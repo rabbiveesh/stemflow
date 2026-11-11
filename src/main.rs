@@ -205,8 +205,10 @@ fn file(o: &Opts, input: &Path, output: &Path) -> Result<()> {
 
 fn read_f32(p: &Path) -> Result<Vec<f32>> {
     let b = std::fs::read(p).with_context(|| format!("reading {}", p.display()))?;
-    Ok(b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+    Ok(b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect())
 }
 

@@ -39,7 +39,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libpulse-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.3
       - name: Cache exported model + demucs weights
         uses: actions/cache@v6
         with:

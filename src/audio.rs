@@ -68,10 +68,7 @@ fn find_streams(needle: &str) -> Result<Vec<String>> {
 }
 
 fn bytes_to_f32(b: &[u8], out: &mut Vec<f32>) {
-    out.extend(
-        b.chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap())),
-    );
+    out.extend(b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)));
 }
 
 fn f32_to_bytes(x: &[f32]) -> Vec<u8> {
