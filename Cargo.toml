@@ -1,0 +1,27 @@
+[package]
+name = "stemflow"
+version = "0.1.0"
+edition = "2021"
+description = "Live bass isolation for whatever your desktop is playing (Demucs via ONNX Runtime, PipeWire/PulseAudio I/O)"
+license = "MIT"
+repository = "https://github.com/rabbiveesh/stemflow"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+libc = "0.2"
+hound = "3"
+libpulse-binding = "2"
+libpulse-simple-binding = "2"
+# ONNX Runtime is loaded at runtime from vendor/ (fetched from Microsoft's GitHub
+# releases by tools/fetch-ort.sh); ort's own CDN download is not used.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
+realfft = "3"
+
+[features]
+default = []
+cuda = ["ort/cuda"]
+
+[profile.release]
+debug = 1
