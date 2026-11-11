@@ -5,7 +5,7 @@ writes out/ab/clipN/{mix,A,B,C}.flac where A/B/C are demucs, scnet and their 50/
 average (exactly what `--sep ensemble` produces, since the streaming is linear)
 in a random order per clip. The answer key goes to out/ab/.key.json.
 
-Usage: .venv/bin/python -I make_ab.py ../out/ab
+Usage: .venv/bin/python -I make_ab.py ../out/ab [--rebuild]
 """
 import json
 import random
@@ -16,6 +16,7 @@ import numpy as np
 import soundfile as sf
 
 root = Path(sys.argv[1])
+rebuild = "--rebuild" in sys.argv  # re-render audio, keep each clip's existing labels
 src = root / "src"
 key_path = root / ".key.json"
 key = json.loads(key_path.read_text()) if key_path.exists() else {}
@@ -29,21 +30,27 @@ for mix_path in sorted(src.glob("clip[0-9]*.wav")):
     if not (d_path.exists() and s_path.exists()):
         continue
     out = root / name
-    if name in key and out.exists():
+    if name in key and out.exists() and not rebuild:
         continue  # keep existing labels stable
     mix, sr = sf.read(mix_path, dtype="float32")
     d, _ = sf.read(d_path, dtype="float32")
     s, _ = sf.read(s_path, dtype="float32")
     n = min(len(mix), len(d), len(s))
     versions = {"demucs": d[:n], "scnet": s[:n], "ensemble": 0.5 * (d[:n] + s[:n])}
-    names = list(versions)
-    rng.shuffle(names)
+    if name in key:
+        names = [key[name][L] for L in "ABC"]
+    else:
+        names = list(versions)
+        rng.shuffle(names)
     out.mkdir(exist_ok=True)
-    # Same loudness for every version, so "louder" can't masquerade as "better".
-    peak = max(np.abs(v).max() for v in versions.values())
-    gain = 0.89 / peak
+    # Match RMS across versions so "louder" can't masquerade as "better", then one
+    # shared gain keeps the loudest peak at -1 dBFS.
+    rms = {k: float(np.sqrt(np.mean(v**2))) + 1e-9 for k, v in versions.items()}
+    target = float(np.mean(list(rms.values())))
+    matched = {k: v * (target / rms[k]) for k, v in versions.items()}
+    gain = 0.89 / max(np.abs(v).max() for v in matched.values())
     for label, v in zip("ABC", names):
-        sf.write(out / f"{label}.flac", versions[v] * gain, sr, subtype="PCM_16")
+        sf.write(out / f"{label}.flac", matched[v] * gain, sr, subtype="PCM_16")
     sf.write(out / "mix.flac", mix[:n] * (0.89 / np.abs(mix[:n]).max()), sr, subtype="PCM_16")
     key[name] = dict(zip("ABC", names))
     print(f"{name}: wrote mix + A/B/C")

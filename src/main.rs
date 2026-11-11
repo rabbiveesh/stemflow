@@ -5,7 +5,7 @@ mod stream;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use model::{Device, Ensemble, HtDemucs, ScNet, Separator, SAMPLE_RATE};
+use model::{Device, Ensemble, HtDemucs, MonoFold, ScNet, Separator, SAMPLE_RATE};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use stream::{Mix, Streamer};
@@ -70,6 +70,10 @@ struct Opts {
     /// Directory with the exported .onnx models.
     #[arg(long, default_value = "models")]
     models: PathBuf,
+    /// Feed the model the original stereo instead of a mono fold. Mono is the default
+    /// because the models miss bass that's panned off-centre (wide 50s-60s stereo).
+    #[arg(long)]
+    stereo_in: bool,
     /// Ensemble weight of SCNet (Demucs gets 1 - this).
     #[arg(long, default_value_t = 0.5)]
     scnet_weight: f32,
@@ -112,13 +116,18 @@ const SCNET_ONNX: &str = "scnet_xl_ihf_bass.onnx";
 fn separator(o: &Opts) -> Result<Box<dyn Separator + Send>> {
     let demucs = || HtDemucs::load(&o.models.join(DEMUCS_ONNX), o.device, o.threads);
     let scnet = || ScNet::load(&o.models.join(SCNET_ONNX), o.device, o.threads);
-    Ok(match o.sep {
+    let sep: Box<dyn Separator + Send> = match o.sep {
         Sep::Demucs => Box::new(demucs()?),
         Sep::Scnet => Box::new(scnet()?),
         Sep::Ensemble => Box::new(Ensemble::new(vec![
             (Box::new(demucs()?), 1.0 - o.scnet_weight),
             (Box::new(scnet()?), o.scnet_weight),
         ])),
+    };
+    Ok(if o.stereo_in {
+        sep
+    } else {
+        Box::new(MonoFold(sep))
     })
 }
 

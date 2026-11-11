@@ -54,6 +54,7 @@ removes the sink, which puts Spotify back on your normal output.
 | `--lookahead S` | `1.5` | future context per sample; more = cleaner but laggier |
 | `--rest-gain G` | `0` | mix the rest of the band back in quietly (e.g. `0.15`) to keep your place |
 | `--output SINK` | default sink | where the bass plays |
+| `--stereo-in` | off | feed the model real stereo instead of a mono fold (see below) |
 
 Latency is roughly lookahead + hop + 0.3 s of buffer, so about 2.8 s by default.
 
@@ -74,6 +75,12 @@ worst, so a 1 s hop has plenty of headroom.
   server. Either switch to `pipewire-pulse`, or run `sudo snap disconnect spotify:pipewire`.
 - Only the separated audio is played back; nothing is recorded or saved in live mode.
   Saving streamed audio would go against most streaming services' terms.
+- **Input is folded to mono by default.** The models were trained on pop mixes with the
+  bass in the centre, and they miss bass panned to one side. On wide 1960s stereo
+  (the Oscar Peterson Trio's *Night Train*), htdemucs_ft returned silence for a whole
+  30 s clip; with mono input it found the bass in every second.
+- Bowed (arco) bass is mostly missed by both models; there's very little of it in
+  their training data.
 - The model is swappable behind the `Separator` trait in `src/model.rs`.
 
 ## Other models

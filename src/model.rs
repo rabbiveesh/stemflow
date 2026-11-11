@@ -358,3 +358,31 @@ impl Separator for Ensemble {
         Ok(acc)
     }
 }
+
+/// Feeds the wrapped separator `(L + R) / 2` on both channels.
+///
+/// The models were trained on pop mixes with the bass in the centre. On wide 1950s-60s
+/// jazz stereo (e.g. the Oscar Peterson Trio on Verve) the bass sits off to one side
+/// and htdemucs_ft returned silence for whole clips; folding to mono fixed it
+/// (Night Train: 30/30 silent seconds -> 0/30). Centre-panned material loses nothing.
+pub struct MonoFold<S>(pub S);
+
+impl<S: Separator> Separator for MonoFold<S> {
+    fn window_len(&self) -> usize {
+        self.0.window_len()
+    }
+
+    fn valid_len(&self) -> usize {
+        self.0.valid_len()
+    }
+
+    fn separate(&mut self, mix: &[f32]) -> Result<Vec<f32>> {
+        let n = mix.len() / 2;
+        let (l, r) = mix.split_at(n);
+        let m: Vec<f32> = l.iter().zip(r).map(|(a, b)| 0.5 * (a + b)).collect();
+        let mut folded = Vec::with_capacity(2 * n);
+        folded.extend_from_slice(&m);
+        folded.extend_from_slice(&m);
+        self.0.separate(&folded)
+    }
+}
