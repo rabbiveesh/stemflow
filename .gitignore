@@ -5,3 +5,6 @@
 __pycache__/
 /vendor/
 /out/
+/tools/third_party/
+/models/*.ckpt
+/models/ref_scnet/

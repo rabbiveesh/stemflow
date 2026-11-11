@@ -5,7 +5,7 @@ mod stream;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use model::{Device, HtDemucs, Separator, HTDEMUCS_SEGMENT, SAMPLE_RATE};
+use model::{Device, Ensemble, HtDemucs, ScNet, Separator, SAMPLE_RATE};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use stream::{Mix, Streamer};
@@ -43,19 +43,36 @@ enum Cmd {
     },
     /// Check the Rust STFT + ONNX pipeline against PyTorch reference vectors.
     Verify {
-        #[arg(long, default_value = "models/htdemucs_ft_bass.onnx")]
-        model: PathBuf,
-        #[arg(long, default_value = "models/ref")]
-        reference: PathBuf,
+        /// demucs or scnet (an ensemble is verified by verifying its members).
+        #[arg(long, value_enum, default_value_t = Sep::Demucs)]
+        sep: Sep,
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
         #[arg(long, value_enum, default_value_t = Device::Cpu)]
         device: Device,
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Sep {
+    /// htdemucs_ft bass specialist (7.8 s window)
+    Demucs,
+    /// SCNet XL IHF (11 s window)
+    Scnet,
+    /// average of both
+    Ensemble,
+}
+
 #[derive(Args, Clone)]
 struct Opts {
-    #[arg(long, default_value = "models/htdemucs_ft_bass.onnx")]
-    model: PathBuf,
+    #[arg(long, value_enum, default_value_t = Sep::Demucs)]
+    sep: Sep,
+    /// Directory with the exported .onnx models.
+    #[arg(long, default_value = "models")]
+    models: PathBuf,
+    /// Ensemble weight of SCNet (Demucs gets 1 - this).
+    #[arg(long, default_value_t = 0.5)]
+    scnet_weight: f32,
     #[arg(long, value_enum, default_value_t = default_device())]
     device: Device,
     /// Seconds of new audio per model run. Compute time per run must stay below this.
@@ -89,16 +106,32 @@ fn secs(s: f32) -> usize {
     (s * SAMPLE_RATE as f32).round() as usize
 }
 
-fn streamer(o: &Opts) -> Result<Streamer<HtDemucs>> {
-    let sep = HtDemucs::load(&o.model, o.device, o.threads)?;
+const DEMUCS_ONNX: &str = "htdemucs_ft_bass.onnx";
+const SCNET_ONNX: &str = "scnet_xl_ihf_bass.onnx";
+
+fn separator(o: &Opts) -> Result<Box<dyn Separator + Send>> {
+    let demucs = || HtDemucs::load(&o.models.join(DEMUCS_ONNX), o.device, o.threads);
+    let scnet = || ScNet::load(&o.models.join(SCNET_ONNX), o.device, o.threads);
+    Ok(match o.sep {
+        Sep::Demucs => Box::new(demucs()?),
+        Sep::Scnet => Box::new(scnet()?),
+        Sep::Ensemble => Box::new(Ensemble::new(vec![
+            (Box::new(demucs()?), 1.0 - o.scnet_weight),
+            (Box::new(scnet()?), o.scnet_weight),
+        ])),
+    })
+}
+
+fn streamer(o: &Opts) -> Result<Streamer<Box<dyn Separator + Send>>> {
+    let sep = separator(o)?;
     let (hop, la, xf) = (secs(o.hop), secs(o.lookahead), secs(o.xfade));
     if xf > la {
         bail!("--xfade must be <= --lookahead");
     }
-    if hop + la > HTDEMUCS_SEGMENT {
+    if hop + la > sep.valid_len() {
         bail!(
             "--hop + --lookahead must be <= {:.2}s",
-            HTDEMUCS_SEGMENT as f32 / SAMPLE_RATE as f32
+            sep.valid_len() as f32 / SAMPLE_RATE as f32
         );
     }
     Ok(Streamer::new(
@@ -127,10 +160,14 @@ fn main() -> Result<()> {
             output,
         } => file(&opts, &input, &output),
         Cmd::Verify {
-            model,
-            reference,
+            sep,
+            models,
             device,
-        } => verify(&model, &reference, device),
+        } => match sep {
+            Sep::Demucs => verify_demucs(&models, device),
+            Sep::Scnet => verify_scnet(&models, device),
+            Sep::Ensemble => verify_demucs(&models, device).and(verify_scnet(&models, device)),
+        },
     }
 }
 
@@ -212,36 +249,59 @@ fn read_f32(p: &Path) -> Result<Vec<f32>> {
         .collect())
 }
 
-fn verify(model: &Path, reference: &Path, device: Device) -> Result<()> {
-    let mix = read_f32(&reference.join("mix.f32"))?;
-    let want_mag = read_f32(&reference.join("mag.f32"))?;
-    let want = read_f32(&reference.join("bass.f32"))?;
-    let mut m = HtDemucs::load(model, device, 0)?;
+fn max_err(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max)
+}
 
-    let mag = m.mag(&mix);
-    let mag_err = mag
-        .iter()
-        .zip(&want_mag)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0f32, f32::max);
+fn report(
+    name: &str,
+    input_err: f32,
+    out_err: f32,
+    peak: f32,
+    dt: f32,
+    device: Device,
+) -> Result<()> {
+    println!("[{name}] input spectrogram max abs err vs torch: {input_err:.2e}");
+    println!("[{name}] bass max abs err vs torch: {out_err:.2e} (signal peak {peak:.3})");
+    println!("[{name}] one window took {dt:.3}s on {device:?} (after warmup)");
+    if input_err > 1e-3 || out_err > 1e-3 {
+        bail!("[{name}] mismatch");
+    }
+    println!("[{name}] OK");
+    Ok(())
+}
+
+fn verify_demucs(models: &Path, device: Device) -> Result<()> {
+    let r = models.join("ref");
+    let (mix, want_mag, want) = (
+        read_f32(&r.join("mix.f32"))?,
+        read_f32(&r.join("mag.f32"))?,
+        read_f32(&r.join("bass.f32"))?,
+    );
+    let mut m = HtDemucs::load(&models.join(DEMUCS_ONNX), device, 0)?;
+    let mag_err = max_err(&m.mag(&mix), &want_mag);
     let t = Instant::now();
     let got = m.separate(&mix)?;
-    let dt = t.elapsed();
-    let err = got
-        .iter()
-        .zip(&want)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0f32, f32::max);
+    let dt = t.elapsed().as_secs_f32();
     let peak = want.iter().fold(0f32, |a, b| a.max(b.abs()));
-    println!("STFT  max abs err vs torch: {mag_err:.2e}");
-    println!("bass  max abs err vs torch: {err:.2e} (signal peak {peak:.3})");
-    println!(
-        "one 7.8s window took {:.3}s on {device:?}",
-        dt.as_secs_f32()
+    report("demucs", mag_err, max_err(&got, &want), peak, dt, device)
+}
+
+fn verify_scnet(models: &Path, device: Device) -> Result<()> {
+    let r = models.join("ref_scnet");
+    let (mix, want_in, want) = (
+        read_f32(&r.join("mix.f32"))?,
+        read_f32(&r.join("spec_in.f32"))?,
+        read_f32(&r.join("bass.f32"))?,
     );
-    if mag_err > 1e-3 || err > 1e-3 {
-        bail!("mismatch");
-    }
-    println!("OK");
-    Ok(())
+    let mut m = ScNet::load(&models.join(SCNET_ONNX), device, 0)?;
+    let in_err = max_err(&m.spec_in(&mix), &want_in);
+    let t = Instant::now();
+    let got = m.separate(&mix)?;
+    let dt = t.elapsed().as_secs_f32();
+    let peak = want.iter().fold(0f32, |a, b| a.max(b.abs()));
+    report("scnet", in_err, max_err(&got, &want), peak, dt, device)
 }

@@ -106,3 +106,73 @@ impl Stft {
 
 // Correctness vs PyTorch is checked by `stemflow verify` (demucs' spec/ispec pair is
 // deliberately not a perfect inverse, so a roundtrip unit test would be meaningless).
+
+/// Plain `torch.stft` / `torch.istft` with `center=True` (reflect pad),
+/// `normalized=True` and *no window* (rectangular), as SCNet calls them.
+/// Keeps all `NFFT / 2 + 1` bins. Layout is `[bin * frames + frame]`.
+pub struct PlainStft {
+    fwd: Arc<dyn RealToComplex<f32>>,
+    inv: Arc<dyn ComplexToReal<f32>>,
+    norm: f32,
+}
+
+pub const FULL_BINS: usize = NFFT / 2 + 1;
+
+impl PlainStft {
+    pub fn new() -> Self {
+        let mut planner = RealFftPlanner::<f32>::new();
+        PlainStft {
+            fwd: planner.plan_fft_forward(NFFT),
+            inv: planner.plan_fft_inverse(NFFT),
+            norm: 1.0 / (NFFT as f32).sqrt(),
+        }
+    }
+
+    pub fn frames_for(len: usize) -> usize {
+        1 + len / HOP
+    }
+
+    pub fn stft(&self, x: &[f32], out: &mut [Complex32]) {
+        let frames = Self::frames_for(x.len());
+        assert_eq!(out.len(), FULL_BINS * frames);
+        let xc = reflect_pad(x, NFFT / 2, NFFT / 2);
+        let mut buf = self.fwd.make_input_vec();
+        let mut spec = self.fwd.make_output_vec();
+        for f in 0..frames {
+            buf.copy_from_slice(&xc[f * HOP..f * HOP + NFFT]);
+            self.fwd.process(&mut buf, &mut spec).expect("fft");
+            for bin in 0..FULL_BINS {
+                out[bin * frames + f] = spec[bin] * self.norm;
+            }
+        }
+    }
+
+    /// `torch.istft(..., length=None)`: returns `HOP * (frames - 1)` samples.
+    pub fn istft(&self, z: &[Complex32], frames: usize, out: &mut [f32]) {
+        assert_eq!(z.len(), FULL_BINS * frames);
+        let len = HOP * (frames - 1);
+        assert_eq!(out.len(), len);
+        let total = NFFT + HOP * (frames - 1);
+        let mut y = vec![0f32; total];
+        let mut env = vec![0f32; total];
+        let mut spec = self.inv.make_input_vec();
+        let mut frame = self.inv.make_output_vec();
+        for f in 0..frames {
+            for bin in 0..FULL_BINS {
+                spec[bin] = z[bin * frames + f];
+            }
+            spec[0].im = 0.0;
+            spec[FULL_BINS - 1].im = 0.0;
+            self.inv.process(&mut spec, &mut frame).expect("ifft");
+            let off = f * HOP;
+            for i in 0..NFFT {
+                y[off + i] += frame[i] * self.norm;
+                env[off + i] += 1.0;
+            }
+        }
+        let start = NFFT / 2;
+        for (i, o) in out.iter_mut().enumerate() {
+            *o = y[start + i] / env[start + i];
+        }
+    }
+}

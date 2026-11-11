@@ -75,7 +75,23 @@ worst, so a 1 s hop has plenty of headroom.
 - Only the separated audio is played back; nothing is recorded or saved in live mode.
   Saving streamed audio would go against most streaming services' terms.
 - The model is swappable behind the `Separator` trait in `src/model.rs`.
-  BS-RoFormer / SCNet bass checkpoints are next.
+
+## Other models
+
+`--sep scnet` runs SCNet XL IHF (from ZFTurbo's Music-Source-Separation-Training,
+Multisong bass SDR 11.94 vs 11.96 for htdemucs_ft). It takes 1.44 s per 11 s window
+on an RTX 4060, so it needs `--hop 2` or more. Export it with:
+
+```bash
+git clone --depth 1 https://github.com/ZFTurbo/Music-Source-Separation-Training tools/third_party/msst
+(cd tools && .venv/bin/python -I export_scnet.py ../models)
+./target/release/stemflow verify --sep scnet --device cuda
+```
+
+`--sep ensemble` averages both models. In fp32 the two need about 3 GB + 5 GB of GPU
+memory, so it doesn't fit on an 8 GB card yet. Since streaming is linear,
+`tools/make_ab.py` builds the exact ensemble output offline from the two single-model
+runs, mixed into a blind A/B/C listening set.
 
 ## License
 
