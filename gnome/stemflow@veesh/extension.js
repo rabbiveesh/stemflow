@@ -159,6 +159,13 @@ class StemflowIndicator extends PanelMenu.Button {
         this._status.label.style = 'font-size: smaller;';
         this.menu.addMenuItem(this._status);
 
+        // Karaoke: the same controls, acting on the vocals. Switches to the vocals
+        // model last used (or the first one), and back to the last bass model.
+        this._karaoke = new PopupMenu.PopupSwitchMenuItem('Karaoke', false);
+        this._karaoke.connect('toggled', (_i, on) => this._setMode(on ? 'vocals' : 'bass'));
+        this.menu.addMenuItem(this._karaoke);
+        this._lastModel = {};
+
         // Experiments: switch models live. The list comes from stemflow, which rescans
         // its models folder each time, so new exports appear without reloading anything.
         this._models = new PopupMenu.PopupSubMenuMenuItem('Model');
@@ -290,7 +297,22 @@ class StemflowIndicator extends PanelMenu.Button {
             });
     }
 
+    _setMode(target) {
+        const list = this._modelList || [];
+        const of = id => (id.endsWith('_vocals') ? 'vocals' : 'bass');
+        const known = id => list.some(([m]) => m === id);
+        const id = known(this._lastModel[target]) ? this._lastModel[target]
+            : (list.find(([m]) => of(m) === target) || [])[0];
+        if (id)
+            this._setModel(id);
+        else
+            Main.notify('stemflow', `No ${target} model in the models folder`);
+    }
+
     _fillModels(models, current) {
+        this._modelList = models;
+        if (current)
+            this._lastModel[current.endsWith('_vocals') ? 'vocals' : 'bass'] = current;
         const key = JSON.stringify([models, current]);
         if (key === this._modelsKey)
             return; // rebuilding while the submenu is open would close it
@@ -326,8 +348,9 @@ class StemflowIndicator extends PanelMenu.Button {
         // Off: the clef takes the bar's own colour (white); on: water-blue.
         if (!on || this._clef.style !== CLEF_WARN)
             this._clef.style = on ? CLEF : '';
-        for (const w of [this._desc, this._snaps, this._one, this._boost, this._bass, this._band, this._status, this._models])
+        for (const w of [this._desc, this._snaps, this._one, this._boost, this._bass, this._band, this._status, this._models, this._karaoke])
             w.visible = on;
+        this._karaoke.visible = on && !!this._proxy.Model;
         // An older daemon has no Model property: no switcher.
         this._models.visible = on && this._settings.get_boolean('experiments') && !!this._proxy.Model;
         if (!on) {
@@ -342,6 +365,7 @@ class StemflowIndicator extends PanelMenu.Button {
         const t = p.Target || 'bass';
         const T = t[0].toUpperCase() + t.slice(1);
         this._switch.label.text = t === 'bass' ? 'Bass isolation' : `${T} isolation (karaoke)`;
+        this._karaoke.setToggleState(t === 'vocals');
         this._bass._label.text = T;
         this._snapButtons.solo.label = `${T} solo`;
         this._snapButtons.nobass.label = `No ${t}`;
