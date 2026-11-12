@@ -122,7 +122,8 @@ struct Opts {
     /// (play-along). Default: the last level set (live), else bass solo.
     #[arg(long, allow_hyphen_values = true)]
     balance: Option<f32>,
-    /// Target (bass, or vocals in karaoke) loudness in percent of full (50 sounds half as loud). Overrides --balance.
+    /// Target (bass, or vocals in karaoke) loudness in percent of the original (50 sounds
+    /// half as loud, up to 200 = twice as loud). Overrides --balance.
     #[arg(long)]
     bass: Option<f32>,
     /// Band (everything but the target) loudness in percent of full. Overrides --balance.

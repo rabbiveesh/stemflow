@@ -13,6 +13,7 @@ const ExtensionUtils = imports.misc.extensionUtils;
 const Me = ExtensionUtils.getCurrentExtension();
 
 const BUS_NAME = 'org.stemflow.Control';
+const MAX_BASS = 2; // the daemon's limit: twice as loud as the original
 const OBJ_PATH = '/org/stemflow/Control';
 const UNIT = 'stemflow.service';
 const STEP = 0.1; // hotkey / scroll step on the -1..1 line
@@ -127,8 +128,13 @@ class StemflowIndicator extends PanelMenu.Button {
         this._one._value.text = 'No bass';
         this.menu.addMenuItem(this._one);
 
-        // Advanced mode: each level on its own.
-        this._bass = new SliderRow('Bass', v => this._set('Bass', v));
+        // Boost the target past the original, up to twice as loud (+10 dB); the
+        // daemon limits the result so it can't clip.
+        this._boost = new SliderRow('Boost', v => this._set('Bass', 1 + v * (MAX_BASS - 1)));
+        this.menu.addMenuItem(this._boost);
+
+        // Advanced mode: each level on its own (the target slider runs to MAX_BASS).
+        this._bass = new SliderRow('Bass', v => this._set('Bass', v * MAX_BASS));
         this._band = new SliderRow('Band', v => this._set('Band', v));
         this.menu.addMenuItem(this._bass);
         this.menu.addMenuItem(this._band);
@@ -278,13 +284,13 @@ class StemflowIndicator extends PanelMenu.Button {
         // Off: the clef takes the bar's own colour (white); on: water-blue.
         if (!on || this._clef.style !== CLEF_WARN)
             this._clef.style = on ? CLEF : '';
-        for (const w of [this._desc, this._snaps, this._one, this._bass, this._band, this._status])
+        for (const w of [this._desc, this._snaps, this._one, this._boost, this._bass, this._band, this._status])
             w.visible = on;
         if (!on) {
             this._status.label.text = '';
             return;
         }
-        this._one.visible = !adv;
+        this._one.visible = this._boost.visible = !adv;
         this._bass.visible = this._band.visible = adv;
         const p = this._proxy;
         // "Bass" is whichever stem stemflow targets: vocals in karaoke mode
@@ -297,7 +303,9 @@ class StemflowIndicator extends PanelMenu.Button {
         this._snapButtons.nobass.label = `No ${t}`;
         this._desc.label.text = p.Description;
         this._one.set((p.Balance + 1) / 2, `No ${t}`);
-        this._bass.set(p.Bass, `${Math.round(p.Bass * 100)}%`);
+        this._boost.set(Math.max(0, p.Bass - 1) / (MAX_BASS - 1),
+            p.Bass > 1 ? `+${Math.round((p.Bass - 1) * 100)}%` : 'off');
+        this._bass.set(p.Bass / MAX_BASS, `${Math.round(p.Bass * 100)}%`);
         this._band.set(p.Band, `${Math.round(p.Band * 100)}%`);
     }
 

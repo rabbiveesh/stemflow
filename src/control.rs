@@ -10,16 +10,21 @@
 //! `Band`; `Target` says which stem `Bass` means.
 //! Each half is scaled by *perceived* loudness: 50% sounds half as loud (-10 dB),
 //! so the useful quiet range isn't crammed into the bottom of the slider.
+//! The target can also be boosted past full, up to `MAX_BASS` (200% = twice as loud,
+//! +10 dB); the player's limiter keeps the louder mix from clipping.
 
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Perceived loudness (0..1, 0.5 = half as loud) to amplitude: -10 dB per halving,
-/// i.e. gain = p^(log2(10)/2) ≈ p^1.66.
+/// Highest target level: 2.0 sounds twice as loud as the original (+10 dB).
+pub const MAX_BASS: f32 = 2.0;
+
+/// Perceived loudness (0.5 = half as loud, 2 = twice as loud) to amplitude: 10 dB per
+/// doubling, i.e. gain = p^(log2(10)/2) ≈ p^1.66.
 pub fn loudness_to_gain(p: f32) -> f32 {
-    let p = p.clamp(0.0, 1.0);
+    let p = p.clamp(0.0, MAX_BASS);
     if p == 0.0 {
         0.0
     } else {
@@ -40,9 +45,9 @@ pub struct Control {
     pub overruns: AtomicU64,
 }
 
-fn unit(v: f32) -> f32 {
+fn level(v: f32, max: f32) -> f32 {
     if v.is_finite() {
-        v.clamp(0.0, 1.0)
+        v.clamp(0.0, max)
     } else {
         1.0
     }
@@ -65,8 +70,8 @@ impl Control {
         )
     }
     pub fn set_levels(&self, bass: f32, band: f32) {
-        self.bass.store(unit(bass).to_bits(), Ordering::Relaxed);
-        self.band.store(unit(band).to_bits(), Ordering::Relaxed);
+        self.bass.store(level(bass, MAX_BASS).to_bits(), Ordering::Relaxed);
+        self.band.store(level(band, 1.0).to_bits(), Ordering::Relaxed);
     }
     /// (bass gain, band gain) as amplitudes.
     pub fn gains(&self) -> (f32, f32) {
@@ -90,7 +95,8 @@ impl Control {
             0.0
         };
         if b <= 0.0 {
-            self.set_levels(1.0, 1.0 + b)
+            // keep any boost while the band fades
+            self.set_levels(self.levels().0.max(1.0), 1.0 + b)
         } else {
             self.set_levels(1.0 - b, 1.0)
         }
@@ -102,6 +108,7 @@ impl Control {
         let tc = format!("{}{}", t[..1].to_uppercase(), &t[1..]);
         match (pct(bass), pct(band)) {
             (100, 0) => format!("{tc} solo"),
+            (a, 0) if a > 100 => format!("{tc} solo · {a}%"),
             (100, 100) => "Full mix".into(),
             (0, 100) => format!("No {t}"),
             (100, b) => format!("Band {b}%"),
@@ -181,7 +188,7 @@ impl Service {
         self.ctl.set_balance(b as f32);
         self.changed(&em).await;
     }
-    /// Bass loudness, 0..1 (0.5 sounds half as loud).
+    /// Bass loudness, 0..2 (0.5 sounds half as loud, above 1 is a boost).
     #[zbus(property)]
     fn bass(&self) -> f64 {
         self.ctl.levels().0 as f64
@@ -317,5 +324,13 @@ mod tests {
         assert_eq!(k.describe(), "No vocals");
         k.set_balance(-1.0);
         assert_eq!(k.describe(), "Vocals solo");
+        // boost: twice as loud = +10 dB, kept while the band fades, capped at 200%
+        c.set_levels(2.0, 1.0);
+        assert!((20.0 * c.gains().0.log10() - 10.0).abs() < 0.01);
+        assert_eq!((c.balance(), c.describe().as_str()), (0.0, "Bass 200%"));
+        c.set_balance(-1.0);
+        assert_eq!(c.describe(), "Bass solo · 200%");
+        c.set_levels(5.0, 1.0);
+        assert_eq!(c.levels().0, MAX_BASS);
     }
 }
