@@ -138,7 +138,7 @@ pub fn live<S: Separator + Send + 'static>(
         "stemflow",
         Direction::Playback,
         Some(&output),
-        "bass",
+        ctl.target,
         &spec,
         None,
         Some(&BufferAttr {
@@ -156,8 +156,9 @@ pub fn live<S: Separator + Send + 'static>(
         pactl(&["move-sink-input", id, SINK])?;
     }
     eprintln!(
-        "stemflow: {} `{grab}` stream(s) -> {SINK} -> bass -> {output}; latency ≈ {:.1}s (Ctrl-C to stop)",
+        "stemflow: {} `{grab}` stream(s) -> {SINK} -> {} -> {output}; latency ≈ {:.1}s (Ctrl-C to stop)",
         grabbed.len(),
+        ctl.target,
         (st.latency() as f32 / SAMPLE_RATE as f32) + slack
     );
     if grabbed.is_empty() {

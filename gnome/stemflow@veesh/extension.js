@@ -34,6 +34,7 @@ const IFACE = `
     <property name="Bass" type="d" access="readwrite"/>
     <property name="Band" type="d" access="readwrite"/>
     <property name="Description" type="s" access="read"/>
+    <property name="Target" type="s" access="read"/>
     <property name="App" type="s" access="read"/>
     <property name="Latency" type="d" access="read"/>
     <property name="Compute" type="d" access="read"/>
@@ -134,10 +135,12 @@ class StemflowIndicator extends PanelMenu.Button {
 
         const snaps = new PopupMenu.PopupBaseMenuItem({ activate: false, reactive: false });
         const box = new St.BoxLayout({ x_expand: true, style: 'spacing: 6px;' });
+        this._snapButtons = {};
         for (const [label, name] of [['Bass solo', 'solo'], ['Full mix', 'full'], ['No bass', 'nobass']]) {
             const b = new St.Button({ label, style_class: 'button', x_expand: true, can_focus: true });
             b.connect('clicked', () => this._snap(name));
             box.add_child(b);
+            this._snapButtons[name] = b;
         }
         snaps.add_child(box);
         this.menu.addMenuItem(snaps);
@@ -284,8 +287,16 @@ class StemflowIndicator extends PanelMenu.Button {
         this._one.visible = !adv;
         this._bass.visible = this._band.visible = adv;
         const p = this._proxy;
+        // "Bass" is whichever stem stemflow targets: vocals in karaoke mode
+        // (`stemflow live --target vocals`). Older daemons have no Target.
+        const t = p.Target || 'bass';
+        const T = t[0].toUpperCase() + t.slice(1);
+        this._switch.label.text = t === 'bass' ? 'Bass isolation' : `${T} isolation (karaoke)`;
+        this._bass._label.text = T;
+        this._snapButtons.solo.label = `${T} solo`;
+        this._snapButtons.nobass.label = `No ${t}`;
         this._desc.label.text = p.Description;
-        this._one.set((p.Balance + 1) / 2, 'No bass');
+        this._one.set((p.Balance + 1) / 2, `No ${t}`);
         this._bass.set(p.Bass, `${Math.round(p.Bass * 100)}%`);
         this._band.set(p.Band, `${Math.round(p.Band * 100)}%`);
     }

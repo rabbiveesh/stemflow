@@ -5,6 +5,9 @@
 //! Balance runs from -1 to +1 on one line:
 //!   -1 = bass solo, band fades in as it rises;  0 = the original mix;
 //!   +1 = no bass (play-along), bass fades out as it rises.
+//! "Bass" is really the target stem: in karaoke mode (`--target vocals`) the same
+//! line runs from vocals solo to no vocals. The D-Bus property names stay `Bass` and
+//! `Band`; `Target` says which stem `Bass` means.
 //! Each half is scaled by *perceived* loudness: 50% sounds half as loud (-10 dB),
 //! so the useful quiet range isn't crammed into the bottom of the slider.
 
@@ -28,6 +31,8 @@ pub fn loudness_to_gain(p: f32) -> f32 {
 /// "balance" is a view onto them; advanced mode sets each directly.
 #[derive(Default)]
 pub struct Control {
+    /// Which stem "bass" refers to: "bass", or "vocals" in karaoke mode.
+    pub target: &'static str,
     bass: AtomicU32,
     band: AtomicU32,
     /// Latest model run time in microseconds, and how many runs overran the hop.
@@ -44,8 +49,11 @@ fn unit(v: f32) -> f32 {
 }
 
 impl Control {
-    pub fn new(bass: f32, band: f32) -> Arc<Self> {
-        let c = Control::default();
+    pub fn new(target: &'static str, bass: f32, band: f32) -> Arc<Self> {
+        let c = Control {
+            target,
+            ..Default::default()
+        };
         c.set_levels(bass, band);
         Arc::new(c)
     }
@@ -90,46 +98,52 @@ impl Control {
     pub fn describe(&self) -> String {
         let (bass, band) = self.levels();
         let pct = |p: f32| (p * 100.0).round() as i32;
+        let t = self.target;
+        let tc = format!("{}{}", t[..1].to_uppercase(), &t[1..]);
         match (pct(bass), pct(band)) {
-            (100, 0) => "Bass solo".into(),
+            (100, 0) => format!("{tc} solo"),
             (100, 100) => "Full mix".into(),
-            (0, 100) => "No bass".into(),
+            (0, 100) => format!("No {t}"),
             (100, b) => format!("Band {b}%"),
-            (a, 100) => format!("Bass {a}%"),
-            (a, b) => format!("Bass {a}% · Band {b}%"),
+            (a, 100) => format!("{tc} {a}%"),
+            (a, b) => format!("{tc} {a}% · Band {b}%"),
         }
     }
 }
 
-/// Where the last levels are remembered between runs.
-fn state_file() -> Option<PathBuf> {
+/// Where the last levels are remembered between runs, one file per target.
+fn state_file(target: &str) -> Option<PathBuf> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    Some(base.join("stemflow/levels"))
+    Some(base.join(match target {
+        "bass" => "stemflow/levels".to_string(),
+        t => format!("stemflow/levels-{t}"),
+    }))
 }
 
-/// Last (bass, band) loudness, if remembered.
-pub fn load_levels() -> Option<(f32, f32)> {
-    let s = std::fs::read_to_string(state_file()?).ok()?;
+/// Last (target, band) loudness, if remembered.
+pub fn load_levels(target: &str) -> Option<(f32, f32)> {
+    let s = std::fs::read_to_string(state_file(target)?).ok()?;
     let mut it = s.split_whitespace().map(|v| v.parse::<f32>().ok());
     Some((it.next()??, it.next()??))
 }
 
 pub fn save_levels(ctl: &Control) {
     let (a, b) = ctl.levels();
-    if let Some(p) = state_file() {
+    if let Some(p) = state_file(ctl.target) {
         let _ = std::fs::create_dir_all(p.parent().unwrap());
         let _ = std::fs::write(p, format!("{a} {b}\n"));
     }
 }
 
-/// Snap points the hotkeys and menu buttons use.
+/// Snap points the hotkeys and menu buttons use. "nobass" means "remove the
+/// target" whatever it is, so existing hotkeys keep working in karaoke mode.
 fn snap(name: &str) -> Option<f32> {
     match name {
         "solo" => Some(-1.0),
         "full" => Some(0.0),
-        "nobass" => Some(1.0),
+        "nobass" | "remove" | "novocals" => Some(1.0),
         _ => None,
     }
 }
@@ -201,6 +215,11 @@ impl Service {
     #[zbus(property)]
     fn description(&self) -> String {
         self.ctl.describe()
+    }
+    /// Which stem `Bass`, solo and remove refer to: "bass" or "vocals" (karaoke).
+    #[zbus(property)]
+    fn target(&self) -> String {
+        self.ctl.target.to_string()
     }
     #[zbus(property)]
     fn app(&self) -> String {
@@ -277,7 +296,7 @@ mod tests {
 
     #[test]
     fn balance_scale() {
-        let c = Control::new(1.0, 1.0);
+        let c = Control::new("bass", 1.0, 1.0);
         for (b, want) in [(-1.0, (1.0, 0.0)), (0.0, (1.0, 1.0)), (1.0, (0.0, 1.0))] {
             c.set_balance(b);
             assert_eq!(c.gains(), want);
@@ -293,5 +312,10 @@ mod tests {
         assert_eq!(c.describe(), "Bass 30%");
         c.set_levels(0.5, 0.2);
         assert_eq!(c.describe(), "Bass 50% · Band 20%");
+        let k = Control::new("vocals", 1.0, 1.0);
+        k.set_balance(1.0);
+        assert_eq!(k.describe(), "No vocals");
+        k.set_balance(-1.0);
+        assert_eq!(k.describe(), "Vocals solo");
     }
 }

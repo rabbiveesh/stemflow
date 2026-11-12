@@ -1,9 +1,9 @@
-"""Export BS-Roformer SW (6-stem, bass head only) to ONNX, with the STFT/iSTFT
+"""Export BS-Roformer SW (6-stem, one head: bass by default) to ONNX, with the STFT/iSTFT
 moved out (Rust does them), the same split as export_scnet.py.
 
 The graph takes the complex-as-channels spectrogram of the chunk,
-[1, 4 (L re, L im, R re, R im), 1025, T], and returns the masked bass
-spectrogram in the same layout (DC bin zeroed, as the model's zero_dc does).
+[1, 4 (L re, L im, R re, R im), 1025, T], and returns the masked
+spectrogram of that stem in the same layout (DC bin zeroed, as the model's zero_dc does).
 The STFT is torch.stft: n_fft 2048, hop 512, periodic Hann window, *not*
 normalized, center=True, reflect padding; T = 1 + samples / 512.
 
@@ -12,8 +12,12 @@ graph runs on any chunk length (trained at 588800 samples = 13.35 s).
 
 Needs the MSST source checkout (tools/third_party/msst) for the model class and
 models/ext/bsrofo/{config.yaml,model.ckpt} (enerjazzer/BS-ROFO-SW-Fixed).
-Usage: .venv/bin/python -I export_bsrofo.py ../models/ext/bsrofo ../models
+Usage: .venv/bin/python -I export_bsrofo.py ../models/ext/bsrofo ../models [stem]
+stem is one of the checkpoint's instruments (bass, drums, other, vocals, guitar,
+piano); it writes bsrofo_sw_<stem>.onnx and reference vectors to ref_bsrofo
+(bass) or ref_bsrofo_<stem>.
 """
+import os
 import sys
 from pathlib import Path
 
@@ -37,18 +41,20 @@ Loader.add_constructor("tag:yaml.org,2002:python/tuple", lambda l, n: tuple(l.co
 
 src_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "../models/ext/bsrofo")
 out_dir = Path(sys.argv[2] if len(sys.argv) > 2 else "../models")
+STEM = sys.argv[3] if len(sys.argv) > 3 else "bass"
 cfg = yaml.load((src_dir / "config.yaml").read_text(), Loader=Loader)
 mcfg = dict(cfg["model"], flash_attn=False)
 assert (mcfg["stft_n_fft"], mcfg["stft_hop_length"], mcfg.get("stft_normalized")) == (N_FFT, HOP, False)
 m = BSRoformer(**mcfg).eval()
+m.requires_grad_(False)  # no autograd state while tracing: the export took >12 GB of RAM without this
 state = torch.load(src_dir / "model.ckpt", map_location="cpu", weights_only=False)
 m.load_state_dict(state.get("state_dict", state))
-bass_idx = cfg["training"]["instruments"].index("bass")
+head_idx = cfg["training"]["instruments"].index(STEM)
 assert not m.skip_connection and m.zero_dc
 
 
 class Core(torch.nn.Module):
-    """BSRoformer.forward between the STFT and the iSTFT, bass head only."""
+    """BSRoformer.forward between the STFT and the iSTFT, one head only."""
 
     def __init__(self, m, head):
         super().__init__()
@@ -110,26 +116,28 @@ def test_mix(n, seed=0):
     return torch.from_numpy(np.stack([bass + chords + hats, 0.8 * bass + chords - hats]).astype(np.float32))[None]
 
 
-core = Core(m, bass_idx).eval()
+core = Core(m, head_idx).eval()
 EXPORT_N = 4 * 44100  # trace length; T stays dynamic
 with torch.no_grad():
-    for n in (EXPORT_N, 588800):
+    # The 13.35 s check takes ~20 GB of RAM on CPU; STEMFLOW_LONG_CHECK=0 skips it.
+    for n in (EXPORT_N, 588800) if os.environ.get("STEMFLOW_LONG_CHECK", "1") != "0" else (EXPORT_N,):
         mix = test_mix(n)
-        full = m(mix)[0, bass_idx]
+        full = m(mix)[0, head_idx]
         y = istft(core(stft(mix)), n)
         print(f"n={n}: torch split vs stock forward, max abs err {float((y - full).abs().max()):.2e}")
     z = stft(test_mix(EXPORT_N))
 
-onnx_path = out_dir / "bsrofo_sw_bass.onnx"
-torch.onnx.export(core, (z,), str(onnx_path), input_names=["spec_in"], output_names=["spec"],
-                  dynamic_axes={"spec_in": {3: "frames"}, "spec": {3: "frames"}},
-                  opset_version=17, do_constant_folding=True)
+onnx_path = out_dir / f"bsrofo_sw_{STEM}.onnx"
+with torch.no_grad():
+    torch.onnx.export(core, (z,), str(onnx_path), input_names=["spec_in"], output_names=["spec"],
+                      dynamic_axes={"spec_in": {3: "frames"}, "spec": {3: "frames"}},
+                      opset_version=17, do_constant_folding=True)
 print("wrote", onnx_path, f"{onnx_path.stat().st_size / 1e6:.1f} MB")
 
 import onnxruntime as ort  # noqa: E402
 
 sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-ref = out_dir / "ref_bsrofo"
+ref = out_dir / ("ref_bsrofo" if STEM == "bass" else f"ref_bsrofo_{STEM}")
 ref.mkdir(exist_ok=True)
 with torch.no_grad():
     for n in (EXPORT_N, 3 * 44100 + 777):
@@ -140,6 +148,6 @@ with torch.no_grad():
         print(f"n={n}: onnx vs torch spec max abs err {float(np.abs(o - spec.numpy()).max()):.2e}, "
               f"peak {float(spec.abs().max()):.2f}")
     mix.numpy().tofile(ref / "mix.f32")
-    m(mix)[0, bass_idx].numpy().astype(np.float32).tofile(ref / "bass.f32")
+    m(mix)[0, head_idx].numpy().astype(np.float32).tofile(ref / f"{STEM}.f32")
     z.numpy().tofile(ref / "spec_in.f32")
     print(f"wrote reference vectors ({mix.shape[-1]} samples) to", ref)
