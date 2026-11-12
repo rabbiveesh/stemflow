@@ -119,7 +119,7 @@ class StemflowIndicator extends PanelMenu.Button {
         this.add_child(this._icon);
         this.connect('scroll-event', (_a, ev) => this._onScroll(ev));
 
-        this._switch = new PopupMenu.PopupSwitchMenuItem('Bass isolation', false);
+        this._switch = stayOpen(new PopupMenu.PopupSwitchMenuItem('Bass isolation', false));
         this._switch.connect('toggled', (_i, on) => systemd(on ? 'StartUnit' : 'StopUnit'));
         this.menu.addMenuItem(this._switch);
 
