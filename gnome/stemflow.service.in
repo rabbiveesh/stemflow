@@ -1,0 +1,13 @@
+[Unit]
+Description=stemflow live bass isolation
+After=pipewire-pulse.service
+
+[Service]
+# Extra flags, e.g. STEMFLOW_ARGS="--grab firefox" in ~/.config/stemflow/env
+EnvironmentFile=-%h/.config/stemflow/env
+ExecStart=@ROOT@/target/release/stemflow live --models @ROOT@/models $STEMFLOW_ARGS
+# SIGINT runs stemflow's cleanup (unload the sink, hand the app back to the speakers).
+KillSignal=SIGINT
+TimeoutStopSec=5
+Restart=on-failure
+RestartSec=3

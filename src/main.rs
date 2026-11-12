@@ -1,14 +1,15 @@
 mod audio;
+mod control;
 mod model;
 mod spec;
 mod stream;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use model::{Device, Ensemble, HtDemucs, MonoFold, ScNet, Separator, SAMPLE_RATE};
+use model::{BsRoformer, Device, Ensemble, HtDemucs, MonoFold, ScNet, Separator, SAMPLE_RATE};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use stream::{Mix, Streamer};
+use stream::Streamer;
 
 /// Live bass isolation for whatever your desktop is playing.
 #[derive(Parser)]
@@ -43,7 +44,7 @@ enum Cmd {
     },
     /// Check the Rust STFT + ONNX pipeline against PyTorch reference vectors.
     Verify {
-        /// demucs or scnet (an ensemble is verified by verifying its members).
+        /// demucs, scnet or bsrofo (an ensemble is verified by verifying its members).
         #[arg(long, value_enum, default_value_t = Sep::Demucs)]
         sep: Sep,
         #[arg(long, default_value = "models")]
@@ -61,11 +62,13 @@ enum Sep {
     Scnet,
     /// average of both
     Ensemble,
+    /// BS-RoFormer SW (window set by --window)
+    Bsrofo,
 }
 
 #[derive(Args, Clone)]
 struct Opts {
-    #[arg(long, value_enum, default_value_t = Sep::Demucs)]
+    #[arg(long, value_enum, default_value_t = Sep::Bsrofo)]
     sep: Sep,
     /// Directory with the exported .onnx models.
     #[arg(long, default_value = "models")]
@@ -74,6 +77,10 @@ struct Opts {
     /// because the models miss bass that's panned off-centre (wide 50s-60s stereo).
     #[arg(long)]
     stereo_in: bool,
+    /// BS-RoFormer context window, seconds (trained at 13.35). 3 keeps up live on an
+    /// 8 GB laptop GPU; longer needs more VRAM and compute but not more latency.
+    #[arg(long, default_value_t = 3.0)]
+    window: f32,
     /// Ensemble weight of SCNet (Demucs gets 1 - this).
     #[arg(long, default_value_t = 0.5)]
     scnet_weight: f32,
@@ -88,11 +95,16 @@ struct Opts {
     /// Crossfade between consecutive runs, seconds (must be <= lookahead).
     #[arg(long, default_value_t = 0.1)]
     xfade: f32,
-    #[arg(long, default_value_t = 1.0)]
-    bass_gain: f32,
-    /// Level of everything except the bass (0 = bass solo, 1 = original mix).
-    #[arg(long, default_value_t = 0.0)]
-    rest_gain: f32,
+    /// Starting mix on one line: -1 = bass solo, 0 = full mix, +1 = no bass
+    /// (play-along). Default: the last level set (live), else bass solo.
+    #[arg(long, allow_hyphen_values = true)]
+    balance: Option<f32>,
+    /// Bass loudness in percent of full (50 sounds half as loud). Overrides --balance.
+    #[arg(long)]
+    bass: Option<f32>,
+    /// Band (everything but the bass) loudness in percent of full. Overrides --balance.
+    #[arg(long)]
+    band: Option<f32>,
     /// CPU threads for inference (0 = ONNX Runtime default).
     #[arg(long, default_value_t = 0)]
     threads: usize,
@@ -112,6 +124,7 @@ fn secs(s: f32) -> usize {
 
 const DEMUCS_ONNX: &str = "htdemucs_ft_bass.onnx";
 const SCNET_ONNX: &str = "scnet_xl_ihf_bass.onnx";
+const BSROFO_ONNX: &str = "bsrofo_sw_bass.onnx";
 
 fn separator(o: &Opts) -> Result<Box<dyn Separator + Send>> {
     let demucs = || HtDemucs::load(&o.models.join(DEMUCS_ONNX), o.device, o.threads);
@@ -123,6 +136,12 @@ fn separator(o: &Opts) -> Result<Box<dyn Separator + Send>> {
             (Box::new(demucs()?), 1.0 - o.scnet_weight),
             (Box::new(scnet()?), o.scnet_weight),
         ])),
+        Sep::Bsrofo => Box::new(BsRoformer::load(
+            &o.models.join(BSROFO_ONNX),
+            o.device,
+            o.threads,
+            secs(o.window),
+        )?),
     };
     Ok(if o.stereo_in {
         sep
@@ -143,16 +162,7 @@ fn streamer(o: &Opts) -> Result<Streamer<Box<dyn Separator + Send>>> {
             sep.valid_len() as f32 / SAMPLE_RATE as f32
         );
     }
-    Ok(Streamer::new(
-        sep,
-        hop,
-        la,
-        xf,
-        Mix {
-            bass_gain: o.bass_gain,
-            rest_gain: o.rest_gain,
-        },
-    ))
+    Ok(Streamer::new(sep, hop, la, xf))
 }
 
 fn main() -> Result<()> {
@@ -162,7 +172,19 @@ fn main() -> Result<()> {
             grab,
             output,
             slack,
-        } => audio::live(streamer(&opts)?, &grab, output, slack),
+        } => {
+            let st = streamer(&opts)?;
+            let ctl = levels(&opts, true);
+            let (lat, hop) = (
+                st.latency() as f64 / SAMPLE_RATE as f64,
+                st.hop as f64 / SAMPLE_RATE as f64,
+            );
+            // Off the bus is fine (e.g. no session bus over ssh): CLI flags still work.
+            let _bus = control::serve(ctl.clone(), &grab, lat + slack as f64, hop)
+                .map_err(|e| eprintln!("stemflow: no D-Bus control ({e})"))
+                .ok();
+            audio::live(st, ctl, &grab, output, slack)
+        }
         Cmd::File {
             opts,
             input,
@@ -176,8 +198,26 @@ fn main() -> Result<()> {
             Sep::Demucs => verify_demucs(&models, device),
             Sep::Scnet => verify_scnet(&models, device),
             Sep::Ensemble => verify_demucs(&models, device).and(verify_scnet(&models, device)),
+            Sep::Bsrofo => verify_bsrofo(&models, device),
         },
     }
+}
+
+/// Starting levels: explicit flags, else the remembered ones, else bass solo.
+fn levels(o: &Opts, remember: bool) -> std::sync::Arc<control::Control> {
+    let ctl = control::Control::new(1.0, 0.0);
+    if let Some((a, b)) = remember.then(control::load_levels).flatten() {
+        ctl.set_levels(a, b);
+    }
+    if let Some(b) = o.balance {
+        ctl.set_balance(b);
+    }
+    let (a, b) = ctl.levels();
+    ctl.set_levels(
+        o.bass.map_or(a, |v| v / 100.0),
+        o.band.map_or(b, |v| v / 100.0),
+    );
+    ctl
 }
 
 fn file(o: &Opts, input: &Path, output: &Path) -> Result<()> {
@@ -207,6 +247,7 @@ fn file(o: &Opts, input: &Path, output: &Path) -> Result<()> {
     };
 
     let mut s = streamer(o)?;
+    let ctl = levels(o, false);
     let (hop, lat) = (s.hop, s.delay());
     let frames = stereo.len() / 2;
     let mut padded = stereo;
@@ -216,7 +257,8 @@ fn file(o: &Opts, input: &Path, output: &Path) -> Result<()> {
     let mut times = Vec::new();
     for chunk in padded.chunks(2 * hop) {
         let t = Instant::now();
-        out.extend(s.process(chunk)?);
+        let (bg, rg) = ctl.gains();
+        out.extend(s.process(chunk)?.mix(bg, rg));
         times.push(t.elapsed().as_secs_f32());
     }
     let hop_s = hop as f32 / SAMPLE_RATE as f32;
@@ -263,6 +305,11 @@ fn max_err(a: &[f32], b: &[f32]) -> f32 {
         .zip(b)
         .map(|(x, y)| (x - y).abs())
         .fold(0f32, f32::max)
+}
+
+fn rms_diff(a: &[f32], b: &[f32]) -> f32 {
+    let s: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+    (s / a.len() as f32).sqrt()
 }
 
 fn report(
@@ -313,4 +360,26 @@ fn verify_scnet(models: &Path, device: Device) -> Result<()> {
     let dt = t.elapsed().as_secs_f32();
     let peak = want.iter().fold(0f32, |a, b| a.max(b.abs()));
     report("scnet", in_err, max_err(&got, &want), peak, dt, device)
+}
+
+fn verify_bsrofo(models: &Path, device: Device) -> Result<()> {
+    let r = models.join("ref_bsrofo");
+    let (mix, want_in, want) = (
+        read_f32(&r.join("mix.f32"))?,
+        read_f32(&r.join("spec_in.f32"))?,
+        read_f32(&r.join("bass.f32"))?,
+    );
+    let mut m = BsRoformer::load(&models.join(BSROFO_ONNX), device, 0, mix.len() / 2)?;
+    let in_err = max_err(&m.spec_in(&mix), &want_in);
+    // The model amplifies float32 STFT rounding (1e-5 input jitter moves the output
+    // by up to 1e-2), so the strict check feeds torch's own spectrogram: that tests
+    // the ONNX graph and the Rust iSTFT exactly. The end-to-end error is reported.
+    let t = Instant::now();
+    let got = m.separate_spec(want_in)?;
+    let dt = t.elapsed().as_secs_f32();
+    let peak = want.iter().fold(0f32, |a, b| a.max(b.abs()));
+    let e2e = m.separate(&mix)?;
+    let (e, d) = (max_err(&e2e, &want), rms_diff(&e2e, &want));
+    println!("[bsrofo] end to end (Rust STFT): max err {e:.2e}, rms {d:.2e}");
+    report("bsrofo", in_err, max_err(&got, &want), peak, dt, device)
 }

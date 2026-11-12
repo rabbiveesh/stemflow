@@ -8,3 +8,7 @@ __pycache__/
 /tools/third_party/
 /models/*.ckpt
 /models/ref_scnet/
+/models/ext/
+/models/ref_bsrofo/
+/tools/.venv-gpu/
+gnome/*/schemas/gschemas.compiled

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.stemflow" path="/org/gnome/shell/extensions/stemflow/">
+    <key name="advanced" type="b">
+      <default>false</default>
+      <summary>Separate bass and band sliders instead of one</summary>
+    </key>
+    <key name="slide-left" type="as">
+      <default><![CDATA[['<Super>bracketleft']]]></default>
+      <summary>Move toward bass solo</summary>
+    </key>
+    <key name="slide-right" type="as">
+      <default><![CDATA[['<Super>bracketright']]]></default>
+      <summary>Move toward play-along (no bass)</summary>
+    </key>
+    <key name="toggle-solo" type="as">
+      <default><![CDATA[['<Super>backslash']]]></default>
+      <summary>Bass solo, or back to where you were</summary>
+    </key>
+    <key name="toggle-nobass" type="as">
+      <default><![CDATA[['<Super><Shift>backslash']]]></default>
+      <summary>Play-along (no bass), or back to where you were</summary>
+    </key>
+    <key name="toggle-running" type="as">
+      <default><![CDATA[['<Super><Alt>b']]]></default>
+      <summary>Start or stop stemflow</summary>
+    </key>
+  </schema>
+</schemalist>

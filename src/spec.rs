@@ -176,3 +176,110 @@ impl PlainStft {
         }
     }
 }
+
+/// `torch.stft` / `torch.istft` with a periodic Hann window, `center=True` (reflect
+/// pad) and `normalized=False`, at any size (BS-RoFormer: n_fft 2048, hop 512).
+/// Keeps all `nfft / 2 + 1` bins. Layout is `[bin * frames + frame]`.
+pub struct HannStft {
+    fwd: Arc<dyn RealToComplex<f32>>,
+    inv: Arc<dyn ComplexToReal<f32>>,
+    window: Vec<f32>,
+    pub nfft: usize,
+    pub hop: usize,
+}
+
+impl HannStft {
+    pub fn new(nfft: usize, hop: usize) -> Self {
+        let mut planner = RealFftPlanner::<f32>::new();
+        let window = (0..nfft)
+            .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / nfft as f32).cos())
+            .collect();
+        HannStft {
+            fwd: planner.plan_fft_forward(nfft),
+            inv: planner.plan_fft_inverse(nfft),
+            window,
+            nfft,
+            hop,
+        }
+    }
+
+    pub fn bins(&self) -> usize {
+        self.nfft / 2 + 1
+    }
+
+    pub fn frames_for(&self, len: usize) -> usize {
+        1 + len / self.hop
+    }
+
+    pub fn stft(&self, x: &[f32], out: &mut [Complex32]) {
+        let (n, hop, bins) = (self.nfft, self.hop, self.bins());
+        let frames = self.frames_for(x.len());
+        assert_eq!(out.len(), bins * frames);
+        let xc = reflect_pad(x, n / 2, n / 2);
+        let mut buf = self.fwd.make_input_vec();
+        let mut spec = self.fwd.make_output_vec();
+        for f in 0..frames {
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = xc[f * hop + i] * self.window[i];
+            }
+            self.fwd.process(&mut buf, &mut spec).expect("fft");
+            for bin in 0..bins {
+                out[bin * frames + f] = spec[bin];
+            }
+        }
+    }
+
+    /// `torch.istft(..., length=out.len())`.
+    pub fn istft(&self, z: &[Complex32], frames: usize, out: &mut [f32]) {
+        let (n, hop, bins) = (self.nfft, self.hop, self.bins());
+        assert_eq!(z.len(), bins * frames);
+        let total = n + hop * (frames - 1);
+        assert!(n / 2 + out.len() <= total);
+        let mut y = vec![0f32; total];
+        let mut env = vec![0f32; total];
+        let mut spec = self.inv.make_input_vec();
+        let mut frame = self.inv.make_output_vec();
+        let scale = 1.0 / n as f32; // realfft's inverse is unnormalized
+        for f in 0..frames {
+            for bin in 0..bins {
+                spec[bin] = z[bin * frames + f];
+            }
+            spec[0].im = 0.0;
+            spec[bins - 1].im = 0.0;
+            self.inv.process(&mut spec, &mut frame).expect("ifft");
+            let off = f * hop;
+            for i in 0..n {
+                y[off + i] += frame[i] * scale * self.window[i];
+                env[off + i] += self.window[i] * self.window[i];
+            }
+        }
+        for (i, o) in out.iter_mut().enumerate() {
+            let e = env[n / 2 + i];
+            *o = if e > 1e-11 { y[n / 2 + i] / e } else { 0.0 };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hann_roundtrip() {
+        let s = HannStft::new(2048, 512);
+        let x: Vec<f32> = (0..20_000)
+            .map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+        let fr = s.frames_for(x.len());
+        let mut z = vec![Complex32::new(0.0, 0.0); s.bins() * fr];
+        s.stft(&x, &mut z);
+        let mut y = vec![0f32; x.len()];
+        s.istft(&z, fr, &mut y);
+        let err = x
+            .iter()
+            .zip(&y)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(err < 1e-4, "roundtrip err {err}");
+    }
+}

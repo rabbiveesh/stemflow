@@ -2,7 +2,7 @@
 //! bass for that window out", so other models (BS-RoFormer, SCNet, ...) can slot in
 //! as further `Separator` impls.
 
-use crate::spec::{frames_for, PlainStft, Stft, BINS, FULL_BINS, HOP};
+use crate::spec::{frames_for, HannStft, PlainStft, Stft, BINS, FULL_BINS, HOP};
 use anyhow::{Context, Result};
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
@@ -288,6 +288,84 @@ impl Separator for ScNet {
             }
             self.stft.istft(&z, fr, &mut y);
             out[ch * seg..(ch + 1) * seg].copy_from_slice(&y[..seg]);
+        }
+        Ok(out)
+    }
+}
+
+/// BS-RoFormer SW, bass head, exported by tools/export_bsrofo.py. Its STFT
+/// (n_fft 2048, hop 512, Hann, unnormalized) runs here; the graph's frame axis is
+/// dynamic, so the window length is a free choice (trained at 588800 = 13.35 s).
+pub struct BsRoformer {
+    session: Session,
+    stft: HannStft,
+    seg: usize,
+}
+
+impl BsRoformer {
+    pub fn load(path: &Path, device: Device, threads: usize, seg: usize) -> Result<Self> {
+        let mut m = BsRoformer {
+            session: session(path, device, threads, gpu_mem_mb())?,
+            stft: HannStft::new(2048, 512),
+            seg,
+        };
+        m.separate(&vec![0.0; 2 * seg])?;
+        Ok(m)
+    }
+
+    fn frames(&self) -> usize {
+        self.stft.frames_for(self.seg)
+    }
+
+    /// Model input: `[4, 1025, frames]` = L re, L im, R re, R im.
+    pub fn spec_in(&self, mix: &[f32]) -> Vec<f32> {
+        let (seg, fr, bins) = (self.seg, self.frames(), self.stft.bins());
+        let plane = bins * fr;
+        let mut out = vec![0f32; 4 * plane];
+        let mut z = vec![Complex32::new(0.0, 0.0); plane];
+        for ch in 0..2 {
+            self.stft.stft(&mix[ch * seg..(ch + 1) * seg], &mut z);
+            let (re, im) = out[2 * ch * plane..(2 * ch + 2) * plane].split_at_mut(plane);
+            for (i, c) in z.iter().enumerate() {
+                re[i] = c.re;
+                im[i] = c.im;
+            }
+        }
+        out
+    }
+}
+
+impl Separator for BsRoformer {
+    fn window_len(&self) -> usize {
+        self.seg
+    }
+
+    fn separate(&mut self, mix: &[f32]) -> Result<Vec<f32>> {
+        let seg = self.seg;
+        assert_eq!(mix.len(), 2 * seg);
+        let spec_in = self.spec_in(mix);
+        self.separate_spec(spec_in)
+    }
+}
+
+impl BsRoformer {
+    /// The model + iSTFT half of `separate`, from a ready-made input spectrogram.
+    pub fn separate_spec(&mut self, spec_in: Vec<f32>) -> Result<Vec<f32>> {
+        let (seg, fr, bins) = (self.seg, self.frames(), self.stft.bins());
+        let outputs = self.session.run(
+            ort::inputs!["spec_in" => Tensor::from_array(([1usize, 4, bins, fr], spec_in))?],
+        )?;
+        let (_, spec) = outputs["spec"].try_extract_tensor::<f32>()?;
+        let plane = bins * fr;
+        let mut out = vec![0f32; 2 * seg];
+        let mut z = vec![Complex32::new(0.0, 0.0); plane];
+        for ch in 0..2 {
+            let re = &spec[2 * ch * plane..(2 * ch + 1) * plane];
+            let im = &spec[(2 * ch + 1) * plane..(2 * ch + 2) * plane];
+            for i in 0..plane {
+                z[i] = Complex32::new(re[i], im[i]);
+            }
+            self.stft.istft(&z, fr, &mut out[ch * seg..(ch + 1) * seg]);
         }
         Ok(out)
     }

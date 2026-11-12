@@ -30,12 +30,16 @@ app ──▶ [stemflow null sink] ──monitor──▶ stemflow ──▶ bas
 # ONNX Runtime from Microsoft's GitHub releases (+ CUDA 12 / cuDNN 9 libs for cuda)
 tools/fetch-ort.sh cuda        # or: tools/fetch-ort.sh cpu
 
-# One-time model export (CPU-only torch, ~1 GB venv)
+# One-time model export (CPU-only torch, ~1 GB venv). The default model is
+# BS-RoFormer SW: its weights (enerjazzer/BS-ROFO-SW-Fixed on Hugging Face,
+# config.yaml + model.ckpt) go in models/ext/bsrofo/, and the model class comes
+# from ZFTurbo's Music-Source-Separation-Training.
 tools/setup-export-env.sh
-(cd tools && .venv/bin/python -I export_htdemucs.py ../models)
+git clone --depth 1 https://github.com/ZFTurbo/Music-Source-Separation-Training tools/third_party/msst
+(cd tools && .venv/bin/python -I export_bsrofo.py ../models/ext/bsrofo ../models)
 
 cargo build --release --features cuda
-./target/release/stemflow verify --device cuda   # Rust pipeline vs PyTorch
+./target/release/stemflow verify --sep bsrofo --device cuda   # Rust pipeline vs PyTorch
 ```
 
 ## Use
@@ -52,11 +56,36 @@ removes the sink, which puts Spotify back on your normal output.
 | `--grab NAME` | `spotify` | which app's streams to capture (substring of the app name) |
 | `--hop S` | `1.0` | seconds of new audio per model run; compute must stay under this |
 | `--lookahead S` | `1.5` | future context per sample; more = cleaner but laggier |
-| `--rest-gain G` | `0` | mix the rest of the band back in quietly (e.g. `0.15`) to keep your place |
+| `--balance B` | last used, else `-1` | one line: `-1` bass solo, `0` full mix, `1` no bass (play-along) |
+| `--bass P` / `--band P` | | set each level separately, in % of how loud it sounds (50 = half as loud) |
+| `--window S` | `3` | BS-RoFormer context; longer needs more GPU memory, not more latency |
 | `--output SINK` | default sink | where the bass plays |
 | `--stereo-in` | off | feed the model real stereo instead of a mono fold (see below) |
 
 Latency is roughly lookahead + hop + 0.3 s of buffer, so about 2.8 s by default.
+Level changes are applied as audio leaves for the speakers, so they're heard within
+about 0.1 s. The last levels are remembered in `~/.local/state/stemflow/levels`.
+
+## GNOME Shell extension (GNOME 42)
+
+```bash
+gnome/install.sh     # systemd user unit + extension; then reload the shell
+```
+
+A top-bar menu to start/stop stemflow and move the mix, plus hotkeys:
+
+| key | |
+|---|---|
+| `Super+[` / `Super+]` | toward bass solo / toward play-along |
+| `Super+\` | bass solo, or back to where you were |
+| `Super+Shift+\` | no bass (play-along), or back |
+| `Super+Alt+B` | start / stop |
+
+Scrolling on the icon moves the mix too. "Separate sliders" in the menu gives the
+bass and the band a slider each. stemflow also serves `org.stemflow.Control` on the
+session bus (`busctl --user introspect org.stemflow.Control /org/stemflow/Control`),
+and the unit takes extra flags from `~/.config/stemflow/env`
+(`STEMFLOW_ARGS="--grab firefox"`).
 
 To try settings offline and see whether they'd keep up live:
 
@@ -65,8 +94,8 @@ ffmpeg -i track.flac -ar 44100 track.wav
 ./target/release/stemflow file --device cuda track.wav bass.wav
 ```
 
-On an RTX 4060 Laptop GPU, one 7.8 s window takes 0.33 s at the median and 0.51 s at
-worst, so a 1 s hop has plenty of headroom.
+On an RTX 4060 Laptop GPU, BS-RoFormer takes 0.62 s per 3 s window, which keeps up
+with a 1 s hop. Windows of 5 s and up run out of the 8 GB in fp32.
 
 ## Notes
 
@@ -84,6 +113,9 @@ worst, so a 1 s hop has plenty of headroom.
 - The model is swappable behind the `Separator` trait in `src/model.rs`.
 
 ## Other models
+
+BS-RoFormer SW won blind listening rounds against all of these. `--sep demucs`
+runs htdemucs_ft (export with `export_htdemucs.py`; 0.33 s per 7.8 s window).
 
 `--sep scnet` runs SCNet XL IHF (from ZFTurbo's Music-Source-Separation-Training,
 Multisong bass SDR 11.94 vs 11.96 for htdemucs_ft). It takes 1.44 s per 11 s window

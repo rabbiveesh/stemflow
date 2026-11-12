@@ -1,0 +1,8 @@
+{
+  "uuid": "stemflow@veesh",
+  "name": "stemflow",
+  "description": "Live control for stemflow's bass isolation: one slider from bass solo through the full mix to play-along, plus hotkeys.",
+  "shell-version": ["42"],
+  "settings-schema": "org.gnome.shell.extensions.stemflow",
+  "url": "https://github.com/rabbiveesh/stemflow"
+}

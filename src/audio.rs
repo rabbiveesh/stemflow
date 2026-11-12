@@ -3,8 +3,9 @@
 //! We create a null sink called `stemflow`, move the target app's streams into it,
 //! capture its monitor, run the separator, and play the result to the real output.
 
+use crate::control::Control;
 use crate::model::{Separator, SAMPLE_RATE};
-use crate::stream::Streamer;
+use crate::stream::{Stems, Streamer};
 use anyhow::{bail, Context, Result};
 use libpulse_binding::def::BufferAttr;
 use libpulse_binding::sample::{Format, Spec};
@@ -77,6 +78,7 @@ fn f32_to_bytes(x: &[f32]) -> Vec<u8> {
 
 pub fn live<S: Separator + Send + 'static>(
     mut st: Streamer<S>,
+    ctl: Arc<Control>,
     grab: &str,
     output: Option<String>,
     slack: f32,
@@ -127,7 +129,10 @@ pub fn live<S: Separator + Send + 'static>(
     )
     .map_err(|e| anyhow::anyhow!("opening capture: {e}"))?;
     let hop = st.hop;
-    let play_buf = ((2 * hop + (slack * SAMPLE_RATE as f32) as usize) * frame) as u32;
+    // Keep the device buffer small and the jitter buffer here instead, so the mix
+    // levels (applied as samples leave for the device) change within ~0.1 s.
+    let block = SAMPLE_RATE as usize / 50; // 20 ms
+    let play_buf = (5 * block * frame) as u32;
     let play = Simple::new(
         None,
         "stemflow",
@@ -161,7 +166,7 @@ pub fn live<S: Separator + Send + 'static>(
 
     // capture -> worker -> playback, each on its own thread.
     let (tx_in, rx_in) = mpsc::channel::<Vec<f32>>();
-    let (tx_out, rx_out) = mpsc::channel::<Vec<f32>>();
+    let (tx_out, rx_out) = mpsc::channel::<Stems>();
     let r = running.clone();
     std::thread::spawn(move || {
         let mut buf = vec![0u8; SAMPLE_RATE as usize / 50 * frame];
@@ -176,15 +181,62 @@ pub fn live<S: Separator + Send + 'static>(
             }
         }
     });
+    let pctl = ctl.clone();
+    let refill = hop + (slack * SAMPLE_RATE as f32) as usize;
     let player = std::thread::spawn(move || -> Result<()> {
-        let silence = vec![0f32; 2 * (slack * SAMPLE_RATE as f32) as usize];
-        play.write(&f32_to_bytes(&silence))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        for chunk in rx_out {
-            play.write(&f32_to_bytes(&chunk))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (mut bass, mut band) = (Vec::<f32>::new(), Vec::<f32>::new());
+        let mut pos = 0; // frames already played from the front of bass/band
+        let mut buffering = true;
+        let mut g = pctl.gains();
+        let mut out = vec![0f32; 2 * block];
+        loop {
+            // Take whatever the worker has finished; block only when starved.
+            let avail = bass.len() / 2 - pos;
+            let next = if buffering || avail < block {
+                rx_out.recv().ok()
+            } else {
+                rx_out.try_recv().ok()
+            };
+            if let Some(st) = next {
+                bass.drain(..2 * pos);
+                band.drain(..2 * pos);
+                pos = 0;
+                bass.extend(st.bass);
+                band.extend(st.band);
+            } else if buffering || avail < block {
+                return Ok(()); // worker gone
+            }
+            let avail = bass.len() / 2 - pos;
+            if buffering {
+                if avail < refill {
+                    continue;
+                }
+                buffering = false;
+            }
+            while bass.len() / 2 - pos >= block {
+                let target = pctl.gains();
+                for i in 0..block {
+                    let a = (i as f32 + 1.0) / block as f32; // ramp: no zipper noise
+                    let gb = g.0 + (target.0 - g.0) * a;
+                    let gr = g.1 + (target.1 - g.1) * a;
+                    for ch in 0..2 {
+                        let k = 2 * (pos + i) + ch;
+                        out[2 * i + ch] = gb * bass[k] + gr * band[k];
+                    }
+                }
+                g = target;
+                pos += block;
+                play.write(&f32_to_bytes(&out))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                if running_low(&bass, pos, block) {
+                    break; // go fetch the next chunk once we're down to one block
+                }
+            }
+            if bass.len() / 2 - pos == 0 {
+                eprintln!("warning: playback ran dry; rebuffering");
+                buffering = true;
+            }
         }
-        Ok(())
     });
 
     let hop_s = hop as f32 / SAMPLE_RATE as f32;
@@ -203,7 +255,9 @@ pub fn live<S: Separator + Send + 'static>(
             let t = Instant::now();
             let out = st.process(&chunk)?;
             let dt = t.elapsed().as_secs_f32();
+            ctl.compute_us.store((dt * 1e6) as u64, Ordering::Relaxed);
             if dt > hop_s {
+                ctl.overruns.fetch_add(1, Ordering::Relaxed);
                 eprintln!("warning: run took {dt:.2}s > hop {hop_s:.2}s");
             }
             if tx_out.send(out).is_err() {
@@ -221,4 +275,10 @@ pub fn live<S: Separator + Send + 'static>(
         }
     }
     Ok(())
+}
+
+/// The player drains its queue a block at a time and goes back for more input
+/// when only one block is left.
+fn running_low(bass: &[f32], pos: usize, block: usize) -> bool {
+    bass.len() / 2 - pos < 2 * block
 }

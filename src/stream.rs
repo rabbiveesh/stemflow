@@ -15,10 +15,22 @@
 use crate::model::Separator;
 use anyhow::Result;
 
-pub struct Mix {
-    pub bass_gain: f32,
-    /// Gain for everything-but-the-bass (mix minus bass). 0 = bass solo.
-    pub rest_gain: f32,
+/// One hop of output, unmixed: the bass and everything else ("band" = mix - bass),
+/// each interleaved stereo. Levels are applied at playback, so a level change is
+/// heard right away instead of after the model's lookahead and buffers.
+pub struct Stems {
+    pub bass: Vec<f32>,
+    pub band: Vec<f32>,
+}
+
+impl Stems {
+    pub fn mix(&self, bass_gain: f32, band_gain: f32) -> Vec<f32> {
+        self.bass
+            .iter()
+            .zip(&self.band)
+            .map(|(b, r)| bass_gain * b + band_gain * r)
+            .collect()
+    }
 }
 
 pub struct Streamer<S: Separator> {
@@ -28,13 +40,12 @@ pub struct Streamer<S: Separator> {
     pub lookahead: usize,
     xfade: usize,
     win: Vec<f32>,  // planar [2, seg]
-    tail: Vec<f32>, // planar [2, xfade]: previous step's output just past its slice
+    tail: Vec<f32>, // planar [2, xfade]: previous step's bass just past its slice
     have_tail: bool,
-    pub mix: Mix,
 }
 
 impl<S: Separator> Streamer<S> {
-    pub fn new(sep: S, hop: usize, lookahead: usize, xfade: usize, mix: Mix) -> Self {
+    pub fn new(sep: S, hop: usize, lookahead: usize, xfade: usize) -> Self {
         let seg = sep.window_len();
         assert!(
             hop > 0 && xfade <= lookahead,
@@ -53,7 +64,6 @@ impl<S: Separator> Streamer<S> {
             win: vec![0.0; 2 * seg],
             tail: vec![0.0; 2 * xfade],
             have_tail: false,
-            mix,
         }
     }
 
@@ -67,9 +77,9 @@ impl<S: Separator> Streamer<S> {
         self.hop + self.lookahead
     }
 
-    /// Feed exactly `hop` interleaved stereo frames, get `hop` interleaved frames back
+    /// Feed exactly `hop` interleaved stereo frames, get `hop` frames of stems back
     /// (delayed by `delay()`).
-    pub fn process(&mut self, input: &[f32]) -> Result<Vec<f32>> {
+    pub fn process(&mut self, input: &[f32]) -> Result<Stems> {
         let (seg, hop, xf) = (self.seg, self.hop, self.xfade);
         assert_eq!(input.len(), 2 * hop);
         for ch in 0..2 {
@@ -79,29 +89,31 @@ impl<S: Separator> Streamer<S> {
                 *s = input[2 * i + ch];
             }
         }
-        let bass = self.sep.separate(&self.win)?;
+        let est = self.sep.separate(&self.win)?;
 
         let start = seg - self.lookahead - hop;
-        let (bg, rg) = (self.mix.bass_gain, self.mix.rest_gain);
-        let mut out = vec![0f32; 2 * hop];
+        let mut bass = vec![0f32; 2 * hop];
+        let mut band = vec![0f32; 2 * hop];
         for ch in 0..2 {
-            let b = &bass[ch * seg..(ch + 1) * seg];
+            let b = &est[ch * seg..(ch + 1) * seg];
             let m = &self.win[ch * seg..(ch + 1) * seg];
-            let y = |i: usize| bg * b[i] + rg * (m[i] - b[i]);
             for i in 0..hop {
-                let mut v = y(start + i);
+                let mut v = b[start + i];
                 if self.have_tail && i < xf {
                     let a = (i as f32 + 0.5) / xf as f32;
                     v = self.tail[ch * xf + i] * (1.0 - a) + v * a;
                 }
-                out[2 * i + ch] = v;
+                bass[2 * i + ch] = v;
+                // The mix itself is exact; only the split between stems is estimated,
+                // so bass + band always sums back to the original.
+                band[2 * i + ch] = m[start + i] - v;
             }
             for i in 0..xf {
-                self.tail[ch * xf + i] = y(start + hop + i);
+                self.tail[ch * xf + i] = b[start + hop + i];
             }
         }
         self.have_tail = true;
-        Ok(out)
+        Ok(Stems { bass, band })
     }
 }
 
@@ -123,21 +135,12 @@ mod tests {
     #[test]
     fn identity_is_delayed_copy() {
         let (hop, la) = (100, 37);
-        let mut s = Streamer::new(
-            Ident(1000),
-            hop,
-            la,
-            20,
-            Mix {
-                bass_gain: 1.0,
-                rest_gain: 0.0,
-            },
-        );
+        let mut s = Streamer::new(Ident(1000), hop, la, 20);
         let n = 20 * hop;
         let x: Vec<f32> = (0..2 * n).map(|i| (i as f32 * 0.37).sin()).collect();
         let mut y = Vec::new();
         for c in x.chunks(2 * hop) {
-            y.extend(s.process(c).unwrap());
+            y.extend(s.process(c).unwrap().bass);
         }
         let d = 2 * s.delay();
         for i in 0..(2 * n - d) {
