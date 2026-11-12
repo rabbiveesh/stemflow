@@ -123,8 +123,10 @@ impl Control {
         )
     }
     pub fn set_levels(&self, bass: f32, band: f32) {
-        self.bass.store(level(bass, MAX_BASS).to_bits(), Ordering::Relaxed);
-        self.band.store(level(band, 1.0).to_bits(), Ordering::Relaxed);
+        self.bass
+            .store(level(bass, MAX_BASS).to_bits(), Ordering::Relaxed);
+        self.band
+            .store(level(band, 1.0).to_bits(), Ordering::Relaxed);
     }
     /// (bass gain, band gain) as amplitudes.
     pub fn gains(&self) -> (f32, f32) {
@@ -413,7 +415,10 @@ pub fn serve(
                 continue;
             }
             seen = g;
-            let Ok(iface) = c.object_server().interface::<_, Service>("/org/stemflow/Control") else {
+            let Ok(iface) = c
+                .object_server()
+                .interface::<_, Service>("/org/stemflow/Control")
+            else {
                 return;
             };
             let svc = iface.get();

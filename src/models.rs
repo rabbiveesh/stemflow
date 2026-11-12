@@ -39,7 +39,11 @@ fn classify(stem: &str) -> Option<(Arch, &'static str, &'static str)> {
     } else {
         return None;
     };
-    let target = if stem.ends_with("_vocals") { "vocals" } else { "bass" };
+    let target = if stem.ends_with("_vocals") {
+        "vocals"
+    } else {
+        "bass"
+    };
     Some((arch, target, name))
 }
 
@@ -50,11 +54,19 @@ fn model(dir: &Path, rel: &Path) -> Option<Model> {
     let stem = rel.file_stem()?.to_str()?;
     let (arch, target, name) = classify(stem)?;
     let id = rel.with_extension("").to_str()?.to_string();
-    let label = match rel.parent().and_then(|p| p.to_str()).filter(|p| !p.is_empty()) {
+    let label = match rel
+        .parent()
+        .and_then(|p| p.to_str())
+        .filter(|p| !p.is_empty())
+    {
         Some(exp) => format!("{exp}: {name}"),
         None => name.to_string(),
     };
-    let label = if target == "vocals" { format!("{label} (vocals)") } else { label };
+    let label = if target == "vocals" {
+        format!("{label} (vocals)")
+    } else {
+        label
+    };
     Some(Model {
         id,
         label,
@@ -68,7 +80,9 @@ fn model(dir: &Path, rel: &Path) -> Option<Model> {
 pub fn scan(dir: &Path) -> Vec<Model> {
     let mut out = Vec::new();
     let entries = |p: &Path| -> Vec<std::fs::DirEntry> {
-        std::fs::read_dir(p).map(|r| r.flatten().collect()).unwrap_or_default()
+        std::fs::read_dir(p)
+            .map(|r| r.flatten().collect())
+            .unwrap_or_default()
     };
     for e in entries(dir) {
         let name = PathBuf::from(e.file_name());
@@ -102,9 +116,20 @@ mod tests {
     fn names() {
         let d = Path::new("/m");
         let m = model(d, Path::new("ft2/htdemucs_ft_bass.onnx")).unwrap();
-        assert_eq!((m.id.as_str(), m.label.as_str(), m.arch, m.target), ("ft2/htdemucs_ft_bass", "ft2: Demucs ft", Arch::Demucs, "bass"));
+        assert_eq!(
+            (m.id.as_str(), m.label.as_str(), m.arch, m.target),
+            (
+                "ft2/htdemucs_ft_bass",
+                "ft2: Demucs ft",
+                Arch::Demucs,
+                "bass"
+            )
+        );
         let m = model(d, Path::new("bsrofo_sw_vocals.onnx")).unwrap();
-        assert_eq!((m.label.as_str(), m.target), ("BS-RoFormer SW (vocals)", "vocals"));
+        assert_eq!(
+            (m.label.as_str(), m.target),
+            ("BS-RoFormer SW (vocals)", "vocals")
+        );
         assert!(model(d, Path::new("scnet_xl_ihf.ckpt")).is_none());
         assert!(model(d, Path::new("other.onnx")).is_none());
     }

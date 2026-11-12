@@ -345,7 +345,10 @@ impl Limiter {
     fn apply(&mut self, out: &mut [f32], next_peak: f32) {
         let peak = out.iter().fold(0f32, |m, x| m.max(x.abs()));
         let need = |p: f32| if p > Self::CEIL { Self::CEIL / p } else { 1.0 };
-        let target = (self.g * Self::RELEASE).min(1.0).min(need(peak)).min(need(next_peak));
+        let target = (self.g * Self::RELEASE)
+            .min(1.0)
+            .min(need(peak))
+            .min(need(next_peak));
         let n = out.len() / 2;
         if self.g < 1.0 || target < 1.0 {
             for i in 0..n {
@@ -370,7 +373,9 @@ mod limiter_tests {
         // quiet, then a loud burst (announced one block ahead), then quiet again
         let level = |b: usize| if (5..10).contains(&b) { 3.0 } else { 0.5 };
         for b in 0..400 {
-            let mut out: Vec<f32> = (0..2 * block).map(|i| level(b) * ((i / 2) as f32 * 0.05).sin()).collect();
+            let mut out: Vec<f32> = (0..2 * block)
+                .map(|i| level(b) * ((i / 2) as f32 * 0.05).sin())
+                .collect();
             lim.apply(&mut out, level(b + 1));
             let peak = out.iter().fold(0f32, |m, x| m.max(x.abs()));
             assert!(peak <= Limiter::CEIL + 1e-4, "block {b}: {peak}");

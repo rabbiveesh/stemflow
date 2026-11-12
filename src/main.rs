@@ -189,7 +189,10 @@ fn separator(o: &Opts) -> Result<Box<dyn Separator + Send>> {
     let demucs = || HtDemucs::load(&o.models.join(demucs_onnx(o.target())), o.device, o.threads);
     let scnet = || ScNet::load(&o.models.join(SCNET_ONNX), o.device, o.threads);
     if o.target() != Target::Bass && !matches!(o.sep(), Sep::Bsrofo | Sep::Demucs) {
-        bail!("--target {} needs --sep bsrofo or demucs", o.target().name());
+        bail!(
+            "--target {} needs --sep bsrofo or demucs",
+            o.target().name()
+        );
     }
     let sep: Box<dyn Separator + Send> = match o.sep() {
         Sep::Demucs => Box::new(demucs()?),
@@ -221,7 +224,12 @@ fn load_model(o: &Opts, m: &models::Model) -> Result<Box<dyn Separator + Send>> 
     let sep: Box<dyn Separator + Send> = match m.arch {
         models::Arch::Demucs => Box::new(HtDemucs::load(&m.path, o.device, o.threads)?),
         models::Arch::Scnet => Box::new(ScNet::load(&m.path, o.device, o.threads)?),
-        models::Arch::Bsrofo => Box::new(BsRoformer::load(&m.path, o.device, o.threads, secs(o.window))?),
+        models::Arch::Bsrofo => Box::new(BsRoformer::load(
+            &m.path,
+            o.device,
+            o.threads,
+            secs(o.window),
+        )?),
     };
     Ok(fold(o, sep))
 }
@@ -229,8 +237,12 @@ fn load_model(o: &Opts, m: &models::Model) -> Result<Box<dyn Separator + Send>> 
 fn streamer(o: &Opts) -> Result<Streamer<Box<dyn Separator + Send>>> {
     match &o.model {
         Some(id) => {
-            let m = models::find(&o.models, id)
-                .with_context(|| format!("no model `{id}` in {} (see `stemflow models`)", o.models.display()))?;
+            let m = models::find(&o.models, id).with_context(|| {
+                format!(
+                    "no model `{id}` in {} (see `stemflow models`)",
+                    o.models.display()
+                )
+            })?;
             wrap(o, load_model(o, &m)?)
         }
         None => wrap(o, separator(o)?),
@@ -240,13 +252,17 @@ fn streamer(o: &Opts) -> Result<Streamer<Box<dyn Separator + Send>>> {
 /// The model live mode starts with: --model, else --sep/--target if given, else the
 /// one last picked in the menu (if it still exists), else the default.
 fn live_model(o: &Opts) -> Option<models::Model> {
-    let id = o.model.clone().or_else(|| {
-        if o.sep.is_none() && o.target.is_none() {
-            control::load_model().filter(|id| models::find(&o.models, id).is_some())
-        } else {
-            None
-        }
-    }).or_else(|| o.sep_model_id())?;
+    let id = o
+        .model
+        .clone()
+        .or_else(|| {
+            if o.sep.is_none() && o.target.is_none() {
+                control::load_model().filter(|id| models::find(&o.models, id).is_some())
+            } else {
+                None
+            }
+        })
+        .or_else(|| o.sep_model_id())?;
     models::find(&o.models, &id)
 }
 
@@ -285,21 +301,33 @@ fn main() -> Result<()> {
                 st.hop as f64 / SAMPLE_RATE as f64,
             );
             // Off the bus is fine (e.g. no session bus over ssh): CLI flags still work.
-            let _bus = control::serve(ctl.clone(), opts.models.clone(), &grab, lat + slack as f64, hop)
-                .map_err(|e| eprintln!("stemflow: no D-Bus control ({e})"))
-                .ok();
+            let _bus = control::serve(
+                ctl.clone(),
+                opts.models.clone(),
+                &grab,
+                lat + slack as f64,
+                hop,
+            )
+            .map_err(|e| eprintln!("stemflow: no D-Bus control ({e})"))
+            .ok();
             // Switching models from the menu: drop the running one (frees the GPU),
             // then load the new one with the same settings.
-            let load = move |id: &str| -> Result<(Streamer<Box<dyn Separator + Send>>, &'static str)> {
-                let m = models::find(&opts.models, id).with_context(|| format!("no model `{id}`"))?;
-                Ok((wrap(&opts, load_model(&opts, &m)?)?, m.target))
-            };
+            let load =
+                move |id: &str| -> Result<(Streamer<Box<dyn Separator + Send>>, &'static str)> {
+                    let m = models::find(&opts.models, id)
+                        .with_context(|| format!("no model `{id}`"))?;
+                    Ok((wrap(&opts, load_model(&opts, &m)?)?, m.target))
+                };
             audio::live(st, ctl, &grab, output, slack, load)
         }
         Cmd::Models { models } => {
             let cur = control::load_model();
             for m in models::scan(&models) {
-                let mark = if cur.as_deref() == Some(m.id.as_str()) { "*" } else { " " };
+                let mark = if cur.as_deref() == Some(m.id.as_str()) {
+                    "*"
+                } else {
+                    " "
+                };
                 println!("{mark} {:32} {}", m.id, m.label);
             }
             Ok(())
@@ -328,10 +356,7 @@ fn main() -> Result<()> {
 /// Starting levels: explicit flags, else the remembered ones, else bass solo.
 fn levels(o: &Opts, target: &'static str, remember: bool) -> std::sync::Arc<control::Control> {
     let ctl = control::Control::new(target, 1.0, 0.0);
-    if let Some((a, b)) = remember
-        .then(|| control::load_levels(target))
-        .flatten()
-    {
+    if let Some((a, b)) = remember.then(|| control::load_levels(target)).flatten() {
         ctl.set_levels(a, b);
     }
     if let Some(b) = o.balance {

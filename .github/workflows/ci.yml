@@ -41,14 +41,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: astral-sh/setup-uv@v10.3.3
       - name: Cache exported model + demucs weights
+        id: model-cache
         uses: actions/cache@v6
         with:
           path: |
             models
             ~/.cache/torch/hub/checkpoints
           key: model-${{ hashFiles('tools/export_htdemucs.py', 'tools/setup-export-env.sh') }}
+          # An older entry still has the demucs weights, so a changed export script
+          # doesn't have to re-download them (dl.fbaipublicfiles.com can be flaky).
+          restore-keys: model-
       - name: Export model
         run: |
+          # A partial cache hit has a stale export: redo it from the cached weights.
+          if [ "${{ steps.model-cache.outputs.cache-hit }}" != "true" ]; then
+            rm -f models/*.onnx
+          fi
           if [ ! -f models/htdemucs_ft_bass.onnx ]; then
             tools/setup-export-env.sh
             cd tools && .venv/bin/python -I export_htdemucs.py ../models
