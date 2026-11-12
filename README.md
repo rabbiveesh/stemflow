@@ -61,7 +61,7 @@ removes the sink, which puts Spotify back on your normal output.
 | `--window S` | `3` | BS-RoFormer context; longer needs more GPU memory, not more latency |
 | `--output SINK` | default sink | where the bass plays |
 | `--stereo-in` | off | feed the model real stereo instead of a mono fold (see below) |
-| `--target vocals` | `bass` | karaoke: solo / full / remove act on the vocals instead (BS-RoFormer only) |
+| `--target vocals` | `bass` | karaoke: solo / full / remove act on the vocals instead (`bsrofo` or `demucs`) |
 
 Latency is roughly lookahead + hop + 0.3 s of buffer, so about 2.8 s by default.
 Level changes are applied as audio leaves for the speakers, so they're heard within

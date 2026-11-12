@@ -51,13 +51,13 @@ enum Cmd {
         models: PathBuf,
         #[arg(long, value_enum, default_value_t = Device::Cpu)]
         device: Device,
-        /// Which BS-RoFormer head to verify.
+        /// Which stem to verify (bsrofo and demucs).
         #[arg(long, value_enum, default_value_t = Target::Bass)]
         target: Target,
     },
 }
 
-/// The stem the mix controls act on. Only BS-RoFormer SW has a vocals head.
+/// The stem the mix controls act on. BS-RoFormer SW and htdemucs_ft have vocals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum Target {
     Bass,
@@ -90,7 +90,7 @@ enum Sep {
 struct Opts {
     #[arg(long, value_enum, default_value_t = Sep::Bsrofo)]
     sep: Sep,
-    /// Stem to isolate or remove. `vocals` (karaoke) needs --sep bsrofo.
+    /// Stem to isolate or remove. `vocals` (karaoke) needs --sep bsrofo or demucs.
     #[arg(long, value_enum, default_value_t = Target::Bass)]
     target: Target,
     /// Directory with the exported .onnx models.
@@ -145,17 +145,19 @@ fn secs(s: f32) -> usize {
     (s * SAMPLE_RATE as f32).round() as usize
 }
 
-const DEMUCS_ONNX: &str = "htdemucs_ft_bass.onnx";
+fn demucs_onnx(t: Target) -> String {
+    format!("htdemucs_ft_{}.onnx", t.name())
+}
 const SCNET_ONNX: &str = "scnet_xl_ihf_bass.onnx";
 fn bsrofo_onnx(t: Target) -> String {
     format!("bsrofo_sw_{}.onnx", t.name())
 }
 
 fn separator(o: &Opts) -> Result<Box<dyn Separator + Send>> {
-    let demucs = || HtDemucs::load(&o.models.join(DEMUCS_ONNX), o.device, o.threads);
+    let demucs = || HtDemucs::load(&o.models.join(demucs_onnx(o.target)), o.device, o.threads);
     let scnet = || ScNet::load(&o.models.join(SCNET_ONNX), o.device, o.threads);
-    if o.target != Target::Bass && o.sep != Sep::Bsrofo {
-        bail!("--target {} needs --sep bsrofo", o.target.name());
+    if o.target != Target::Bass && !matches!(o.sep, Sep::Bsrofo | Sep::Demucs) {
+        bail!("--target {} needs --sep bsrofo or demucs", o.target.name());
     }
     let sep: Box<dyn Separator + Send> = match o.sep {
         Sep::Demucs => Box::new(demucs()?),
@@ -224,9 +226,11 @@ fn main() -> Result<()> {
             device,
             target,
         } => match sep {
-            Sep::Demucs => verify_demucs(&models, device),
+            Sep::Demucs => verify_demucs(&models, device, target),
             Sep::Scnet => verify_scnet(&models, device),
-            Sep::Ensemble => verify_demucs(&models, device).and(verify_scnet(&models, device)),
+            Sep::Ensemble => {
+                verify_demucs(&models, device, Target::Bass).and(verify_scnet(&models, device))
+            }
             Sep::Bsrofo => verify_bsrofo(&models, device, target),
         },
     }
@@ -362,14 +366,18 @@ fn report(
     Ok(())
 }
 
-fn verify_demucs(models: &Path, device: Device) -> Result<()> {
-    let r = models.join("ref");
+fn verify_demucs(models: &Path, device: Device, target: Target) -> Result<()> {
+    let t = target.name();
+    let r = models.join(match target {
+        Target::Bass => "ref".to_string(),
+        _ => format!("ref_demucs_{t}"),
+    });
     let (mix, want_mag, want) = (
         read_f32(&r.join("mix.f32"))?,
         read_f32(&r.join("mag.f32"))?,
-        read_f32(&r.join("bass.f32"))?,
+        read_f32(&r.join(format!("{t}.f32")))?,
     );
-    let mut m = HtDemucs::load(&models.join(DEMUCS_ONNX), device, 0)?;
+    let mut m = HtDemucs::load(&models.join(demucs_onnx(target)), device, 0)?;
     let mag_err = max_err(&m.mag(&mix), &want_mag);
     let t = Instant::now();
     let got = m.separate(&mix)?;
