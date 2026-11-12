@@ -138,7 +138,7 @@ pub fn live<S: Separator + Send + 'static>(
         "stemflow",
         Direction::Playback,
         Some(&output),
-        "bass",
+        ctl.target,
         &spec,
         None,
         Some(&BufferAttr {
@@ -156,8 +156,9 @@ pub fn live<S: Separator + Send + 'static>(
         pactl(&["move-sink-input", id, SINK])?;
     }
     eprintln!(
-        "stemflow: {} `{grab}` stream(s) -> {SINK} -> bass -> {output}; latency ≈ {:.1}s (Ctrl-C to stop)",
+        "stemflow: {} `{grab}` stream(s) -> {SINK} -> {} -> {output}; latency ≈ {:.1}s (Ctrl-C to stop)",
         grabbed.len(),
+        ctl.target,
         (st.latency() as f32 / SAMPLE_RATE as f32) + slack
     );
     if grabbed.is_empty() {
@@ -189,6 +190,7 @@ pub fn live<S: Separator + Send + 'static>(
         let mut buffering = true;
         let mut g = pctl.gains();
         let mut out = vec![0f32; 2 * block];
+        let mut lim = Limiter::new();
         loop {
             // Take whatever the worker has finished; block only when starved.
             let avail = bass.len() / 2 - pos;
@@ -224,6 +226,11 @@ pub fn live<S: Separator + Send + 'static>(
                         out[2 * i + ch] = gb * bass[k] + gr * band[k];
                     }
                 }
+                // Look one block ahead (it's already buffered) so the limiter is down
+                // before a peak arrives rather than clipping it.
+                let ahead = (bass.len() / 2 - pos - block).min(block);
+                let next = mix_peak(&bass, &band, pos + block, ahead, target);
+                lim.apply(&mut out, next);
                 g = target;
                 pos += block;
                 play.write(&f32_to_bytes(&out))
@@ -281,4 +288,65 @@ pub fn live<S: Separator + Send + 'static>(
 /// when only one block is left.
 fn running_low(bass: &[f32], pos: usize, block: usize) -> bool {
     bass.len() / 2 - pos < 2 * block
+}
+
+/// Peak of `gains.0 * bass + gains.1 * band` over `n` frames from `start`.
+fn mix_peak(bass: &[f32], band: &[f32], start: usize, n: usize, gains: (f32, f32)) -> f32 {
+    bass[2 * start..2 * (start + n)]
+        .iter()
+        .zip(&band[2 * start..2 * (start + n)])
+        .fold(0f32, |m, (b, r)| m.max((gains.0 * b + gains.1 * r).abs()))
+}
+
+/// Block peak limiter with one block of lookahead: the gain ramps down across a
+/// block to whatever both it and the next block need, so nothing goes over
+/// `CEIL`, and recovers slowly (`RELEASE` per block) so it doesn't pump.
+struct Limiter {
+    g: f32,
+}
+
+impl Limiter {
+    const CEIL: f32 = 0.97;
+    /// ~6 dB/s at 20 ms blocks.
+    const RELEASE: f32 = 1.014;
+
+    fn new() -> Self {
+        Limiter { g: 1.0 }
+    }
+
+    fn apply(&mut self, out: &mut [f32], next_peak: f32) {
+        let peak = out.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let need = |p: f32| if p > Self::CEIL { Self::CEIL / p } else { 1.0 };
+        let target = (self.g * Self::RELEASE).min(1.0).min(need(peak)).min(need(next_peak));
+        let n = out.len() / 2;
+        if self.g < 1.0 || target < 1.0 {
+            for i in 0..n {
+                let a = (i as f32 + 1.0) / n as f32;
+                let g = self.g + (target - self.g) * a;
+                out[2 * i] *= g;
+                out[2 * i + 1] *= g;
+            }
+        }
+        self.g = target;
+    }
+}
+
+#[cfg(test)]
+mod limiter_tests {
+    use super::*;
+
+    #[test]
+    fn never_clips_and_recovers() {
+        let mut lim = Limiter::new();
+        let block = 960;
+        // quiet, then a loud burst (announced one block ahead), then quiet again
+        let level = |b: usize| if (5..10).contains(&b) { 3.0 } else { 0.5 };
+        for b in 0..400 {
+            let mut out: Vec<f32> = (0..2 * block).map(|i| level(b) * ((i / 2) as f32 * 0.05).sin()).collect();
+            lim.apply(&mut out, level(b + 1));
+            let peak = out.iter().fold(0f32, |m, x| m.max(x.abs()));
+            assert!(peak <= Limiter::CEIL + 1e-4, "block {b}: {peak}");
+        }
+        assert!(lim.g > 0.999, "recovered to {}", lim.g);
+    }
 }

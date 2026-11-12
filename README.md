@@ -61,10 +61,25 @@ removes the sink, which puts Spotify back on your normal output.
 | `--window S` | `3` | BS-RoFormer context; longer needs more GPU memory, not more latency |
 | `--output SINK` | default sink | where the bass plays |
 | `--stereo-in` | off | feed the model real stereo instead of a mono fold (see below) |
+| `--target vocals` | `bass` | karaoke: solo / full / remove act on the vocals instead (`bsrofo` or `demucs`) |
 
 Latency is roughly lookahead + hop + 0.3 s of buffer, so about 2.8 s by default.
 Level changes are applied as audio leaves for the speakers, so they're heard within
 about 0.1 s. The last levels are remembered in `~/.local/state/stemflow/levels`.
+
+### Karaoke
+
+`--target vocals` swaps BS-RoFormer SW's bass head for its vocals head. Everything
+else stays the same: the balance runs from vocals solo to no vocals, and the
+D-Bus `Bass` property and the "nobass" hotkey now mean the vocals (the `Target`
+property says which stem it is). It costs the same as bass (0.62 s per 1 s hop on
+an RTX 4060 laptop). Export the head once:
+
+```bash
+(cd tools && .venv/bin/python -I export_bsrofo.py ../models/ext/bsrofo ../models vocals)
+./target/release/stemflow verify --sep bsrofo --device cuda --target vocals
+./target/release/stemflow live --device cuda --target vocals --balance 1
+```
 
 ## GNOME Shell extension (GNOME 42)
 

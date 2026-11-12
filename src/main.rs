@@ -51,7 +51,27 @@ enum Cmd {
         models: PathBuf,
         #[arg(long, value_enum, default_value_t = Device::Cpu)]
         device: Device,
+        /// Which stem to verify (bsrofo and demucs).
+        #[arg(long, value_enum, default_value_t = Target::Bass)]
+        target: Target,
     },
+}
+
+/// The stem the mix controls act on. BS-RoFormer SW and htdemucs_ft have vocals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Target {
+    Bass,
+    /// karaoke: solo / full / remove act on the vocals
+    Vocals,
+}
+
+impl Target {
+    fn name(self) -> &'static str {
+        match self {
+            Target::Bass => "bass",
+            Target::Vocals => "vocals",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -70,6 +90,9 @@ enum Sep {
 struct Opts {
     #[arg(long, value_enum, default_value_t = Sep::Bsrofo)]
     sep: Sep,
+    /// Stem to isolate or remove. `vocals` (karaoke) needs --sep bsrofo or demucs.
+    #[arg(long, value_enum, default_value_t = Target::Bass)]
+    target: Target,
     /// Directory with the exported .onnx models.
     #[arg(long, default_value = "models")]
     models: PathBuf,
@@ -95,14 +118,15 @@ struct Opts {
     /// Crossfade between consecutive runs, seconds (must be <= lookahead).
     #[arg(long, default_value_t = 0.1)]
     xfade: f32,
-    /// Starting mix on one line: -1 = bass solo, 0 = full mix, +1 = no bass
+    /// Starting mix on one line: -1 = target (bass) solo, 0 = full mix, +1 = no target
     /// (play-along). Default: the last level set (live), else bass solo.
     #[arg(long, allow_hyphen_values = true)]
     balance: Option<f32>,
-    /// Bass loudness in percent of full (50 sounds half as loud). Overrides --balance.
+    /// Target (bass, or vocals in karaoke) loudness in percent of the original (50 sounds
+    /// half as loud, up to 200 = twice as loud). Overrides --balance.
     #[arg(long)]
     bass: Option<f32>,
-    /// Band (everything but the bass) loudness in percent of full. Overrides --balance.
+    /// Band (everything but the target) loudness in percent of full. Overrides --balance.
     #[arg(long)]
     band: Option<f32>,
     /// CPU threads for inference (0 = ONNX Runtime default).
@@ -122,13 +146,20 @@ fn secs(s: f32) -> usize {
     (s * SAMPLE_RATE as f32).round() as usize
 }
 
-const DEMUCS_ONNX: &str = "htdemucs_ft_bass.onnx";
+fn demucs_onnx(t: Target) -> String {
+    format!("htdemucs_ft_{}.onnx", t.name())
+}
 const SCNET_ONNX: &str = "scnet_xl_ihf_bass.onnx";
-const BSROFO_ONNX: &str = "bsrofo_sw_bass.onnx";
+fn bsrofo_onnx(t: Target) -> String {
+    format!("bsrofo_sw_{}.onnx", t.name())
+}
 
 fn separator(o: &Opts) -> Result<Box<dyn Separator + Send>> {
-    let demucs = || HtDemucs::load(&o.models.join(DEMUCS_ONNX), o.device, o.threads);
+    let demucs = || HtDemucs::load(&o.models.join(demucs_onnx(o.target)), o.device, o.threads);
     let scnet = || ScNet::load(&o.models.join(SCNET_ONNX), o.device, o.threads);
+    if o.target != Target::Bass && !matches!(o.sep, Sep::Bsrofo | Sep::Demucs) {
+        bail!("--target {} needs --sep bsrofo or demucs", o.target.name());
+    }
     let sep: Box<dyn Separator + Send> = match o.sep {
         Sep::Demucs => Box::new(demucs()?),
         Sep::Scnet => Box::new(scnet()?),
@@ -137,7 +168,7 @@ fn separator(o: &Opts) -> Result<Box<dyn Separator + Send>> {
             (Box::new(scnet()?), o.scnet_weight),
         ])),
         Sep::Bsrofo => Box::new(BsRoformer::load(
-            &o.models.join(BSROFO_ONNX),
+            &o.models.join(bsrofo_onnx(o.target)),
             o.device,
             o.threads,
             secs(o.window),
@@ -194,19 +225,25 @@ fn main() -> Result<()> {
             sep,
             models,
             device,
+            target,
         } => match sep {
-            Sep::Demucs => verify_demucs(&models, device),
+            Sep::Demucs => verify_demucs(&models, device, target),
             Sep::Scnet => verify_scnet(&models, device),
-            Sep::Ensemble => verify_demucs(&models, device).and(verify_scnet(&models, device)),
-            Sep::Bsrofo => verify_bsrofo(&models, device),
+            Sep::Ensemble => {
+                verify_demucs(&models, device, Target::Bass).and(verify_scnet(&models, device))
+            }
+            Sep::Bsrofo => verify_bsrofo(&models, device, target),
         },
     }
 }
 
 /// Starting levels: explicit flags, else the remembered ones, else bass solo.
 fn levels(o: &Opts, remember: bool) -> std::sync::Arc<control::Control> {
-    let ctl = control::Control::new(1.0, 0.0);
-    if let Some((a, b)) = remember.then(control::load_levels).flatten() {
+    let ctl = control::Control::new(o.target.name(), 1.0, 0.0);
+    if let Some((a, b)) = remember
+        .then(|| control::load_levels(o.target.name()))
+        .flatten()
+    {
         ctl.set_levels(a, b);
     }
     if let Some(b) = o.balance {
@@ -321,7 +358,7 @@ fn report(
     device: Device,
 ) -> Result<()> {
     println!("[{name}] input spectrogram max abs err vs torch: {input_err:.2e}");
-    println!("[{name}] bass max abs err vs torch: {out_err:.2e} (signal peak {peak:.3})");
+    println!("[{name}] stem max abs err vs torch: {out_err:.2e} (signal peak {peak:.3})");
     println!("[{name}] one window took {dt:.3}s on {device:?} (after warmup)");
     if input_err > 1e-3 || out_err > 1e-3 {
         bail!("[{name}] mismatch");
@@ -330,14 +367,18 @@ fn report(
     Ok(())
 }
 
-fn verify_demucs(models: &Path, device: Device) -> Result<()> {
-    let r = models.join("ref");
+fn verify_demucs(models: &Path, device: Device, target: Target) -> Result<()> {
+    let t = target.name();
+    let r = models.join(match target {
+        Target::Bass => "ref".to_string(),
+        _ => format!("ref_demucs_{t}"),
+    });
     let (mix, want_mag, want) = (
         read_f32(&r.join("mix.f32"))?,
         read_f32(&r.join("mag.f32"))?,
-        read_f32(&r.join("bass.f32"))?,
+        read_f32(&r.join(format!("{t}.f32")))?,
     );
-    let mut m = HtDemucs::load(&models.join(DEMUCS_ONNX), device, 0)?;
+    let mut m = HtDemucs::load(&models.join(demucs_onnx(target)), device, 0)?;
     let mag_err = max_err(&m.mag(&mix), &want_mag);
     let t = Instant::now();
     let got = m.separate(&mix)?;
@@ -362,14 +403,18 @@ fn verify_scnet(models: &Path, device: Device) -> Result<()> {
     report("scnet", in_err, max_err(&got, &want), peak, dt, device)
 }
 
-fn verify_bsrofo(models: &Path, device: Device) -> Result<()> {
-    let r = models.join("ref_bsrofo");
+fn verify_bsrofo(models: &Path, device: Device, target: Target) -> Result<()> {
+    let t = target.name();
+    let r = models.join(match target {
+        Target::Bass => "ref_bsrofo".to_string(),
+        _ => format!("ref_bsrofo_{t}"),
+    });
     let (mix, want_in, want) = (
         read_f32(&r.join("mix.f32"))?,
         read_f32(&r.join("spec_in.f32"))?,
-        read_f32(&r.join("bass.f32"))?,
+        read_f32(&r.join(format!("{t}.f32")))?,
     );
-    let mut m = BsRoformer::load(&models.join(BSROFO_ONNX), device, 0, mix.len() / 2)?;
+    let mut m = BsRoformer::load(&models.join(bsrofo_onnx(target)), device, 0, mix.len() / 2)?;
     let in_err = max_err(&m.spec_in(&mix), &want_in);
     // The model amplifies float32 STFT rounding (1e-5 input jitter moves the output
     // by up to 1e-2), so the strict check feeds torch's own spectrogram: that tests
