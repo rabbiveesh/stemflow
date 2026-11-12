@@ -10,11 +10,22 @@ const PanelMenu = imports.ui.panelMenu;
 const PopupMenu = imports.ui.popupMenu;
 const Slider = imports.ui.slider;
 const ExtensionUtils = imports.misc.extensionUtils;
+const Me = ExtensionUtils.getCurrentExtension();
 
 const BUS_NAME = 'org.stemflow.Control';
 const OBJ_PATH = '/org/stemflow/Control';
 const UNIT = 'stemflow.service';
 const STEP = 0.1; // hotkey / scroll step on the -1..1 line
+
+// The clef is a -symbolic icon tinted water-blue through CSS (yellow when the GPU
+// falls behind); the leaf and drops sit on top in fixed colours. The OSD gets a
+// pre-coloured version.
+const CLEF = 'color: #5aa9e0;';
+const CLEF_WARN = 'color: #f6d32d;';
+function gicon(name) {
+    return Gio.icon_new_for_string(`${Me.path}/icons/${name}.svg`);
+}
+const icon = () => gicon('stemflow-light');
 
 const IFACE = `
 <node>
@@ -90,7 +101,10 @@ class StemflowIndicator extends PanelMenu.Button {
         this._proxy = null;
         this._back = 0; // where toggle-solo / toggle-nobass return to
 
-        this._icon = new St.Icon({ icon_name: 'audio-x-generic-symbolic', style_class: 'system-status-icon' });
+        this._icon = new St.Widget({ layout_manager: new Clutter.BinLayout(), y_align: Clutter.ActorAlign.CENTER });
+        this._clef = new St.Icon({ gicon: gicon('stemflow-clef-symbolic'), style_class: 'system-status-icon', style: CLEF });
+        this._icon.add_child(this._clef);
+        this._icon.add_child(new St.Icon({ gicon: gicon('stemflow-accents'), style_class: 'system-status-icon' }));
         this.add_child(this._icon);
         this.connect('scroll-event', (_a, ev) => this._onScroll(ev));
 
@@ -220,17 +234,16 @@ class StemflowIndicator extends PanelMenu.Button {
         if (!this._proxy)
             return;
         const b = balance ?? this._proxy.Balance;
-        const icon = Gio.ThemedIcon.new('audio-x-generic-symbolic');
         // Description arrives with the property change; read it on the next tick.
         GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
             if (this._proxy)
-                Main.osdWindowManager.show(-1, icon, this._proxy.Description, (b + 1) / 2, 1);
+                Main.osdWindowManager.show(-1, icon(), this._proxy.Description, (b + 1) / 2, 1);
             return GLib.SOURCE_REMOVE;
         });
     }
 
     _osdOff() {
-        Main.osdWindowManager.show(-1, Gio.ThemedIcon.new('audio-x-generic-symbolic'), 'stemflow is off', null);
+        Main.osdWindowManager.show(-1, icon(), 'stemflow is off', null);
     }
 
     _refreshStats() {
@@ -248,7 +261,7 @@ class StemflowIndicator extends PanelMenu.Button {
                         `${v('App')} · ${v('Latency').toFixed(1)} s behind · ` +
                         `GPU ${v('Compute').toFixed(2)} s of ${v('Hop').toFixed(1)} s` +
                         (over > 0 ? ` · ${over} dropouts` : '');
-                    this._icon.style = over > 0 ? 'color: #f6d32d;' : '';
+                    this._clef.style = over > 0 ? CLEF_WARN : CLEF;
                 } catch (e) {
                     this._status.label.text = '';
                 }
@@ -259,7 +272,9 @@ class StemflowIndicator extends PanelMenu.Button {
         const on = this._proxy !== null && this._proxy.Description !== null;
         const adv = this._settings.get_boolean('advanced');
         this._switch.setToggleState(on);
-        this._icon.opacity = on ? 255 : 110;
+        // Off: the clef takes the bar's own colour (white); on: water-blue.
+        if (!on || this._clef.style !== CLEF_WARN)
+            this._clef.style = on ? CLEF : '';
         for (const w of [this._desc, this._snaps, this._one, this._bass, this._band, this._status])
             w.visible = on;
         if (!on) {
