@@ -64,6 +64,13 @@ function systemd(method) {
         });
 }
 
+/* A switch row that flips without closing the menu (GNOME's own closes it, which
+ * is jarring for switches that only rearrange the menu). */
+function stayOpen(item) {
+    item.activate = () => item.toggle();
+    return item;
+}
+
 /* A labelled slider row: [label  ───○───  value]. */
 const SliderRow = GObject.registerClass(
 class StemflowSliderRow extends PopupMenu.PopupBaseMenuItem {
@@ -161,7 +168,7 @@ class StemflowIndicator extends PanelMenu.Button {
 
         // Karaoke: the same controls, acting on the vocals. Switches to the vocals
         // model last used (or the first one), and back to the last bass model.
-        this._karaoke = new PopupMenu.PopupSwitchMenuItem('Karaoke', false);
+        this._karaoke = stayOpen(new PopupMenu.PopupSwitchMenuItem('Karaoke', false));
         this._karaoke.connect('toggled', (_i, on) => this._setMode(on ? 'vocals' : 'bass'));
         this.menu.addMenuItem(this._karaoke);
         this._lastModel = {};
@@ -170,12 +177,12 @@ class StemflowIndicator extends PanelMenu.Button {
         // its models folder each time, so new exports appear without reloading anything.
         this._models = new PopupMenu.PopupSubMenuMenuItem('Model');
         this.menu.addMenuItem(this._models);
-        this._exp = new PopupMenu.PopupSwitchMenuItem('Experiments', settings.get_boolean('experiments'));
+        this._exp = stayOpen(new PopupMenu.PopupSwitchMenuItem('Experiments', settings.get_boolean('experiments')));
         this._exp.connect('toggled', (_i, on) => settings.set_boolean('experiments', on));
         this.menu.addMenuItem(this._exp);
         this._expId = settings.connect('changed::experiments', () => this._sync());
 
-        this._adv = new PopupMenu.PopupSwitchMenuItem('Separate sliders', settings.get_boolean('advanced'));
+        this._adv = stayOpen(new PopupMenu.PopupSwitchMenuItem('Separate sliders', settings.get_boolean('advanced')));
         this._adv.connect('toggled', (_i, on) => settings.set_boolean('advanced', on));
         this.menu.addMenuItem(this._adv);
         this._advId = settings.connect('changed::advanced', () => this._sync());
