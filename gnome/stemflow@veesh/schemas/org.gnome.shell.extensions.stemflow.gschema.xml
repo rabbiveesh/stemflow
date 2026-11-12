@@ -5,6 +5,10 @@
       <default>false</default>
       <summary>Separate bass and band sliders instead of one</summary>
     </key>
+    <key name="experiments" type="b">
+      <default>false</default>
+      <summary>Show the model switcher</summary>
+    </key>
     <key name="slide-left" type="as">
       <default><![CDATA[['<Super>bracketleft']]]></default>
       <summary>Move toward bass solo</summary>

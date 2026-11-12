@@ -36,6 +36,8 @@ const IFACE = `
     <property name="Band" type="d" access="readwrite"/>
     <property name="Description" type="s" access="read"/>
     <property name="Target" type="s" access="read"/>
+    <property name="Model" type="s" access="readwrite"/>
+    <property name="Status" type="s" access="read"/>
     <property name="App" type="s" access="read"/>
     <property name="Latency" type="d" access="read"/>
     <property name="Compute" type="d" access="read"/>
@@ -157,6 +159,15 @@ class StemflowIndicator extends PanelMenu.Button {
         this._status.label.style = 'font-size: smaller;';
         this.menu.addMenuItem(this._status);
 
+        // Experiments: switch models live. The list comes from stemflow, which rescans
+        // its models folder each time, so new exports appear without reloading anything.
+        this._models = new PopupMenu.PopupSubMenuMenuItem('Model');
+        this.menu.addMenuItem(this._models);
+        this._exp = new PopupMenu.PopupSwitchMenuItem('Experiments', settings.get_boolean('experiments'));
+        this._exp.connect('toggled', (_i, on) => settings.set_boolean('experiments', on));
+        this.menu.addMenuItem(this._exp);
+        this._expId = settings.connect('changed::experiments', () => this._sync());
+
         this._adv = new PopupMenu.PopupSwitchMenuItem('Separate sliders', settings.get_boolean('advanced'));
         this._adv.connect('toggled', (_i, on) => settings.set_boolean('advanced', on));
         this.menu.addMenuItem(this._adv);
@@ -266,6 +277,8 @@ class StemflowIndicator extends PanelMenu.Button {
                     const [props] = conn.call_finish(res).deep_unpack();
                     const v = k => props[k].deep_unpack();
                     const over = v('Overruns');
+                    if (props.Models)
+                        this._fillModels(v('Models'), v('Model'));
                     this._status.label.text =
                         `${v('App')} · ${v('Latency').toFixed(1)} s behind · ` +
                         `GPU ${v('Compute').toFixed(2)} s of ${v('Hop').toFixed(1)} s` +
@@ -277,6 +290,35 @@ class StemflowIndicator extends PanelMenu.Button {
             });
     }
 
+    _fillModels(models, current) {
+        const key = JSON.stringify([models, current]);
+        if (key === this._modelsKey)
+            return; // rebuilding while the submenu is open would close it
+        this._modelsKey = key;
+        this._shownModel = current;
+        this._models.menu.removeAll();
+        for (const [id, label] of models) {
+            const item = new PopupMenu.PopupMenuItem(label);
+            item.setOrnament(id === current ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE);
+            item.connect('activate', () => this._setModel(id));
+            this._models.menu.addMenuItem(item);
+        }
+        const cur = models.find(([id]) => id === current);
+        this._models.label.text = `Model: ${cur ? cur[1] : current}`;
+    }
+
+    _setModel(id) {
+        Gio.DBus.session.call(BUS_NAME, OBJ_PATH, 'org.freedesktop.DBus.Properties', 'Set',
+            new GLib.Variant('(ssv)', ['org.stemflow.Control', 'Model', new GLib.Variant('s', id)]),
+            null, Gio.DBusCallFlags.NONE, -1, null, (conn, res) => {
+                try {
+                    conn.call_finish(res);
+                } catch (e) {
+                    Main.notify('stemflow', e.message);
+                }
+            });
+    }
+
     _sync() {
         const on = this._proxy !== null && this._proxy.Description !== null;
         const adv = this._settings.get_boolean('advanced');
@@ -284,8 +326,10 @@ class StemflowIndicator extends PanelMenu.Button {
         // Off: the clef takes the bar's own colour (white); on: water-blue.
         if (!on || this._clef.style !== CLEF_WARN)
             this._clef.style = on ? CLEF : '';
-        for (const w of [this._desc, this._snaps, this._one, this._boost, this._bass, this._band, this._status])
+        for (const w of [this._desc, this._snaps, this._one, this._boost, this._bass, this._band, this._status, this._models])
             w.visible = on;
+        // An older daemon has no Model property: no switcher.
+        this._models.visible = on && this._settings.get_boolean('experiments') && !!this._proxy.Model;
         if (!on) {
             this._status.label.text = '';
             return;
@@ -301,7 +345,10 @@ class StemflowIndicator extends PanelMenu.Button {
         this._bass._label.text = T;
         this._snapButtons.solo.label = `${T} solo`;
         this._snapButtons.nobass.label = `No ${t}`;
-        this._desc.label.text = p.Description;
+        // "Loading …" or a load error, while there is one.
+        this._desc.label.text = p.Status || p.Description;
+        if (p.Model && this._modelsKey && p.Model !== this._shownModel)
+            this._refreshStats(); // switched: move the dot
         this._one.set((p.Balance + 1) / 2, `No ${t}`);
         this._boost.set(Math.max(0, p.Bass - 1) / (MAX_BASS - 1),
             p.Bass > 1 ? `+${Math.round((p.Bass - 1) * 100)}%` : 'off');
@@ -314,6 +361,7 @@ class StemflowIndicator extends PanelMenu.Button {
             GLib.source_remove(this._timer);
         Gio.bus_unwatch_name(this._watch);
         this._settings.disconnect(this._advId);
+        this._settings.disconnect(this._expId);
         this._vanished();
         super.destroy();
     }

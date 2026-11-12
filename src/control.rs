@@ -16,7 +16,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Highest target level: 2.0 sounds twice as loud as the original (+10 dB).
 pub const MAX_BASS: f32 = 2.0;
@@ -36,8 +36,16 @@ pub fn loudness_to_gain(p: f32) -> f32 {
 /// "balance" is a view onto them; advanced mode sets each directly.
 #[derive(Default)]
 pub struct Control {
-    /// Which stem "bass" refers to: "bass", or "vocals" in karaoke mode.
-    pub target: &'static str,
+    /// Which stem "bass" refers to: "bass", or "vocals" in karaoke mode. Changes when
+    /// the menu switches to a model with another target.
+    target: Mutex<&'static str>,
+    /// The running model's id, the one the menu asked for (until the audio thread
+    /// picks it up), and what happened to the last switch ("" when nothing to say).
+    model: Mutex<String>,
+    want: Mutex<Option<String>>,
+    status: Mutex<String>,
+    /// Bumped when the audio thread changes something, so the D-Bus side re-announces.
+    generation: AtomicU64,
     bass: AtomicU32,
     band: AtomicU32,
     /// Latest model run time in microseconds, and how many runs overran the hop.
@@ -56,11 +64,56 @@ fn level(v: f32, max: f32) -> f32 {
 impl Control {
     pub fn new(target: &'static str, bass: f32, band: f32) -> Arc<Self> {
         let c = Control {
-            target,
+            target: Mutex::new(target),
             ..Default::default()
         };
         c.set_levels(bass, band);
         Arc::new(c)
+    }
+    pub fn target(&self) -> &'static str {
+        *self.target.lock().unwrap()
+    }
+    pub fn model(&self) -> String {
+        self.model.lock().unwrap().clone()
+    }
+    pub fn set_model(&self, id: &str) {
+        *self.model.lock().unwrap() = id.to_string();
+    }
+    pub fn status(&self) -> String {
+        self.status.lock().unwrap().clone()
+    }
+    fn set_status(&self, s: String) {
+        *self.status.lock().unwrap() = s;
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+    /// Ask the audio thread to switch to model `id` at its next hop.
+    pub fn request_model(&self, id: &str, label: &str) {
+        *self.want.lock().unwrap() = Some(id.to_string());
+        self.set_status(format!("Loading {label}…"));
+    }
+    /// For the audio thread: a pending switch, if any.
+    pub fn take_request(&self) -> Option<String> {
+        self.want.lock().unwrap().take()
+    }
+    /// For the audio thread: the switch to `id` worked. A new target brings back the
+    /// levels last used with it.
+    pub fn switched(&self, id: &str, target: &'static str) {
+        self.set_model(id);
+        save_model(id);
+        let old = std::mem::replace(&mut *self.target.lock().unwrap(), target);
+        if old != target {
+            match load_levels(target) {
+                Some((a, b)) => self.set_levels(a, b),
+                // first time in karaoke: start with the vocals out
+                None if target == "vocals" => self.set_balance(1.0),
+                None => {}
+            }
+        }
+        self.set_status(String::new());
+    }
+    /// For the audio thread: the switch failed (and it went back to `self.model()`).
+    pub fn switch_failed(&self, id: &str, err: &anyhow::Error) {
+        self.set_status(format!("Couldn't load {id}: {err:#}"));
     }
     /// (bass, band) perceived loudness.
     pub fn levels(&self) -> (f32, f32) {
@@ -104,7 +157,7 @@ impl Control {
     pub fn describe(&self) -> String {
         let (bass, band) = self.levels();
         let pct = |p: f32| (p * 100.0).round() as i32;
-        let t = self.target;
+        let t = self.target();
         let tc = format!("{}{}", t[..1].to_uppercase(), &t[1..]);
         match (pct(bass), pct(band)) {
             (100, 0) => format!("{tc} solo"),
@@ -129,6 +182,23 @@ fn state_file(target: &str) -> Option<PathBuf> {
     }))
 }
 
+fn model_file() -> Option<PathBuf> {
+    Some(state_file("bass")?.with_file_name("model"))
+}
+
+/// The model id last switched to from the menu.
+pub fn load_model() -> Option<String> {
+    let s = std::fs::read_to_string(model_file()?).ok()?;
+    Some(s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn save_model(id: &str) {
+    if let Some(p) = model_file() {
+        let _ = std::fs::create_dir_all(p.parent().unwrap());
+        let _ = std::fs::write(p, format!("{id}\n"));
+    }
+}
+
 /// Last (target, band) loudness, if remembered.
 pub fn load_levels(target: &str) -> Option<(f32, f32)> {
     let s = std::fs::read_to_string(state_file(target)?).ok()?;
@@ -138,7 +208,7 @@ pub fn load_levels(target: &str) -> Option<(f32, f32)> {
 
 pub fn save_levels(ctl: &Control) {
     let (a, b) = ctl.levels();
-    if let Some(p) = state_file(ctl.target) {
+    if let Some(p) = state_file(ctl.target()) {
         let _ = std::fs::create_dir_all(p.parent().unwrap());
         let _ = std::fs::write(p, format!("{a} {b}\n"));
     }
@@ -157,6 +227,7 @@ fn snap(name: &str) -> Option<f32> {
 
 struct Service {
     ctl: Arc<Control>,
+    models: PathBuf,
     app: String,
     latency: f64,
     hop: f64,
@@ -165,6 +236,12 @@ struct Service {
 impl Service {
     async fn changed(&self, em: &zbus::object_server::SignalEmitter<'_>) {
         save_levels(&self.ctl);
+        self.announce(em).await;
+    }
+    async fn announce(&self, em: &zbus::object_server::SignalEmitter<'_>) {
+        let _ = self.target_changed(em).await;
+        let _ = self.model_changed(em).await;
+        let _ = self.status_changed(em).await;
         let _ = self.balance_changed(em).await;
         let _ = self.bass_changed(em).await;
         let _ = self.band_changed(em).await;
@@ -226,7 +303,36 @@ impl Service {
     /// Which stem `Bass`, solo and remove refer to: "bass" or "vocals" (karaoke).
     #[zbus(property)]
     fn target(&self) -> String {
-        self.ctl.target.to_string()
+        self.ctl.target().to_string()
+    }
+    /// Every model in the models folder as (id, label), rescanned on each read so new
+    /// exports show up without restarting anything.
+    #[zbus(property(emits_changed_signal = "false"))]
+    fn models(&self) -> Vec<(String, String)> {
+        crate::models::scan(&self.models)
+            .into_iter()
+            .map(|m| (m.id, m.label))
+            .collect()
+    }
+    /// The running model's id. Setting it switches models live (a few seconds of
+    /// silence while the new one loads); `Status` says how it went.
+    #[zbus(property)]
+    fn model(&self) -> String {
+        self.ctl.model()
+    }
+    #[zbus(property)]
+    async fn set_model(&mut self, id: String) -> zbus::fdo::Result<()> {
+        let m = crate::models::find(&self.models, &id)
+            .ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("no model `{id}`")))?;
+        if id != self.ctl.model() {
+            self.ctl.request_model(&m.id, &m.label);
+        }
+        Ok(())
+    }
+    /// "Loading …" during a switch, an error if one failed, else empty.
+    #[zbus(property)]
+    fn status(&self) -> String {
+        self.ctl.status()
     }
     #[zbus(property)]
     fn app(&self) -> String {
@@ -280,12 +386,14 @@ impl Service {
 /// alive for as long as the service should exist.
 pub fn serve(
     ctl: Arc<Control>,
+    models: PathBuf,
     app: &str,
     latency: f64,
     hop: f64,
 ) -> Result<zbus::blocking::Connection> {
     let svc = Service {
-        ctl,
+        ctl: ctl.clone(),
+        models,
         app: app.to_string(),
         latency,
         hop,
@@ -294,6 +402,24 @@ pub fn serve(
         .name("org.stemflow.Control")?
         .serve_at("/org/stemflow/Control", svc)?
         .build()?;
+    // Re-announce whatever the audio thread changes (model switches, new target).
+    let c = conn.clone();
+    std::thread::spawn(move || {
+        let mut seen = ctl.generation.load(Ordering::Relaxed);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let g = ctl.generation.load(Ordering::Relaxed);
+            if g == seen {
+                continue;
+            }
+            seen = g;
+            let Ok(iface) = c.object_server().interface::<_, Service>("/org/stemflow/Control") else {
+                return;
+            };
+            let svc = iface.get();
+            zbus::block_on(svc.announce(iface.signal_emitter()));
+        }
+    });
     Ok(conn)
 }
 

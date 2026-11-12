@@ -1,6 +1,7 @@
 mod audio;
 mod control;
 mod model;
+mod models;
 mod spec;
 mod stream;
 
@@ -41,6 +42,11 @@ enum Cmd {
         opts: Opts,
         input: PathBuf,
         output: PathBuf,
+    },
+    /// List the models in the models folder (* = the one live mode last used).
+    Models {
+        #[arg(long, default_value = "models")]
+        models: PathBuf,
     },
     /// Check the Rust STFT + ONNX pipeline against PyTorch reference vectors.
     Verify {
@@ -88,11 +94,17 @@ enum Sep {
 
 #[derive(Args, Clone)]
 struct Opts {
-    #[arg(long, value_enum, default_value_t = Sep::Bsrofo)]
-    sep: Sep,
-    /// Stem to isolate or remove. `vocals` (karaoke) needs --sep bsrofo or demucs.
-    #[arg(long, value_enum, default_value_t = Target::Bass)]
-    target: Target,
+    /// Architecture (default bsrofo). Live, without --sep/--target/--model, the model
+    /// last picked in the menu is used.
+    #[arg(long, value_enum)]
+    sep: Option<Sep>,
+    /// Stem to isolate or remove (default bass). `vocals` (karaoke) needs --sep bsrofo or demucs.
+    #[arg(long, value_enum)]
+    target: Option<Target>,
+    /// A model by id: its path under --models without `.onnx`, e.g. `ft2/htdemucs_ft_bass`
+    /// (overrides --sep and --target). `stemflow models` lists them.
+    #[arg(long)]
+    model: Option<String>,
     /// Directory with the exported .onnx models.
     #[arg(long, default_value = "models")]
     models: PathBuf,
@@ -134,6 +146,25 @@ struct Opts {
     threads: usize,
 }
 
+impl Opts {
+    fn sep(&self) -> Sep {
+        self.sep.unwrap_or(Sep::Bsrofo)
+    }
+    fn target(&self) -> Target {
+        self.target.unwrap_or(Target::Bass)
+    }
+    /// The model id `--sep`/`--target` name, if they name a single file.
+    fn sep_model_id(&self) -> Option<String> {
+        match self.sep() {
+            Sep::Bsrofo => Some(bsrofo_onnx(self.target())),
+            Sep::Demucs => Some(demucs_onnx(self.target())),
+            Sep::Scnet => Some(SCNET_ONNX.into()),
+            Sep::Ensemble => None,
+        }
+        .map(|f| f.trim_end_matches(".onnx").to_string())
+    }
+}
+
 fn default_device() -> Device {
     if cfg!(feature = "cuda") {
         Device::Cuda
@@ -155,12 +186,12 @@ fn bsrofo_onnx(t: Target) -> String {
 }
 
 fn separator(o: &Opts) -> Result<Box<dyn Separator + Send>> {
-    let demucs = || HtDemucs::load(&o.models.join(demucs_onnx(o.target)), o.device, o.threads);
+    let demucs = || HtDemucs::load(&o.models.join(demucs_onnx(o.target())), o.device, o.threads);
     let scnet = || ScNet::load(&o.models.join(SCNET_ONNX), o.device, o.threads);
-    if o.target != Target::Bass && !matches!(o.sep, Sep::Bsrofo | Sep::Demucs) {
-        bail!("--target {} needs --sep bsrofo or demucs", o.target.name());
+    if o.target() != Target::Bass && !matches!(o.sep(), Sep::Bsrofo | Sep::Demucs) {
+        bail!("--target {} needs --sep bsrofo or demucs", o.target().name());
     }
-    let sep: Box<dyn Separator + Send> = match o.sep {
+    let sep: Box<dyn Separator + Send> = match o.sep() {
         Sep::Demucs => Box::new(demucs()?),
         Sep::Scnet => Box::new(scnet()?),
         Sep::Ensemble => Box::new(Ensemble::new(vec![
@@ -168,21 +199,58 @@ fn separator(o: &Opts) -> Result<Box<dyn Separator + Send>> {
             (Box::new(scnet()?), o.scnet_weight),
         ])),
         Sep::Bsrofo => Box::new(BsRoformer::load(
-            &o.models.join(bsrofo_onnx(o.target)),
+            &o.models.join(bsrofo_onnx(o.target())),
             o.device,
             o.threads,
             secs(o.window),
         )?),
     };
-    Ok(if o.stereo_in {
+    Ok(fold(o, sep))
+}
+
+fn fold(o: &Opts, sep: Box<dyn Separator + Send>) -> Box<dyn Separator + Send> {
+    if o.stereo_in {
         sep
     } else {
         Box::new(MonoFold(sep))
-    })
+    }
+}
+
+/// Load one model file (from the models folder scan).
+fn load_model(o: &Opts, m: &models::Model) -> Result<Box<dyn Separator + Send>> {
+    let sep: Box<dyn Separator + Send> = match m.arch {
+        models::Arch::Demucs => Box::new(HtDemucs::load(&m.path, o.device, o.threads)?),
+        models::Arch::Scnet => Box::new(ScNet::load(&m.path, o.device, o.threads)?),
+        models::Arch::Bsrofo => Box::new(BsRoformer::load(&m.path, o.device, o.threads, secs(o.window))?),
+    };
+    Ok(fold(o, sep))
 }
 
 fn streamer(o: &Opts) -> Result<Streamer<Box<dyn Separator + Send>>> {
-    let sep = separator(o)?;
+    match &o.model {
+        Some(id) => {
+            let m = models::find(&o.models, id)
+                .with_context(|| format!("no model `{id}` in {} (see `stemflow models`)", o.models.display()))?;
+            wrap(o, load_model(o, &m)?)
+        }
+        None => wrap(o, separator(o)?),
+    }
+}
+
+/// The model live mode starts with: --model, else --sep/--target if given, else the
+/// one last picked in the menu (if it still exists), else the default.
+fn live_model(o: &Opts) -> Option<models::Model> {
+    let id = o.model.clone().or_else(|| {
+        if o.sep.is_none() && o.target.is_none() {
+            control::load_model().filter(|id| models::find(&o.models, id).is_some())
+        } else {
+            None
+        }
+    }).or_else(|| o.sep_model_id())?;
+    models::find(&o.models, &id)
+}
+
+fn wrap(o: &Opts, sep: Box<dyn Separator + Send>) -> Result<Streamer<Box<dyn Separator + Send>>> {
     let (hop, la, xf) = (secs(o.hop), secs(o.lookahead), secs(o.xfade));
     if xf > la {
         bail!("--xfade must be <= --lookahead");
@@ -204,17 +272,37 @@ fn main() -> Result<()> {
             output,
             slack,
         } => {
-            let st = streamer(&opts)?;
-            let ctl = levels(&opts, true);
+            let m = live_model(&opts);
+            let st = match &m {
+                Some(m) => wrap(&opts, load_model(&opts, m)?)?,
+                None => streamer(&opts)?, // the ensemble
+            };
+            let target = m.as_ref().map_or(opts.target().name(), |m| m.target);
+            let ctl = levels(&opts, target, true);
+            ctl.set_model(m.as_ref().map_or("ensemble", |m| &m.id));
             let (lat, hop) = (
                 st.latency() as f64 / SAMPLE_RATE as f64,
                 st.hop as f64 / SAMPLE_RATE as f64,
             );
             // Off the bus is fine (e.g. no session bus over ssh): CLI flags still work.
-            let _bus = control::serve(ctl.clone(), &grab, lat + slack as f64, hop)
+            let _bus = control::serve(ctl.clone(), opts.models.clone(), &grab, lat + slack as f64, hop)
                 .map_err(|e| eprintln!("stemflow: no D-Bus control ({e})"))
                 .ok();
-            audio::live(st, ctl, &grab, output, slack)
+            // Switching models from the menu: drop the running one (frees the GPU),
+            // then load the new one with the same settings.
+            let load = move |id: &str| -> Result<(Streamer<Box<dyn Separator + Send>>, &'static str)> {
+                let m = models::find(&opts.models, id).with_context(|| format!("no model `{id}`"))?;
+                Ok((wrap(&opts, load_model(&opts, &m)?)?, m.target))
+            };
+            audio::live(st, ctl, &grab, output, slack, load)
+        }
+        Cmd::Models { models } => {
+            let cur = control::load_model();
+            for m in models::scan(&models) {
+                let mark = if cur.as_deref() == Some(m.id.as_str()) { "*" } else { " " };
+                println!("{mark} {:32} {}", m.id, m.label);
+            }
+            Ok(())
         }
         Cmd::File {
             opts,
@@ -238,10 +326,10 @@ fn main() -> Result<()> {
 }
 
 /// Starting levels: explicit flags, else the remembered ones, else bass solo.
-fn levels(o: &Opts, remember: bool) -> std::sync::Arc<control::Control> {
-    let ctl = control::Control::new(o.target.name(), 1.0, 0.0);
+fn levels(o: &Opts, target: &'static str, remember: bool) -> std::sync::Arc<control::Control> {
+    let ctl = control::Control::new(target, 1.0, 0.0);
     if let Some((a, b)) = remember
-        .then(|| control::load_levels(o.target.name()))
+        .then(|| control::load_levels(target))
         .flatten()
     {
         ctl.set_levels(a, b);
@@ -284,7 +372,7 @@ fn file(o: &Opts, input: &Path, output: &Path) -> Result<()> {
     };
 
     let mut s = streamer(o)?;
-    let ctl = levels(o, false);
+    let ctl = levels(o, o.target().name(), false);
     let (hop, lat) = (s.hop, s.delay());
     let frames = stereo.len() / 2;
     let mut padded = stereo;

@@ -76,13 +76,18 @@ fn f32_to_bytes(x: &[f32]) -> Vec<u8> {
     x.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
-pub fn live<S: Separator + Send + 'static>(
-    mut st: Streamer<S>,
+pub type Live = Streamer<Box<dyn Separator + Send>>;
+
+/// `load` builds the streamer for a model id when the menu switches models.
+pub fn live(
+    st: Live,
     ctl: Arc<Control>,
     grab: &str,
     output: Option<String>,
     slack: f32,
+    load: impl Fn(&str) -> Result<(Live, &'static str)>,
 ) -> Result<()> {
+    let mut st = Some(st);
     let output = match output {
         Some(o) => o,
         None => pactl(&["get-default-sink"])?.trim().to_string(),
@@ -128,7 +133,7 @@ pub fn live<S: Separator + Send + 'static>(
         }),
     )
     .map_err(|e| anyhow::anyhow!("opening capture: {e}"))?;
-    let hop = st.hop;
+    let hop = st.as_ref().unwrap().hop;
     // Keep the device buffer small and the jitter buffer here instead, so the mix
     // levels (applied as samples leave for the device) change within ~0.1 s.
     let block = SAMPLE_RATE as usize / 50; // 20 ms
@@ -138,7 +143,7 @@ pub fn live<S: Separator + Send + 'static>(
         "stemflow",
         Direction::Playback,
         Some(&output),
-        ctl.target,
+        ctl.target(),
         &spec,
         None,
         Some(&BufferAttr {
@@ -158,8 +163,8 @@ pub fn live<S: Separator + Send + 'static>(
     eprintln!(
         "stemflow: {} `{grab}` stream(s) -> {SINK} -> {} -> {output}; latency ≈ {:.1}s (Ctrl-C to stop)",
         grabbed.len(),
-        ctl.target,
-        (st.latency() as f32 / SAMPLE_RATE as f32) + slack
+        ctl.target(),
+        (st.as_ref().unwrap().latency() as f32 / SAMPLE_RATE as f32) + slack
     );
     if grabbed.is_empty() {
         eprintln!("  (no `{grab}` stream yet; start playback, or move any app to \"stemflow\" in pavucontrol)");
@@ -249,8 +254,31 @@ pub fn live<S: Separator + Send + 'static>(
     let hop_s = hop as f32 / SAMPLE_RATE as f32;
     let mut pending: Vec<f32> = Vec::new();
     let mut last_grab = Instant::now();
-    for v in rx_in {
+    for v in &rx_in {
         pending.extend(v);
+        if let Some(id) = ctl.take_request() {
+            let prev = ctl.model();
+            eprintln!("stemflow: switching to {id}");
+            drop(st.take()); // free the GPU before loading the next one
+            st = Some(match load(&id) {
+                Ok((s, target)) => {
+                    ctl.switched(&id, target);
+                    s
+                }
+                Err(e) => {
+                    eprintln!("stemflow: couldn't load {id}: {e:#}; back to {prev}");
+                    ctl.switch_failed(&id, &e);
+                    load(&prev)?.0
+                }
+            });
+            // Skip what queued up while loading, so the delay doesn't grow.
+            while let Ok(v) = rx_in.try_recv() {
+                pending.extend(v);
+            }
+            let keep = pending.len().min(2 * hop);
+            pending.drain(..pending.len() - keep);
+        }
+        let Some(st) = st.as_mut() else { continue };
         while pending.len() >= 2 * hop {
             let backlog = pending.len() as f32 / 2.0 / SAMPLE_RATE as f32;
             if backlog > 2.0 * hop_s {
