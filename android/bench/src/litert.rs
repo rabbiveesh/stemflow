@@ -36,6 +36,9 @@ extern "C" {
     fn TfLiteInterpreterOptionsSetNumThreads(o: *mut c_void, n: i32);
     fn TfLiteInterpreterOptionsAddDelegate(o: *mut c_void, d: *mut c_void);
     fn TfLiteInterpreterCreate(model: *const c_void, o: *const c_void) -> *mut c_void;
+    fn TfLiteInterpreterDelete(i: *mut c_void);
+    fn TfLiteInterpreterOptionsDelete(o: *mut c_void);
+    fn TfLiteModelDelete(m: *mut c_void);
     fn TfLiteInterpreterAllocateTensors(i: *mut c_void) -> i32;
     fn TfLiteInterpreterInvoke(i: *mut c_void) -> i32;
     fn TfLiteInterpreterGetInputTensorCount(i: *const c_void) -> i32;
@@ -54,6 +57,7 @@ extern "C" {
 extern "C" {
     fn TfLiteGpuDelegateOptionsV2Default() -> GpuOptions;
     fn TfLiteGpuDelegateV2Create(o: *const GpuOptions) -> *mut c_void;
+    fn TfLiteGpuDelegateV2Delete(d: *mut c_void);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -71,6 +75,10 @@ fn dims(t: *const c_void) -> Vec<usize> {
 
 pub struct LiteRtDemucs {
     interp: *mut c_void,
+    // Owned by this engine and freed with it (see Drop); the delegate is null on the CPU.
+    model: *mut c_void,
+    opts: *mut c_void,
+    delegate: *mut c_void,
     // Tensor indices, told apart by rank: the waveforms are 3-D, the spectrograms 4-D.
     in_mix: i32,
     in_mag: i32,
@@ -79,8 +87,8 @@ pub struct LiteRtDemucs {
     stft: Stft,
     seg: usize,
     frames: usize,
-    // Scratch kept between runs: allocating ~30 MB afresh per run costs tens of
-    // milliseconds of page faults on a phone.
+    // Scratch kept between runs, rather than ~30 MB allocated afresh each time
+    // (tidier on a phone; it made no measurable difference to the run time).
     z: Vec<Complex32>,
     y: Vec<f32>,
 }
@@ -88,13 +96,29 @@ pub struct LiteRtDemucs {
 impl LiteRtDemucs {
     pub fn load(path: &Path, accel: Accel, threads: usize) -> Result<Self> {
         let cpath = CString::new(path.to_str().context("model path")?)?;
-        // The model, options and delegate live for the whole process; never freed.
-        let interp = unsafe {
-            let model = TfLiteModelCreateFromFile(cpath.as_ptr());
-            ensure!(!model.is_null(), "loading {}", path.display());
-            let opts = TfLiteInterpreterOptionsCreate();
+        let null = std::ptr::null_mut();
+        // Filled in step by step, so that Drop frees whatever exists if a step fails.
+        let mut m = LiteRtDemucs {
+            interp: null,
+            model: null,
+            opts: null,
+            delegate: null,
+            in_mix: -1,
+            in_mag: -1,
+            out_wave: -1,
+            out_spec: -1,
+            stft: Stft::new(),
+            seg: 0,
+            frames: 0,
+            z: Vec::new(),
+            y: Vec::new(),
+        };
+        unsafe {
+            m.model = TfLiteModelCreateFromFile(cpath.as_ptr());
+            ensure!(!m.model.is_null(), "loading {}", path.display());
+            m.opts = TfLiteInterpreterOptionsCreate();
             if threads > 0 {
-                TfLiteInterpreterOptionsSetNumThreads(opts, threads as i32);
+                TfLiteInterpreterOptionsSetNumThreads(m.opts, threads as i32);
             }
             if accel != Accel::Cpu {
                 let mut g = TfLiteGpuDelegateOptionsV2Default();
@@ -112,50 +136,56 @@ impl LiteRtDemucs {
                     g.inference_priority2 = MIN_LATENCY;
                     g.inference_priority3 = MIN_MEMORY_USAGE;
                 }
-                let d = TfLiteGpuDelegateV2Create(&g);
-                ensure!(!d.is_null(), "creating the GPU delegate");
-                TfLiteInterpreterOptionsAddDelegate(opts, d);
+                m.delegate = TfLiteGpuDelegateV2Create(&g);
+                ensure!(!m.delegate.is_null(), "creating the GPU delegate");
+                TfLiteInterpreterOptionsAddDelegate(m.opts, m.delegate);
             }
-            let interp = TfLiteInterpreterCreate(model, opts);
-            ensure!(!interp.is_null(), "creating the interpreter (GPU delegate rejected the graph?)");
-            ensure!(TfLiteInterpreterAllocateTensors(interp) == 0, "allocating tensors");
-            interp
-        };
-        let (mut in_mix, mut in_mag, mut out_wave, mut out_spec) = (-1, -1, -1, -1);
-        let (mut seg, mut frames) = (0, 0);
-        unsafe {
-            ensure!(TfLiteInterpreterGetInputTensorCount(interp) == 2, "expected 2 inputs");
-            ensure!(TfLiteInterpreterGetOutputTensorCount(interp) == 2, "expected 2 outputs");
+            m.interp = TfLiteInterpreterCreate(m.model, m.opts);
+            ensure!(!m.interp.is_null(), "creating the interpreter (GPU delegate rejected the graph?)");
+            ensure!(TfLiteInterpreterAllocateTensors(m.interp) == 0, "allocating tensors");
+            ensure!(TfLiteInterpreterGetInputTensorCount(m.interp) == 2, "expected 2 inputs");
+            ensure!(TfLiteInterpreterGetOutputTensorCount(m.interp) == 2, "expected 2 outputs");
             for i in 0..2 {
-                let d = dims(TfLiteInterpreterGetInputTensor(interp, i));
+                let d = dims(TfLiteInterpreterGetInputTensor(m.interp, i));
                 match d.as_slice() {
-                    [1, 2, s] => (in_mix, seg) = (i, *s),
-                    [1, 4, BINS, f] => (in_mag, frames) = (i, *f),
+                    [1, 2, s] => (m.in_mix, m.seg) = (i, *s),
+                    [1, 4, BINS, f] => (m.in_mag, m.frames) = (i, *f),
                     _ => bail!("unexpected input shape {d:?}"),
                 }
-                match dims(TfLiteInterpreterGetOutputTensor(interp, i)).len() {
-                    3 => out_wave = i,
-                    4 => out_spec = i,
+                match dims(TfLiteInterpreterGetOutputTensor(m.interp, i)).len() {
+                    3 => m.out_wave = i,
+                    4 => m.out_spec = i,
                     n => bail!("unexpected output rank {n}"),
                 }
             }
         }
-        ensure!(in_mix >= 0 && in_mag >= 0 && out_wave >= 0 && out_spec >= 0, "model I/O");
-        ensure!(frames == frames_for(seg), "{frames} frames for a {seg}-sample segment");
-        let mut m = LiteRtDemucs {
-            interp,
-            in_mix,
-            in_mag,
-            out_wave,
-            out_spec,
-            stft: Stft::new(),
-            seg,
-            frames,
-            z: vec![Complex32::new(0.0, 0.0); BINS * frames],
-            y: vec![0f32; seg],
-        };
-        m.separate(&vec![0.0; 2 * seg])?; // first run compiles the GPU kernels
+        ensure!(m.in_mix >= 0 && m.in_mag >= 0 && m.out_wave >= 0 && m.out_spec >= 0, "model I/O");
+        ensure!(m.frames == frames_for(m.seg), "{} frames for a {}-sample segment", m.frames, m.seg);
+        m.z = vec![Complex32::new(0.0, 0.0); BINS * m.frames];
+        m.y = vec![0f32; m.seg];
+        m.separate(&vec![0.0; 2 * m.seg])?; // first run compiles the GPU kernels
         Ok(m)
+    }
+}
+
+impl Drop for LiteRtDemucs {
+    /// Frees the engine (about 1 GB with the GPU delegate), so models can be swapped
+    /// at run time. The interpreter goes first: it uses the other three.
+    fn drop(&mut self) {
+        unsafe {
+            if !self.interp.is_null() {
+                TfLiteInterpreterDelete(self.interp);
+            }
+            if !self.delegate.is_null() {
+                TfLiteGpuDelegateV2Delete(self.delegate);
+            }
+            if !self.opts.is_null() {
+                TfLiteInterpreterOptionsDelete(self.opts);
+            }
+            if !self.model.is_null() {
+                TfLiteModelDelete(self.model);
+            }
+        }
     }
 }
 

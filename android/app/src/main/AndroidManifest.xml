@@ -9,6 +9,12 @@
     <!-- only for the loopback socket the capture helper connects to -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- to look up the uid of the app whose playback the helper captures -->
+    <queries>
+        <package android:name="com.spotify.music" />
+        <package android:name="com.google.android.apps.youtube.music" />
+    </queries>
+
     <application
         android:label="stemflow"
         android:icon="@android:drawable/ic_media_play"
@@ -22,6 +28,13 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
         <!-- the GPU delegate dlopens the vendor's OpenCL -->
         <uses-native-library android:name="libOpenCL.so" android:required="false" />
         <uses-native-library android:name="libOpenCL-pixel.so" android:required="false" />

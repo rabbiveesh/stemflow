@@ -141,6 +141,14 @@ pub extern "system" fn Java_org_stemflow_app_Native_engineNew<'l>(
     })
 }
 
+/// Release an engine (model, GPU delegate and their ~1 GB). `h` is dead afterwards.
+#[no_mangle]
+pub extern "system" fn Java_org_stemflow_app_Native_engineFree(_: JNIEnv, _: JClass, h: jlong) {
+    if h != 0 {
+        drop(unsafe { Box::from_raw(h as *mut Engine) });
+    }
+}
+
 /// Frames per hop: `process` takes and returns exactly this many stereo frames.
 #[no_mangle]
 pub extern "system" fn Java_org_stemflow_app_Native_engineHop(_: JNIEnv, _: JClass, h: jlong) -> jint {

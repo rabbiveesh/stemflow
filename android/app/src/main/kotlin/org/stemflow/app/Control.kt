@@ -13,6 +13,8 @@ object Control {
     const val MAX_BASS = 2f
     @Volatile var bass = 1f; private set
     @Volatile var band = 0f; private set
+    /** The stem `bass` acts on: "bass", or "vocals" in karaoke. */
+    @Volatile var target = "bass"
 
     fun setLevels(bass: Float, band: Float) {
         this.bass = bass.coerceIn(0f, MAX_BASS)
@@ -37,13 +39,15 @@ object Control {
     fun describe(): String {
         val a = (bass * 100).roundToInt()
         val b = (band * 100).roundToInt()
+        val t = target
+        val tc = t.replaceFirstChar { it.uppercase() }
         return when {
-            a == 100 && b == 0 -> "Bass solo"
-            a > 100 && b == 0 -> "Bass solo · $a%"
+            a == 100 && b == 0 -> "$tc solo"
+            a > 100 && b == 0 -> "$tc solo · $a%"
             a == 100 && b == 100 -> "Full mix"
-            a == 0 && b == 100 -> "No bass"
-            a > 100 && b == 100 -> "Full mix · bass $a%"
-            else -> "Bass $a% · band $b%"
+            a == 0 && b == 100 -> "No $t"
+            a > 100 && b == 100 -> "Full mix · $t $a%"
+            else -> "$tc $a% · band $b%"
         }
     }
 

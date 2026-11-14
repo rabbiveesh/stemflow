@@ -14,10 +14,13 @@ import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
 import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.LinearLayout.LayoutParams
 import android.widget.SeekBar
+import android.widget.Spinner
 import android.widget.Switch
 import android.widget.TextView
 import kotlin.math.abs
@@ -35,7 +38,11 @@ class MainActivity : Activity() {
     private lateinit var boost: SeekBar
     private lateinit var boostValue: TextView
     private lateinit var status: TextView
+    private lateinit var karaoke: Switch
+    private lateinit var modelPicker: Spinner
+    private var modelIds = listOf<String>()
     private val snaps = mutableMapOf<String, Button>()
+    private lateinit var noLabel: TextView
     private var dragging = false
     private val ui = Handler(Looper.getMainLooper())
     private val tick = object : Runnable {
@@ -68,6 +75,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Control.load(this)
+        Control.target = Models.target(this)
 
         power = Switch(this).apply {
             text = "Bass isolation"
@@ -85,6 +93,7 @@ class MainActivity : Activity() {
         boost = slider(100) { p -> Control.setLevels(1f + p / 100f * (Control.MAX_BASS - 1f), Control.band) }
         boostValue = label("100%").apply { minWidth = dp(52); gravity = Gravity.END }
         status = label("", 13f).apply { alpha = 0.7f }
+        noLabel = label("  No bass")
 
         val snapRow = row()
         for ((text, name) in listOf("Bass solo" to "solo", "Full mix" to "full", "No bass" to "nobass")) {
@@ -96,6 +105,30 @@ class MainActivity : Activity() {
             }
             snaps[name] = b
             snapRow.addView(b)
+        }
+
+        // As in the menu: Karaoke switches the target to vocals (the vocals model last
+        // used), and Model picks among the models for the current target.
+        karaoke = Switch(this).apply {
+            text = "Karaoke"
+            textSize = 16f
+            setOnClickListener {
+                Models.setKaraoke(this@MainActivity, isChecked)
+                Control.target = Models.target(this@MainActivity)
+                refresh()
+            }
+        }
+        modelPicker = Spinner(this).apply {
+            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(p: AdapterView<*>, v: View?, pos: Int, id: Long) {
+                    val c = this@MainActivity
+                    Models.choices(c).firstOrNull { it.id == modelIds.getOrNull(pos) }?.let {
+                        if (it.id != Models.current(c)?.id) Models.select(c, it)
+                    }
+                }
+                override fun onNothingSelected(p: AdapterView<*>) {}
+            }
         }
 
         val extras = row(
@@ -116,10 +149,12 @@ class MainActivity : Activity() {
             setPadding(dp(20), dp(20), dp(20), dp(20))
             addView(power)
             addView(desc.apply { setPadding(0, dp(14), 0, dp(4)) })
-            addView(row(label("Solo  "), balance, label("  No bass")))
+            addView(row(label("Solo  "), balance, noLabel))
             addView(row(label("Boost "), boost, boostValue))
             addView(snapRow)
             addView(status.apply { setPadding(0, dp(14), 0, dp(14)) })
+            addView(karaoke)
+            addView(row(label("Model "), modelPicker))
             addView(extras)
         }
         // targetSdk 35 draws edge to edge; the outer view takes the system-bar insets
@@ -142,7 +177,28 @@ class MainActivity : Activity() {
         }
         boostValue.text = "${(maxOf(Control.bass, 1f) * 100).roundToInt()}%"
         for ((name, b) in snaps) b.alpha = if (Control.isSnap(name)) 1f else 0.6f
-        status.text = CaptureService.status
+        status.text = if (CaptureService.running) CaptureService.status else "Off · ${Shizu.state()}"
+        val t = Control.target
+        val tc = t.replaceFirstChar { it.uppercase() }
+        power.text = if (t == "bass") "Bass isolation" else "Karaoke (vocals)"
+        snaps["solo"]?.text = "$tc solo"
+        snaps["nobass"]?.text = "No $t"
+        noLabel.text = "  No $t"
+        val hasVocals = Models.all(this).any { it.stem == "vocals" }
+        karaoke.isEnabled = hasVocals
+        karaoke.isChecked = Models.karaoke(this)
+        karaoke.text = if (hasVocals) "Karaoke" else "Karaoke (no vocals model on the phone)"
+        val choices = Models.choices(this)
+        val ids = choices.map { it.id }
+        if (ids != modelIds) {
+            modelIds = ids
+            modelPicker.adapter = ArrayAdapter(
+                this, android.R.layout.simple_spinner_dropdown_item,
+                if (choices.isEmpty()) listOf("no $t model on the phone") else choices.map { it.label },
+            )
+        }
+        val cur = ids.indexOf(Models.current(this)?.id)
+        if (cur >= 0 && modelPicker.selectedItemPosition != cur) modelPicker.setSelection(cur)
     }
 
     private fun notificationsOk(): Boolean {
@@ -152,7 +208,11 @@ class MainActivity : Activity() {
     }
 
     private fun start() {
-        if (notificationsOk()) startForegroundService(Intent(this, CaptureService::class.java))
+        if (!notificationsOk()) return
+        val go = { startForegroundService(Intent(this, CaptureService::class.java)); Unit }
+        // Shizuku is running but hasn't been asked yet: ask, then start either way
+        // (without it the service waits for android/helper.sh).
+        if (Shizu.available() && !Shizu.granted()) Shizu.request { go() } else go()
     }
 
     private fun stop() = stopService(Intent(this, CaptureService::class.java))

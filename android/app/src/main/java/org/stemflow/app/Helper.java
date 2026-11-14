@@ -28,7 +28,8 @@ import java.net.Socket;
  * the original stops reaching the speaker, exactly like the desktop's stream move.
  * Same hidden-API calls as scrcpy's AudioPlaybackCapture (Apache-2.0).
  *
- * Runs outside the app, as shell (adb for now, Shizuku later):
+ * Runs outside the app, as shell: started by Shizuku (HelperService), or over adb
+ * (android/helper.sh):
  *   CLASSPATH=$(pm path org.stemflow.app | cut -d: -f2) \
  *       app_process / org.stemflow.app.Helper PORT UID [UID...]
  * and writes 44.1 kHz stereo s16le PCM to 127.0.0.1:PORT, where the app listens.
@@ -48,7 +49,12 @@ public final class Helper {
         int[] uids = new int[args.length - 1];
         for (int i = 1; i < args.length; i++) uids[i - 1] = Integer.parseInt(args[i]);
 
-        Looper.prepareMainLooper();
+        run(port, uids);
+    }
+
+    /** Captures until the app closes the socket, then exits the process. */
+    static void run(int port, int[] uids) throws Exception {
+        if (Looper.getMainLooper() == null) Looper.prepareMainLooper();
         Context context = fakeContext();
         AudioRecord record = createRecord(context, uids);
 
@@ -114,16 +120,22 @@ public final class Helper {
     /** A Context that says it is the shell package, on top of a bare ActivityThread. */
     private static Context fakeContext() throws Exception {
         Class<?> atClass = Class.forName("android.app.ActivityThread");
-        Constructor<?> ctor = atClass.getDeclaredConstructor();
-        ctor.setAccessible(true);
-        Object at = ctor.newInstance();
-        setField(atClass, null, "sCurrentActivityThread", at);
-        setField(atClass, at, "mSystemThread", true);
         Method getSystemContext = atClass.getDeclaredMethod("getSystemContext");
         getSystemContext.setAccessible(true);
+        // Under Shizuku the process already has an ActivityThread; over adb it doesn't.
+        Object at = atClass.getMethod("currentActivityThread").invoke(null);
+        if (at == null) {
+            Constructor<?> ctor = atClass.getDeclaredConstructor();
+            ctor.setAccessible(true);
+            at = ctor.newInstance();
+            setField(atClass, null, "sCurrentActivityThread", at);
+            setField(atClass, at, "mSystemThread", true);
+        }
         Context fake = new ShellContext((Context) getSystemContext.invoke(at));
 
-        // Some framework paths ask the ActivityThread who the application is.
+        // AudioRecord asks the ActivityThread who the application is, and the audio
+        // server rejects a package that doesn't belong to our uid (shell). Under
+        // Shizuku the thread says "org.stemflow.app" unless told otherwise.
         try {
             Class<?> bindClass = Class.forName("android.app.ActivityThread$AppBindData");
             Constructor<?> bindCtor = bindClass.getDeclaredConstructor();

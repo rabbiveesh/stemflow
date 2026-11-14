@@ -214,18 +214,6 @@ def glu(x):
     return x[:, :C] * torch.sigmoid(x[:, C:])
 
 
-class GluConv:
-    """glu(conv(x)) as two convolutions, one per half of the output channels, so that
-    no SLICE has to copy the halves apart."""
-
-    def __init__(self, c):
-        C = c.out_channels // 2
-        self.a, self.b = Conv(c, slice(0, C)), Conv(c, slice(C, 2 * C))
-
-    def __call__(self, x):
-        return self.a(x) * torch.sigmoid(self.b(x))
-
-
 def no_norm(n):
     assert isinstance(n, torch.nn.Identity), "htdemucs has norms only in DConv (norm_starts=4)"
 
@@ -252,7 +240,7 @@ def prepare_enc(e):
     no_norm(e.norm1)
     if e.rewrite:
         no_norm(e.norm2)
-        e.rw = GluConv(e.rewrite)
+        e.rw = Conv(e.rewrite)
     if e.dconv:
         prepare_dconv(e.dconv)
 
@@ -267,7 +255,7 @@ def enc(e, x, inject=None):
     y = F.gelu(y)
     if e.dconv:
         y = dconv(e.dconv, y)
-    return e.rw(y) if e.rewrite else y
+    return glu(e.rw(y)) if e.rewrite else y
 
 
 def prepare_dec(d, out=slice(None)):
@@ -280,7 +268,7 @@ def prepare_dec(d, out=slice(None)):
         return
     if d.rewrite:
         no_norm(d.norm1)
-        d.rw = GluConv(d.rewrite)
+        d.rw = Conv(d.rewrite)
     if d.dconv:
         prepare_dconv(d.dconv)
 
@@ -290,7 +278,7 @@ def dec(d, x, skip):
     if not d.empty:
         x = x + skip
         if d.rewrite:
-            x = d.rw(x)
+            x = glu(d.rw(x))
         if d.dconv:
             x = dconv(d.dconv, x)
     z = d.c(x)

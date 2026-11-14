@@ -12,6 +12,7 @@ object Native {
     const val GPU_FP16 = 2
 
     @JvmStatic external fun engineNew(path: String, gpu: Int, hop: Float, lookahead: Float, xfade: Float): Long
+    @JvmStatic external fun engineFree(h: Long)
     @JvmStatic external fun engineHop(h: Long): Int
     @JvmStatic external fun engineDelay(h: Long): Int
     @JvmStatic external fun engineProcess(h: Long, input: FloatArray, bass: FloatArray, band: FloatArray): Float

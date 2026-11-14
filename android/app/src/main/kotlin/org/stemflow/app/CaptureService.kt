@@ -61,21 +61,21 @@ class CaptureService : Service() {
         const val RATE = 44100
         const val HELPER_PORT = 28711
         const val CMD = "org.stemflow.app.CMD"
-        const val HOP_S = 2.0f // the 7.8 s model takes ~1.6 s per run on a Pixel 10a
         const val LOOKAHEAD_S = 1.0f
         const val XFADE_S = 0.25f
         const val BLOCK = RATE / 50 // 20 ms, as the desktop's limiter assumes
 
         @Volatile var running = false
         @Volatile var status = "Off"
-        // The engine holds ~1 GB and takes seconds to build: one per process, reused.
+        // The engine holds ~1 GB. Only the worker thread touches it: it loads the
+        // model when isolation is switched on and frees it when it is switched off.
         private var engine = 0L
         private var engineModel = ""
     }
 
     private class Stems(val bass: FloatArray, val band: FloatArray)
 
-    private val hops = LinkedBlockingQueue<FloatArray>()
+    private val chunks = LinkedBlockingQueue<FloatArray>() // 100 ms each, from the reader
     private val stems = LinkedBlockingQueue<Stems>()
     private var projection: MediaProjection? = null
     private var record: AudioRecord? = null
@@ -93,6 +93,9 @@ class CaptureService : Service() {
             if (i.hasExtra("bass") || i.hasExtra("band")) {
                 Control.setLevels(i.getFloatExtra("bass", Control.bass), i.getFloatExtra("band", Control.band))
             }
+            if (i.hasExtra("karaoke")) Models.setKaraoke(c, i.getBooleanExtra("karaoke", false))
+            i.getStringExtra("model")?.let { id -> Models.all(c).firstOrNull { it.id == id }?.let { Models.select(c, it) } }
+            Control.target = Models.target(c)
             if (i.getBooleanExtra("stop", false)) stopSelf()
             Control.save(c)
             Log.i(TAG, "mix: ${Control.describe()}")
@@ -134,6 +137,7 @@ class CaptureService : Service() {
         source = if (data != null) "projection" else "helper"
 
         Control.load(this)
+        Control.target = Models.target(this)
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel("live", "Bass isolation", NotificationManager.IMPORTANCE_LOW)
         )
@@ -168,86 +172,113 @@ class CaptureService : Service() {
         stopSelf()
     }
 
-    /** Worker thread: load the model, start the other threads, then separate hops. */
-    private fun work() {
-        // Newest .tflite in the app's files (adb: push to /data/local/tmp, then
-        // `run-as org.stemflow.app cp` it into files/).
-        val model = listOfNotNull(filesDir, getExternalFilesDir(null))
-            .flatMap { it.listFiles()?.toList() ?: emptyList() }
-            .filter { it.name.endsWith(".tflite") }
-            .maxByOrNull { it.lastModified() }
-            ?: return fail("No model in $filesDir")
+    /** Load `m` if it isn't the loaded model; false if that failed. */
+    private fun load(m: Models.Model): Boolean {
+        if (engine != 0L && engineModel == m.file.path) return true
+        status = "Loading ${m.label}…"
+        Log.i(TAG, status)
         try {
-            if (engine == 0L || engineModel != model.path) {
-                status = "Loading ${model.name}…"
-                Log.i(TAG, status)
-                val t = System.nanoTime()
-                // A changed model leaks the old engine; fine until models can be switched.
-                engine = Native.engineNew(model.path, Native.GPU_FP16, HOP_S, LOOKAHEAD_S, XFADE_S)
-                engineModel = model.path
-                Log.i(TAG, "model ready in %.1f s".format((System.nanoTime() - t) / 1e9))
-            }
+            val t = System.nanoTime()
+            unload() // first, so two models are never in memory at once
+            engine = Native.engineNew(m.file.path, Native.GPU_FP16, m.hop, LOOKAHEAD_S, XFADE_S)
+            engineModel = m.file.path
+            Log.i(TAG, "model ready in %.1f s".format((System.nanoTime() - t) / 1e9))
+            return true
         } catch (e: Throwable) {
-            return fail("Model failed: ${e.message}")
-        }
-        if (!running) return
-        val hop = Native.engineHop(engine)
-        thread(name = "stemflow-player") { play() }
-        thread(name = "stemflow-reader") { if (source == "helper") readHelper(hop) else readProjection(hop) }
-
-        val hopS = hop.toFloat() / RATE
-        while (running) {
-            var x = hops.poll(200, TimeUnit.MILLISECONDS) ?: continue
-            // Fallen behind (a slow run, a warm phone): skip ahead to the newest hop
-            // rather than stay late for good. It is heard as a jump in the music.
-            while (true) {
-                x = hops.poll() ?: break
-                skipped++
-            }
-            val bass = FloatArray(2 * hop)
-            val band = FloatArray(2 * hop)
-            if (x.all { it > -1e-4f && it < 1e-4f }) {
-                // The source is paused: play silence and leave the GPU alone.
-                stems.put(Stems(bass, band))
-                status = "%s · paused".format(model.name.removeSuffix(".tflite"))
-                continue
-            }
-            computeS = try {
-                Native.engineProcess(engine, x, bass, band)
-            } catch (e: Throwable) {
-                return fail("Separator failed: ${e.message}")
-            }
-            if (computeS > hopS) late++
-            stems.put(Stems(bass, band))
-            val latency = hopS + LOOKAHEAD_S + computeS + hops.size * hopS
-            status = "%s · %s\n%.2f s per %.1f s hop · ~%.1f s behind%s\ninput %.0f dBFS".format(
-                model.name.removeSuffix(".tflite"), if (source == "helper") "helper" else "screen capture",
-                computeS, hopS, latency, if (skipped > 0) " · skipped $skipped" else "", levelDb,
-            )
-            Log.i(TAG, "run %.3fs late=%d skipped=%d in=%.1fdBFS %s".format(computeS, late, skipped, levelDb, Control.describe()))
+            fail("Model failed: ${e.message}")
+            return false
         }
     }
 
-    /** Cuts the incoming stream into hops, and meters it. */
-    private inner class Hopper(private val hop: Int) {
-        private var buf = FloatArray(2 * hop)
-        private var fill = 0
+    private fun unload() {
+        if (engine != 0L) Native.engineFree(engine)
+        engine = 0L
+        engineModel = ""
+    }
+
+    /** Worker thread: load the model, start the other threads, then separate hops. */
+    private fun work() {
+        try {
+            separate()
+        } finally {
+            unload()
+        }
+    }
+
+    private fun separate() {
+        // About 0.16 s of each run is CPU (STFT/iSTFT): ask for a fast core.
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+        var model = Models.current(this) ?: return fail("No model in $filesDir")
+        if (!load(model)) return
+        if (!running) return
+        thread(name = "stemflow-player") { play() }
+        thread(name = "stemflow-reader") { if (source == "helper") readHelper() else readProjection() }
+
+        var hop = Native.engineHop(engine)
+        var buf = FloatArray(2 * hop)
+        var fill = 0
+        while (running) {
+            // The model picked in the UI (or karaoke) changed: swap it in. Audio that
+            // arrives meanwhile is dropped by the catch-up below.
+            val want = Models.current(this)
+            if (want != null && want.file.path != engineModel) {
+                model = want
+                if (!load(model)) return
+                hop = Native.engineHop(engine)
+                buf = FloatArray(2 * hop)
+                fill = 0
+            }
+            val hopS = hop.toFloat() / RATE
+            // Fallen behind (a slow run, a warm phone, a model load): skip ahead rather
+            // than stay late for good. It is heard as a jump in the music.
+            val perHop = 2 * hop / (RATE / 10 * 2)
+            while (chunks.size > 2 * perHop) {
+                repeat(perHop) { chunks.poll() }
+                skipped++
+            }
+            val c = chunks.poll(200, TimeUnit.MILLISECONDS) ?: continue
+            var i = 0
+            while (i < c.size) {
+                val take = minOf(c.size - i, buf.size - fill)
+                System.arraycopy(c, i, buf, fill, take)
+                fill += take
+                i += take
+                if (fill < buf.size) break
+                fill = 0
+                val x = buf
+                buf = FloatArray(2 * hop)
+                val bass = FloatArray(2 * hop)
+                val band = FloatArray(2 * hop)
+                if (x.all { it > -1e-4f && it < 1e-4f }) {
+                    // The source is paused: play silence and leave the GPU alone.
+                    stems.put(Stems(bass, band))
+                    status = "${model.label} · paused"
+                    continue
+                }
+                computeS = try {
+                    Native.engineProcess(engine, x, bass, band)
+                } catch (e: Throwable) {
+                    return fail("Separator failed: ${e.message}")
+                }
+                if (computeS > hopS) late++
+                stems.put(Stems(bass, band))
+                val latency = hopS + LOOKAHEAD_S + computeS + chunks.size * 0.1f
+                status = "%s · %s\n%.2f s per %.1f s hop · ~%.1f s behind%s\ninput %.0f dBFS".format(
+                    model.label, if (source == "helper") "helper" else "screen capture",
+                    computeS, hopS, latency, if (skipped > 0) " · skipped $skipped" else "", levelDb,
+                )
+                Log.i(TAG, "run %.3fs late=%d skipped=%d in=%.1fdBFS %s".format(computeS, late, skipped, levelDb, Control.describe()))
+            }
+        }
+    }
+
+    /** Queues the incoming stream in 100 ms chunks, and meters it. */
+    private inner class Feeder {
         private var sumSq = 0.0
         private var n = 0
 
         fun push(x: FloatArray, len: Int) {
-            var i = 0
-            while (i < len) {
-                val take = minOf(len - i, buf.size - fill)
-                System.arraycopy(x, i, buf, fill, take)
-                fill += take
-                i += take
-                if (fill == buf.size) {
-                    hops.put(buf)
-                    buf = FloatArray(2 * hop)
-                    fill = 0
-                }
-            }
+            chunks.put(x.copyOf(len))
             for (k in 0 until len) sumSq += x[k] * x[k]
             n += len
             if (n >= RATE) {
@@ -259,13 +290,25 @@ class CaptureService : Service() {
         }
     }
 
-    private fun readHelper(hop: Int) {
-        val hopper = Hopper(hop)
+    /** The app whose playback the helper captures. */
+    private fun targetUids(): IntArray =
+        listOf("com.spotify.music").mapNotNull {
+            try { packageManager.getPackageUid(it, 0) } catch (_: Exception) { null }
+        }.toIntArray()
+
+    private fun readHelper() {
+        val hopper = Feeder()
         try {
             ServerSocket(HELPER_PORT, 1, InetAddress.getLoopbackAddress()).use { server ->
                 serverSocket = server
-                status = "Waiting for the capture helper"
-                Log.i(TAG, "$status on port $HELPER_PORT")
+                val uids = targetUids()
+                if (Shizu.granted() && uids.isNotEmpty()) {
+                    status = "Starting the capture helper…"
+                    Shizu.start(this, HELPER_PORT, uids)
+                } else {
+                    status = "Waiting for the capture helper\n${Shizu.state()}"
+                }
+                Log.i(TAG, "${status.lineSequence().first()} (port $HELPER_PORT)")
                 server.accept().use { sock ->
                     Log.i(TAG, "helper connected")
                     status = "Buffering…"
@@ -286,7 +329,7 @@ class CaptureService : Service() {
         if (running) fail("Capture helper disconnected")
     }
 
-    private fun readProjection(hop: Int) {
+    private fun readProjection() {
         val config = AudioPlaybackCaptureConfiguration.Builder(projection!!)
             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
             .addMatchingUsage(AudioAttributes.USAGE_GAME)
@@ -310,7 +353,7 @@ class CaptureService : Service() {
         record = rec
         rec.startRecording()
         status = "Buffering…"
-        val hopper = Hopper(hop)
+        val hopper = Feeder()
         val x = FloatArray(RATE / 10 * 2)
         while (running) {
             val got = rec.read(x, 0, x.size, AudioRecord.READ_BLOCKING)
@@ -372,7 +415,8 @@ class CaptureService : Service() {
         try { serverSocket?.close() } catch (_: Exception) {} // the helper exits on this
         record?.let { try { it.stop() } catch (_: Exception) {}; it.release() }
         projection?.stop()
-        hops.clear()
+        Shizu.stop()
+        chunks.clear()
         stems.clear()
         if (source == "helper") {
             // Dropping the helper's mix moves the source back to the speaker, and

@@ -62,38 +62,46 @@ adb shell "cd /data/local/tmp/stemflow && LD_LIBRARY_PATH=. ./stemflow-bench ft2
 
 ### What the export changes, and why
 
-All of it is mathematically the same model (torch vs stock forward 2e-8, LiteRT desktop CPU vs torch 2e-7):
+All of it is mathematically the same model (torch vs stock forward 4e-8, LiteRT desktop CPU vs torch 2e-7):
 
 | change | reason |
 |---|---|
-| embeddings baked in as constants; LayerScale folded into the linears | traced, they become ops the GPU delegate rejects (BROADCAST_TO, PAD, SELECT, broadcast MUL) |
-| transformer on `[1, C, 1, tokens]` with 1×1 convolutions | the delegate rejects or mis-batches `[tokens, C]` / `[1, tokens, C]` |
-| segment rounded to a multiple of 1024 samples | no padding in the time branch |
+| embeddings baked in as constants; LayerScale folded into the linears and norms | traced, they become ops the GPU delegate rejects (BROADCAST_TO, PAD, SELECT, broadcast MUL) |
+| every tensor 4-D with batch 1: time branch `[1, C, 1, T]`, frequency branch `[1, C, Fr, T]`, transformer `[1, C, 1, tokens]`; encoders, decoders and DConv re-written with 2-D convolutions (DConv's norms take one mean/variance per frequency row) | the delegate rejects or mis-batches `[tokens, C]` / `[1, tokens, C]`, and demucs' own 3-D layers made the converter insert 318 RESHAPE, 260 TRANSPOSE and 106 SLICE ops that each copy the tensor (22% of the GPU time) |
+| segment rounded to a multiple of 1024 samples; the decoders crop by padding the transposed convolution | no padding or slicing in the time branch |
+| the last decoders compute only the wanted source's channels | no 5-D source axis, and a quarter of the last layer's work |
 | channel means as 1×1 convolutions with weights 1/C | `x.mean(dim=1)` becomes MEAN → 3-D tensor → RESHAPE, which the delegate misreads: **NaN** |
+| means and maxima over a row or a whole tensor taken as a chain of poolings, ≤ 64 values per step | one MEAN / REDUCE_MAX over millions of values is a single serial GPU work item: 14 ms each for the first encoder's tensors, 28% of the GPU time in all. Pooling accumulates in fp32, so this is safe in fp16 |
+| attention one head at a time, each product a 1×1 convolution whose weights are the other operand (`scores = conv(q, weight=k)`, softmax over channels, `conv(scores, weight=v)`) | as matmuls the converter emits `[heads, T, d] @ [heads, d, S]`, and the delegate reshapes any matmul with batch ≠ 1, copying the heads×T×S scores three times (35 of 65 ms per attention). Per-head matmuls become FULLY_CONNECTED with run-time weights, which aborts |
 | every norm rescales by max\|d\|/128 before squaring | fp16 tops out at 65504 and norm inputs reach ~1900 on real music: **silent garbage in fp16** |
 
-With these, all 2841 ops run in one GPU partition.
+With these, all 3335 ops run in one GPU partition (7.8 s window; 3308 for 4 s).
 
 ### Results (Pixel 10a, ft2 bass, 30 s of *If I Were a Bell*, mono fold)
 
-| config | per run (p50) | hop it keeps up with | start-up | peak RSS |
-|---|---|---|---|---|
-| GPU fp16, 7.8 s window | 1.61–1.63 s | 1.75 s (0 of 12 runs late) | 7–11 s | 1.1 GB |
-| GPU fp16, 4 s window | 0.78 s | 1 s (0 of 31 runs late) | 10 s | 0.9 GB |
-| GPU fp32, 7.8 s window | 2.34 s | – | – | 1.6 GB |
+| config | per run (p50) | was, before the 4-D rewrite | hop it keeps up with | start-up | peak RSS |
+|---|---|---|---|---|---|
+| GPU fp16, 7.8 s window | 0.96–0.98 s | 1.65 s | 1 s, barely (0–1 of 31 runs late, worst 1.002 s); 1.75 s easily | 5.5 s | 0.93 GB |
+| GPU fp16, 4 s window | 0.54 s | 0.80 s | 1 s (0 of 31 runs late) | 5.5 s | 0.83 GB |
+| GPU fp32, 7.8 s window | 1.96 s | 2.34 s | – | 6 s | 1.3 GB |
 
-Accuracy of the stem against the same model on the phone's CPU:
+Of the 0.96 s, the GPU takes 0.80 s (Google's `benchmark_model`: 0.80 s; 0.42 s for the 4 s window); the rest is CPU: STFT 35 ms, iSTFT 80 ms, copies. Pinned to the X4 core (`taskset 80`) the run takes 0.90 s, so the app's worker thread should ask for a big core.
+
+Accuracy of the fp16 stem against the same model in fp32 on the GPU (which matched the phone's CPU to 55.7 dB before the rewrite):
 
 | config | SNR | worst second |
 |---|---|---|
-| GPU fp32, 7.8 s | 55.7 dB | 50.4 dB |
-| GPU fp16, 7.8 s | 45.3 dB | 35.8 dB |
-| GPU fp16, 4 s (vs the 7.8 s reference) | 21.3 dB | 12.5 dB |
+| GPU fp16, 7.8 s | 46.8 dB | 39.6 dB |
+| GPU fp16, 4 s | 47.3 dB | 39.6 dB |
+| previous export, fp16, 7.8 s (vs the new one in fp32) | 46.6 dB | 38.8 dB |
 
-The 4 s number is not an error measure: a shorter window is a different (less informed) estimate. Whether it sounds worse needs listening or an SDR test.
+A 4 s window is a different (less informed) estimate than a 7.8 s one: the two differ by 21 dB SNR. Whether it sounds worse needs listening or an SDR test.
 
 Notes:
-- Before the fp16 rescaling the 7.8 s window took 1.24 s; the rescaling costs ~0.4 s. GPU time by op type: norm statistics (mean + reduce_max) 28%, reshape/transpose/slice 22%, the convolutions themselves only 18%. So there is room: calibrated constant scales instead of reduce_max, and writing the encoders/decoders in 4-D so the converter stops inserting reshapes.
+- Tried and dropped, as none was faster: min/max instead of abs for the norm's scale (REDUCE_MIN: 1.04 s on the GPU instead of 0.80 s); splitting the rewrite convolutions so the GLU needs no SLICE; pooling steps of 32 or 512; multiplying by 1/s instead of dividing; STFT/iSTFT of the two channels on two threads.
+- Constant, calibrated norm scales instead of max\|d\| would save at most 60 ms: the export without any fp16 protection runs in 0.73 s on the GPU. Not worth an overflow that depends on the music.
+- `benchmark_model --enable_op_profiling` aborts on the new graph (it worked on the old one), so there is no per-op profile of it. Not investigated.
+- The LiteRT 2.x GPU accelerator (ML Drift) is untried.
 - `inference_preference` must stay FAST_SINGLE_ANSWER. SUSTAINED_SPEED spent 218 s (fp16) / 635 s (fp32) tuning at start-up for no faster runs.
 - LiteRT on the CPU through this C API took ~48 s per run (the prebuilt benchmark tool: 3.5 s), so XNNPACK is evidently not being applied there. Unimportant for the GPU path; not investigated.
 - Random-input checks (`inference_diff`) did not catch the fp16 overflow. Only real audio did.
@@ -103,6 +111,7 @@ Notes:
 `core/` is a Rust `cdylib` (JNI) holding the separator on LiteRT/GPU (`bench/src/litert.rs`), the desktop's STFT and sliding-window streaming (`src/spec.rs`, `src/stream.rs`, by path), and a mixer with the desktop's loudness curve and limiter. `app/` is a Kotlin app (no AndroidX):
 
 - **Main screen**, modelled on the GNOME menu: Bass isolation switch, what the mix is, the Solo ↔ No bass balance line (detent at the full mix), Boost to 200%, the Bass solo / Full mix / No bass snaps, a status line.
+- **Karaoke switch and Model picker**, as in the menu: models are the `<name>_<stem>_<samples>.tflite` files in the app's files; Karaoke needs a `vocals` one and switches the target (labels follow: "Vocals solo", "No vocals"). A model picked while running is swapped in live. *Built, not yet exercised with a second model.*
 - **Notification** with the three snaps, and a **Quick Settings tile** for on/off ("Add quick tile" on the main screen).
 - **Sources:** the shell-uid helper (default; works for Spotify, see below), or Android's screen-capture consent ("Use screen capture instead"; only for apps that allow capture, and the original keeps playing).
 - **Threads:** reader (source → 2 s hops) → worker (separator) → player (20 ms blocks, levels applied at playback so the controls act at once). When the worker falls behind it skips to the newest hop.
@@ -133,24 +142,15 @@ adb shell am broadcast -a org.stemflow.app.CMD -p org.stemflow.app --es snap ful
 
 While the source is paused (digital silence) the separator is skipped, so the GPU idles; the first run after resuming is slow (about 4 s, the GPU has clocked down) and is absorbed by the skip.
 
-Not done: karaoke and model switching (need more models on the phone), Shizuku, releasing the model's ~1 GB when switched off.
+### Shizuku
 
-## Audio-in findings
+With [Shizuku](https://shizuku.rikka.app/) installed and started on the phone (over wireless debugging, once per boot), the app starts the helper itself: `Shizu.kt` binds `HelperService` as a Shizuku user service, which runs `Helper.run` as the shell uid. The first switch-on asks for Shizuku's permission. Without Shizuku the app waits for `android/helper.sh` as before.
 
-**Spotify blocks playback capture.** Measured 2026-11-14 on the Pixel 10a with Spotify 9.1.94 playing: the probe records digital silence (−120 dBFS). `dumpsys media.audio_policy` shows Spotify's track with `Flags: 0x600` = DEEP_BUFFER | **NO_MEDIA_PROJECTION** (0x400), i.e. `ALLOW_CAPTURE_BY_SYSTEM`. The same probe captures Musicolet at −24 dBFS, so the app is fine.
+**Works** (2026-11-15, Shizuku 13.6.0 on Android 17): switch on → helper starts through Shizuku → Spotify is separated, no computer involved. One trap: under Shizuku the process's `ActivityThread` reports the app's own package, and the audio server refuses to create the `AudioRecord` for a package that doesn't belong to the shell uid (`EX_SECURITY` in `ValidatedAttributionSourceState`). `Helper.fakeContext` therefore points the thread's bound application at `com.android.shell` in both the adb and the Shizuku case.
 
-Two things that looked like "capturable" and are not evidence:
-- the manifest flag `ALLOW_AUDIO_PLAYBACK_CAPTURE` (Spotify has it; the player overrides it per stream),
-- `dumpsys audio`'s `AudioPlaybackConfiguration ... flags=0x0` (it doesn't show the capture policy; `dumpsys media.audio_policy` does).
+**With the faster models (same day):** ft2, 7.8 s window, 1.5 s hop: **0.87–0.94 s per run** in the app, none late over the first 13 runs. Models are freed when isolation is switched off or another model is picked (`engineFree`, `Drop for LiteRtDemucs`).
 
-**With shell privileges Spotify is capturable, and the original goes silent.** Tested with scrcpy 5.0.1 (its server runs as the shell uid over adb), recording 10 s of Spotify to WAV:
-
-| scrcpy `--audio-source` | how it captures | result |
-|---|---|---|
-| `playback` | AudioPolicy mix, `MIX_TYPE_PLAYERS`, route flag `LOOP_BACK` only, matching usages | **−15.8 dBFS, Spotify's music**, taken before the volume control |
-| `output` | REMOTE_SUBMIX device | −52 dBFS: it is post-volume, and media volume was at 1 of 25 |
-
-The `playback` mix has no `RENDER` flag, so matched audio is rerouted to the capturer instead of the speaker: the same "move the stream" behaviour as the desktop. (Confirmed from the policy dump; not yet confirmed by ear.) So the app design is: a small helper running as shell uid (through Shizuku, or started over adb for development) registers that mix for Spotify, excluding our own uid, and hands PCM to the app, which plays the remix normally. scrcpy's `AudioPlaybackCapture.java` (Apache-2.0) is the reference for the hidden-API calls.
+Not done: a vocals model on the phone (Karaoke), a timeout when the helper fails to start (the status just stays on "Starting the capture helper…"), model switching exercised live.
 
 ### The helper (`app/src/main/java/org/stemflow/app/Helper.java`)
 
