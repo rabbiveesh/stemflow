@@ -75,7 +75,6 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Control.load(this)
-        Control.target = Models.target(this)
 
         power = Switch(this).apply {
             text = "Bass isolation"
@@ -113,8 +112,7 @@ class MainActivity : Activity() {
             text = "Karaoke"
             textSize = 16f
             setOnClickListener {
-                Models.setKaraoke(this@MainActivity, isChecked)
-                Control.target = Models.target(this@MainActivity)
+                Control.setKaraoke(this@MainActivity, isChecked)
                 refresh()
             }
         }

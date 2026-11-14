@@ -88,14 +88,15 @@ class CaptureService : Service() {
 
     private val commands = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
+            // Karaoke first: it brings in that target's own levels, which a snap or
+            // level in the same command then overrides.
+            if (i.hasExtra("karaoke")) Control.setKaraoke(c, i.getBooleanExtra("karaoke", false))
             i.getStringExtra("snap")?.let { Control.snap(it) }
             if (i.hasExtra("balance")) Control.setBalance(i.getFloatExtra("balance", 0f))
             if (i.hasExtra("bass") || i.hasExtra("band")) {
                 Control.setLevels(i.getFloatExtra("bass", Control.bass), i.getFloatExtra("band", Control.band))
             }
-            if (i.hasExtra("karaoke")) Models.setKaraoke(c, i.getBooleanExtra("karaoke", false))
             i.getStringExtra("model")?.let { id -> Models.all(c).firstOrNull { it.id == id }?.let { Models.select(c, it) } }
-            Control.target = Models.target(c)
             if (i.getBooleanExtra("stop", false)) stopSelf()
             Control.save(c)
             Log.i(TAG, "mix: ${Control.describe()}")
@@ -137,7 +138,6 @@ class CaptureService : Service() {
         source = if (data != null) "projection" else "helper"
 
         Control.load(this)
-        Control.target = Models.target(this)
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel("live", "Bass isolation", NotificationManager.IMPORTANCE_LOW)
         )

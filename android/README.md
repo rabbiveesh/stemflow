@@ -111,7 +111,7 @@ Notes:
 `core/` is a Rust `cdylib` (JNI) holding the separator on LiteRT/GPU (`bench/src/litert.rs`), the desktop's STFT and sliding-window streaming (`src/spec.rs`, `src/stream.rs`, by path), and a mixer with the desktop's loudness curve and limiter. `app/` is a Kotlin app (no AndroidX):
 
 - **Main screen**, modelled on the GNOME menu: Bass isolation switch, what the mix is, the Solo ↔ No bass balance line (detent at the full mix), Boost to 200%, the Bass solo / Full mix / No bass snaps, a status line.
-- **Karaoke switch and Model picker**, as in the menu: models are the `<name>_<stem>_<samples>.tflite` files in the app's files; Karaoke needs a `vocals` one and switches the target (labels follow: "Vocals solo", "No vocals"). A model picked while running is swapped in live. *Built, not yet exercised with a second model.*
+- **Karaoke switch and Model picker**, as in the menu: models are the `<name>_<stem>_<samples>.tflite` files in the app's files; Karaoke needs a `vocals` one and switches the target (labels follow: "Vocals solo", "No vocals"). A model picked while running is swapped in live (5–8 s to load on a Pixel 10a; the old one is freed first, so memory stays near 0.9 GB). Each target remembers its own levels: bass starts at Bass solo, karaoke at No vocals.
 - **Notification** with the three snaps, and a **Quick Settings tile** for on/off ("Add quick tile" on the main screen).
 - **Sources:** the shell-uid helper (default; works for Spotify, see below), or Android's screen-capture consent ("Use screen capture instead"; only for apps that allow capture, and the original keeps playing).
 - **Threads:** reader (source → 2 s hops) → worker (separator) → player (20 ms blocks, levels applied at playback so the controls act at once). When the worker falls behind it skips to the newest hop.
@@ -150,7 +150,9 @@ With [Shizuku](https://shizuku.rikka.app/) installed and started on the phone (o
 
 **With the faster models (same day):** ft2, 7.8 s window, 1.5 s hop: **0.87–0.94 s per run** in the app, none late over the first 13 runs. Models are freed when isolation is switched off or another model is picked (`engineFree`, `Drop for LiteRtDemucs`).
 
-Not done: a vocals model on the phone (Karaoke), a timeout when the helper fails to start (the status just stays on "Starting the capture helper…"), model switching exercised live.
+**Karaoke (same day):** `htdemucs_ft_vocals_344064.tflite`, exported with `export_litert.py OUT vocals 7.8` (stock weights), runs at 0.82–0.92 s per 1.5 s hop. Its fp16 output has not been compared numerically against fp32 as the bass model's was.
+
+Not done: a timeout when the helper fails to start (the status just stays on "Starting the capture helper…").
 
 ### The helper (`app/src/main/java/org/stemflow/app/Helper.java`)
 

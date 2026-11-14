@@ -14,7 +14,7 @@ object Control {
     @Volatile var bass = 1f; private set
     @Volatile var band = 0f; private set
     /** The stem `bass` acts on: "bass", or "vocals" in karaoke. */
-    @Volatile var target = "bass"
+    @Volatile var target = "bass"; private set
 
     fun setLevels(bass: Float, band: Float) {
         this.bass = bass.coerceIn(0f, MAX_BASS)
@@ -51,14 +51,27 @@ object Control {
         }
     }
 
+    /**
+     * Each target remembers its own levels, as on the desktop. A target used for the
+     * first time starts where it is most useful: bass solo, or no vocals for karaoke.
+     */
     fun load(c: Context) {
+        target = Models.target(c)
         val p = c.getSharedPreferences("mix", Context.MODE_PRIVATE)
-        setLevels(p.getFloat("bass", 1f), p.getFloat("band", 0f))
+        val solo = target == "bass"
+        setLevels(p.getFloat("target_$target", if (solo) 1f else 0f), p.getFloat("band_$target", if (solo) 0f else 1f))
     }
 
     fun save(c: Context) {
         c.getSharedPreferences("mix", Context.MODE_PRIVATE).edit()
-            .putFloat("bass", bass).putFloat("band", band).apply()
+            .putFloat("target_$target", bass).putFloat("band_$target", band).apply()
+    }
+
+    /** Karaoke on or off: keep the old target's levels, bring back the new one's. */
+    fun setKaraoke(c: Context, on: Boolean) {
+        save(c)
+        Models.setKaraoke(c, on)
+        load(c)
     }
 
     fun isSnap(name: String) = when (name) {
