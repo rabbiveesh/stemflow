@@ -1,0 +1,25 @@
+[package]
+name = "stemflow-bench"
+version = "0.1.0"
+edition = "2021"
+description = "On-device timing of the stemflow separators (run over adb on Android)"
+license = "MIT"
+publish = false
+
+# Not part of the desktop crate: built separately with cargo-ndk (see ../README.md).
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hound = "3"
+# Same pin as the desktop crate; libonnxruntime.so comes from the onnxruntime-android AAR.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
+realfft = "3"
+
+[profile.release]
+debug = 1
+
+[features]
+# model.rs is shared with the desktop crate, which has a cuda feature; never on here.
+cuda = []

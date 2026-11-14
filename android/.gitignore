@@ -1,0 +1,7 @@
+bench/target/
+core/target/
+listen/
+app/build/
+app/.gradle/
+app/local.properties
+app/src/main/jniLibs/

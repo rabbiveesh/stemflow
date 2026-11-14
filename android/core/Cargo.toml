@@ -1,0 +1,28 @@
+[package]
+name = "stemflow-core"
+version = "0.1.0"
+edition = "2021"
+description = "stemflow's separator, streaming and mixing as a JNI library for the Android app"
+license = "MIT"
+publish = false
+
+# Built separately with cargo-ndk (see ../README.md); not part of the desktop crate.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+jni = "0.21"
+realfft = "3"
+# Only because src/model.rs (shared with the desktop, for the Separator trait and
+# MonoFold) also holds the ONNX Runtime separators. Unused at run time here.
+clap = { version = "4", features = ["derive"] }
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
+
+[features]
+cuda = []
+
+[profile.release]
+debug = 1
