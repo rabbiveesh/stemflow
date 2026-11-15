@@ -247,3 +247,5 @@ Findings:
 Not yet tested: YouTube Music; Shizuku as the way to start the helper without adb.
 
 **All media, not one app (2026-11-15):** checked in `dumpsys media.audio_policy` while live: the mix's criteria are `RULE_EXCLUDE_UID <stemflow>` plus `RULE_MATCH_ATTRIBUTE_USAGE` for MEDIA, GAME and UNKNOWN; Spotify's track sits on the remote-submix output and stemflow's own track on the speaker's deep-buffer output. Only tried with Spotify playing; other players (Musicolet, YouTube Music) are untested.
+
+**Or one player:** the main screen's "From" picker lists "Whatever is playing" plus the installed apps that offer a media service (`Sources.kt`, found through the manifest's `<queries>`); the choice is read when isolation is switched on. A chosen app is captured by uid alone (`RULE_MATCH_UID`, as before), so other sounds keep playing normally. The helper takes `PORT except|only UID...`; `android/helper.sh PACKAGE` captures only that app. Checked live with Spotify chosen (criterion `RULE_MATCH_UID 10320`, audio flowing); the picker itself has not been looked at on the phone, and it is not known whether every player shows up in the list.

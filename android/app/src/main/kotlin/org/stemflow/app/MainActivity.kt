@@ -41,6 +41,8 @@ class MainActivity : Activity() {
     private lateinit var karaoke: Switch
     private lateinit var modelPicker: Spinner
     private var modelIds = listOf<String>()
+    private lateinit var sourcePicker: Spinner
+    private var sourcePkgs = listOf<String?>()
     private val snaps = mutableMapOf<String, Button>()
     private lateinit var noLabel: TextView
     private var dragging = false
@@ -129,6 +131,20 @@ class MainActivity : Activity() {
             }
         }
 
+        // Whose playback is isolated: everything, or one player. Read when isolation
+        // is switched on.
+        sourcePicker = Spinner(this).apply {
+            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(p: AdapterView<*>, v: View?, pos: Int, id: Long) {
+                    val c = this@MainActivity
+                    val pkg = sourcePkgs.getOrNull(pos)
+                    if (pkg != Sources.current(c)?.pkg) Sources.select(c, Sources.apps(c).firstOrNull { it.pkg == pkg })
+                }
+                override fun onNothingSelected(p: AdapterView<*>) {}
+            }
+        }
+
         val extras = row(
             Button(this).apply {
                 text = "Add quick tile"
@@ -153,6 +169,7 @@ class MainActivity : Activity() {
             addView(status.apply { setPadding(0, dp(14), 0, dp(14)) })
             addView(karaoke)
             addView(row(label("Model "), modelPicker))
+            addView(row(label("From  "), sourcePicker))
             addView(extras)
         }
         // targetSdk 35 draws edge to edge; the outer view takes the system-bar insets
@@ -163,7 +180,21 @@ class MainActivity : Activity() {
         })
     }
 
-    override fun onResume() { super.onResume(); ui.post(tick) }
+    override fun onResume() { super.onResume(); loadSources(); ui.post(tick) }
+
+    private fun loadSources() {
+        val apps = Sources.apps(this)
+        val pkgs = listOf<String?>(null) + apps.map { it.pkg }
+        if (pkgs != sourcePkgs) {
+            sourcePkgs = pkgs
+            sourcePicker.adapter = ArrayAdapter(
+                this, android.R.layout.simple_spinner_dropdown_item,
+                listOf("Whatever is playing") + apps.map { it.label },
+            )
+        }
+        val cur = pkgs.indexOf(Sources.current(this)?.pkg)
+        if (cur >= 0 && sourcePicker.selectedItemPosition != cur) sourcePicker.setSelection(cur)
+    }
     override fun onPause() { super.onPause(); ui.removeCallbacks(tick) }
 
     private fun refresh() {

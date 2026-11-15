@@ -23,8 +23,9 @@ import java.net.Socket;
 /**
  * Captures the phone's media playback with shell privileges and streams it to the app.
  *
- * Whatever is playing with a media, game or unspecified usage is taken, from any app
- * except the ones excluded (stemflow itself, or its output would loop back in).
+ * Either whatever is playing with a media, game or unspecified usage, from any app
+ * except the ones excluded (stemflow itself, or its output would loop back in); or
+ * only the chosen apps' playback.
  * Some players (Spotify) mark their audio NO_MEDIA_PROJECTION, so an ordinary app's playback capture
  * records silence. The shell uid may register an audio policy mix directly, and one
  * with only the LOOP_BACK route flag *moves* the matched players to the capturer:
@@ -34,7 +35,7 @@ import java.net.Socket;
  * Runs outside the app, as shell: started by Shizuku (HelperService), or over adb
  * (android/helper.sh):
  *   CLASSPATH=$(pm path org.stemflow.app | cut -d: -f2) \
- *       app_process / org.stemflow.app.Helper PORT EXCLUDED_UID [EXCLUDED_UID...]
+ *       app_process / org.stemflow.app.Helper PORT except|only UID [UID...]
  * and writes 44.1 kHz stereo s16le PCM to 127.0.0.1:PORT, where the app listens.
  * Exiting (or the app closing the socket) drops the mix and playback returns.
  */
@@ -44,22 +45,26 @@ public final class Helper {
     public static final int RATE = 44100;
 
     public static void main(String[] args) throws Exception {
-        if (args.length < 2) {
-            System.err.println("usage: Helper PORT EXCLUDED_UID [EXCLUDED_UID...]");
+        if (args.length < 3 || !(args[1].equals("except") || args[1].equals("only"))) {
+            System.err.println("usage: Helper PORT except|only UID [UID...]");
             System.exit(2);
         }
         int port = Integer.parseInt(args[0]);
-        int[] exclude = new int[args.length - 1];
-        for (int i = 1; i < args.length; i++) exclude[i - 1] = Integer.parseInt(args[i]);
+        int[] uids = new int[args.length - 2];
+        for (int i = 2; i < args.length; i++) uids[i - 2] = Integer.parseInt(args[i]);
 
-        run(port, exclude);
+        boolean only = args[1].equals("only");
+        run(port, only ? uids : new int[0], only ? new int[0] : uids);
     }
 
-    /** Captures until the app closes the socket, then exits the process. */
-    static void run(int port, int[] exclude) throws Exception {
+    /**
+     * Captures until the app closes the socket, then exits the process. With `only`
+     * non-empty just those uids are captured; otherwise all media but `exclude`'s.
+     */
+    static void run(int port, int[] only, int[] exclude) throws Exception {
         if (Looper.getMainLooper() == null) Looper.prepareMainLooper();
         Context context = fakeContext();
-        AudioRecord record = createRecord(context, exclude);
+        AudioRecord record = createRecord(context, only, exclude);
 
         Socket socket = new Socket(InetAddress.getLoopbackAddress(), port);
         socket.setTcpNoDelay(true);
@@ -79,23 +84,28 @@ public final class Helper {
         System.exit(0); // drops the mix: the source plays on the speaker again
     }
 
-    private static AudioRecord createRecord(Context context, int[] exclude) throws Exception {
+    private static AudioRecord createRecord(Context context, int[] only, int[] exclude) throws Exception {
         Class<?> ruleClass = Class.forName("android.media.audiopolicy.AudioMixingRule");
         Class<?> ruleBuilderClass = Class.forName("android.media.audiopolicy.AudioMixingRule$Builder");
         Object ruleBuilder = ruleBuilderClass.getConstructor().newInstance();
         ruleBuilderClass.getMethod("setTargetMixRole", int.class)
                 .invoke(ruleBuilder, ruleClass.getField("MIX_ROLE_PLAYERS").getInt(null));
-        // Any of these usages (the same three MediaProjection capture allows), from
-        // any uid but the excluded ones.
-        int matchUsage = ruleClass.getField("RULE_MATCH_ATTRIBUTE_USAGE").getInt(null);
-        Method addMixRule = ruleBuilderClass.getMethod("addMixRule", int.class, Object.class);
-        int[] usages = {AudioAttributes.USAGE_MEDIA, AudioAttributes.USAGE_GAME, AudioAttributes.USAGE_UNKNOWN};
-        for (int usage : usages) {
-            addMixRule.invoke(ruleBuilder, matchUsage, new AudioAttributes.Builder().setUsage(usage).build());
-        }
         int matchUid = ruleClass.getField("RULE_MATCH_UID").getInt(null);
-        Method excludeMixRule = ruleBuilderClass.getMethod("excludeMixRule", int.class, Object.class);
-        for (int uid : exclude) excludeMixRule.invoke(ruleBuilder, matchUid, uid);
+        Method addMixRule = ruleBuilderClass.getMethod("addMixRule", int.class, Object.class);
+        if (only.length > 0) {
+            // A rule can't both match and exclude uids, and doesn't need to here.
+            for (int uid : only) addMixRule.invoke(ruleBuilder, matchUid, uid);
+        } else {
+            // Any of these usages (the same three MediaProjection capture allows),
+            // from any uid but the excluded ones.
+            int matchUsage = ruleClass.getField("RULE_MATCH_ATTRIBUTE_USAGE").getInt(null);
+            int[] usages = {AudioAttributes.USAGE_MEDIA, AudioAttributes.USAGE_GAME, AudioAttributes.USAGE_UNKNOWN};
+            for (int usage : usages) {
+                addMixRule.invoke(ruleBuilder, matchUsage, new AudioAttributes.Builder().setUsage(usage).build());
+            }
+            Method excludeMixRule = ruleBuilderClass.getMethod("excludeMixRule", int.class, Object.class);
+            for (int uid : exclude) excludeMixRule.invoke(ruleBuilder, matchUid, uid);
+        }
         // Not allowPrivilegedPlaybackCapture(true): AudioMix then refuses any sample
         // rate above 16 kHz. It isn't needed; the shell uid's mix gets Spotify anyway.
         Object rule = ruleBuilderClass.getMethod("build").invoke(ruleBuilder);

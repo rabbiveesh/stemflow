@@ -96,6 +96,8 @@ class CaptureService : Service() {
                 Control.setLevels(i.getFloatExtra("bass", Control.bass), i.getFloatExtra("band", Control.band))
             }
             i.getStringExtra("model")?.let { id -> Models.all(c).firstOrNull { it.id == id }?.let { Models.select(c, it) } }
+            // A package name, or "" for whatever is playing; used at the next start.
+            i.getStringExtra("source")?.let { pkg -> Sources.select(c, Sources.apps(c).firstOrNull { it.pkg == pkg }) }
             if (i.getBooleanExtra("stop", false)) stopSelf()
             Control.save(c)
             Log.i(TAG, "mix: ${Control.describe()}")
@@ -296,8 +298,13 @@ class CaptureService : Service() {
                 serverSocket = server
                 if (Shizu.granted()) {
                     status = "Starting the capture helper…"
-                    // All media playback except our own output.
-                    Shizu.start(this, HELPER_PORT, intArrayOf(Process.myUid()))
+                    // The chosen player, or all media playback except our own output.
+                    val app = Sources.current(this)
+                    Log.i(TAG, "capturing ${app?.pkg ?: "all media"}")
+                    Shizu.start(
+                        this, HELPER_PORT,
+                        if (app != null) intArrayOf(app.uid) else IntArray(0), intArrayOf(Process.myUid()),
+                    )
                 } else {
                     status = "Waiting for the capture helper\n${Shizu.state()}"
                 }

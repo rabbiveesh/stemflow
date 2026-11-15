@@ -43,19 +43,23 @@ object Shizu {
         Shizuku.requestPermission(1)
     }
 
-    /** Start the helper: all media playback except `exclude`'s, into our socket on `port`. */
-    fun start(c: Context, port: Int, exclude: IntArray) {
+    /**
+     * Start the helper, streaming into our socket on `port`: just `only`'s playback,
+     * or with `only` empty all media playback except `exclude`'s.
+     */
+    fun start(c: Context, port: Int, only: IntArray, exclude: IntArray) {
         val a = Shizuku.UserServiceArgs(ComponentName(c.packageName, HelperService::class.java.name))
             .daemon(false)
             .processNameSuffix("helper")
             .debuggable(true)
-            .version(1)
+            .version(2)
         val sc = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName, binder: IBinder) {
                 val data = Parcel.obtain()
                 val reply = Parcel.obtain()
                 try {
                     data.writeInt(port)
+                    data.writeIntArray(only)
                     data.writeIntArray(exclude)
                     binder.transact(1, data, reply, 0) // HelperService.START
                     reply.readException()

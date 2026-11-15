@@ -9,10 +9,11 @@
     <!-- only for the loopback socket the capture helper connects to -->
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- to look up the uid of the app whose playback the helper captures -->
+    <!-- the players offered under "From": apps with a media service -->
     <queries>
-        <package android:name="com.spotify.music" />
-        <package android:name="com.google.android.apps.youtube.music" />
+        <intent><action android:name="android.media.browse.MediaBrowserService" /></intent>
+        <intent><action android:name="androidx.media3.session.MediaSessionService" /></intent>
+        <intent><action android:name="androidx.media3.session.MediaLibraryService" /></intent>
     </queries>
 
     <application
