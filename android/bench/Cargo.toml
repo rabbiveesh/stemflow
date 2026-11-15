@@ -23,3 +23,5 @@ debug = 1
 [features]
 # model.rs is shared with the desktop crate, which has a cuda feature; never on here.
 cuda = []
+# LiteRT 2.3.2 (CompiledModel + ML Drift GPU accelerator) instead of 1.4.2; see src/litert.rs.
+litert2 = []

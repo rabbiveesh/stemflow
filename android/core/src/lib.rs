@@ -21,12 +21,12 @@ use anyhow::{ensure, Result};
 use jni::objects::{JClass, JFloatArray, JString};
 use jni::sys::{jfloat, jint, jlong};
 use jni::JNIEnv;
-use litert::{Accel, LiteRtDemucs};
+use litert::{Accel, LiteRtDemucs, LiteRtRoformer};
 use model::{MonoFold, Separator, SAMPLE_RATE};
 use std::time::Instant;
 use stream::Streamer;
 
-type Engine = Streamer<MonoFold<LiteRtDemucs>>;
+type Engine = Streamer<MonoFold<Box<dyn Separator>>>;
 
 /// Highest target level: 2.0 sounds twice as loud as the original (+10 dB).
 const MAX_BASS: f32 = 2.0;
@@ -109,7 +109,8 @@ fn throw(env: &mut JNIEnv, e: anyhow::Error) {
     let _ = env.throw_new("java/lang/RuntimeException", format!("{e:#}"));
 }
 
-/// Load a `.tflite` htdemucs model. `gpu`: 0 = CPU, 1 = GPU fp32, 2 = GPU fp16.
+/// Load a `.tflite` model: BS-RoFormer if the file name starts with `bsrofo` (as the
+/// export scripts name them), htdemucs otherwise. `gpu`: 0 = CPU, 1 = GPU fp32, 2 = GPU fp16.
 /// Times are in seconds. Blocks for several seconds (model load + GPU kernel build).
 #[no_mangle]
 pub extern "system" fn Java_org_stemflow_app_Native_engineNew<'l>(
@@ -128,7 +129,14 @@ pub extern "system" fn Java_org_stemflow_app_Native_engineNew<'l>(
             1 => Accel::Gpu,
             _ => Accel::GpuFp16,
         };
-        let sep = MonoFold(LiteRtDemucs::load(std::path::Path::new(&path), accel, 0)?);
+        let path = std::path::Path::new(&path);
+        let roformer = path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("bsrofo"));
+        let sep: Box<dyn Separator> = if roformer {
+            Box::new(LiteRtRoformer::load(path, accel, 0)?)
+        } else {
+            Box::new(LiteRtDemucs::load(path, accel, 0)?)
+        };
+        let sep = MonoFold(sep);
         let secs = |s: f32| (s * SAMPLE_RATE as f32).round() as usize;
         let (hop, la, xf) = (secs(hop), secs(lookahead), secs(xfade));
         ensure!(hop > 0 && xf <= la, "crossfade must fit inside the lookahead");

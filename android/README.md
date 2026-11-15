@@ -101,10 +101,81 @@ Notes:
 - Tried and dropped, as none was faster: min/max instead of abs for the norm's scale (REDUCE_MIN: 1.04 s on the GPU instead of 0.80 s); splitting the rewrite convolutions so the GLU needs no SLICE; pooling steps of 32 or 512; multiplying by 1/s instead of dividing; STFT/iSTFT of the two channels on two threads.
 - Constant, calibrated norm scales instead of max\|d\| would save at most 60 ms: the export without any fp16 protection runs in 0.73 s on the GPU. Not worth an overflow that depends on the music.
 - `benchmark_model --enable_op_profiling` aborts on the new graph (it worked on the old one), so there is no per-op profile of it. Not investigated.
-- The LiteRT 2.x GPU accelerator (ML Drift) is untried.
+- The LiteRT 2.x GPU accelerator (ML Drift) runs this model 14% faster: see below.
 - `inference_preference` must stay FAST_SINGLE_ANSWER. SUSTAINED_SPEED spent 218 s (fp16) / 635 s (fp32) tuning at start-up for no faster runs.
 - LiteRT on the CPU through this C API took ~48 s per run (the prebuilt benchmark tool: 3.5 s), so XNNPACK is evidently not being applied there. Unimportant for the GPU path; not investigated.
 - Random-input checks (`inference_diff`) did not catch the fp16 overflow. Only real audio did.
+
+### BS-RoFormer SW on the phone GPU
+
+`tools/export_bsrofo_litert.py` does the same for one head of BS-RoFormer SW (the model that won the desktop's blind tests; its weights are dev-only, see the licensing notes). It needs `rotary-embedding-torch beartype pyyaml` in the env, and the MSST checkout and `models/ext/bsrofo/` of the main checkout:
+
+```bash
+cd android/tools && ~/Android/litert-env/.venv/bin/python -I export_bsrofo_litert.py ../.. ~/Android/litert-models vocals 3
+```
+
+The bench picks `LiteRtRoformer` for files named `bsrofo*` (input and output are the spectrogram `[1, 4, 1025, frames]`, STFT as on the desktop). `--hop` plus `--lookahead` must fit in the window, which is 2.995 s for "3": `--hop 2 --lookahead 0.9`.
+
+Results (Pixel 10a, fp16, 3 s window, 30 s of *If I Were a Bell*, bass head, mono fold):
+
+| step | per window |
+|---|---|
+| first export that runs entirely on the GPU | 3.22 s |
+| attention matmuls kept 4-D (`tools/tflite_matmul4d.py`) | 1.91 s |
+| all convolutions on the `[1, D, bands, T]` grid | 1.81 s on the GPU, 1.89 s in the bench |
+
+It keeps up with a 2 s hop (0 of 16 runs late, worst 1.97 s) and not with less. fp32 takes 4.1 s. Peak RSS 1.1 GB. The stem matches the desktop's RoFormer (ONNX, CUDA, same window and hop) to 68.4 dB SNR in fp32 and 46.9 dB in fp16 (worst second 36.2 dB).
+
+What the export changes (torch vs stock forward 3e-6, LiteRT desktop vs torch 4e-4 at a peak of 209):
+
+| change | reason |
+|---|---|
+| token grid `[1, D, bands, T]`, linears as 1×1 convolutions; band split as one `[bins, 1]` convolution per band; all masks laid out by one reshape and transpose | no 3-D tensors, no per-band reshapes |
+| attention one head at a time, as matmuls over `[1, rows, N, 64]`, and `tflite_matmul4d.py` rewrites the file so they stay 4-D | the converter makes every matmul 3-D with batch = rows; the delegate then copies the scores three times: 67 of 133 ms per transformer |
+| rotary embedding as constants, with q and k produced as their even and odd halves | the rotation becomes elementwise |
+| RMSNorm divides by the token's peak before squaring (and gamma is folded into the next linear) | fp16 overflow. The division must not be a multiplication by the reciprocal: on silence that is 0 × inf, **NaN** |
+| constants made contiguous | the converter silently gave a clone of a permuted tensor the data of another constant of the same shape: **wrong output, no error** |
+
+Notes:
+- Where the time goes, per transformer (24 of them), from ablations at depth 2: feed-forward 22 ms, matmuls and softmax 13 ms, and the rest of attention (its convolutions, rotation and transposes) about 37 ms by difference; the band split and mask head take 62 ms in all. The norms cost nothing measurable.
+- Convolutions run at about 370 GMAC/s on the bands × frames grid, 30% slower on frames × bands, and slower on flat or other grids (1×16058, 7, 14 or 31 rows). Demucs' widest layers reach about 470 GMAC/s, so the floor for this model (404 GMAC of convolutions per 3 s) is about 1.3 s.
+- Untried: a shorter window (cost is close to linear in its length).
+- `benchmark_model --enable_op_profiling` aborts on this graph too.
+
+### LiteRT 2.x GPU accelerator (ML Drift)
+
+The bench can run on LiteRT 2.3.2's `CompiledModel` and GPU accelerator instead of 1.4.2's interpreter and GPU delegate: build it with the feature `litert2` (the two runtimes export clashing symbols, so it is one or the other). It needs `libLiteRt.so` and `libLiteRtClGlAccelerator.so` from the `litert` and `litert-gpu` 2.3.2 AARs on Google's Maven, unzipped at `~/Android/litert-2`; both go next to the binary on the phone. The same `.tflite` files run on either.
+
+```bash
+cd android/bench && ANDROID_NDK_HOME=~/Android/android-ndk-r29 LITERT_LIB_DIRS=~/Android/litert-2/litert/jni/arm64-v8a cargo ndk -t arm64-v8a -P 26 build --release --features litert2 --target-dir target/litert2
+```
+
+Per run in the bench, fp16, Pixel 10a, same clip and settings as above:
+
+| model | LiteRT 1.4.2 | LiteRT 2.3.2 (ML Drift) | fp16 accuracy on ML Drift |
+|---|---|---|---|
+| Demucs ft2 bass, 7.8 s window | 0.96 s (GPU alone 0.80 s) | 0.865 s (GPU alone 0.69 s); 0 of 31 runs late at a 1 s hop, worst 0.875 s | 46.8 dB vs its own fp32, which matches 1.4.2's fp32 to 127 dB |
+| BS-RoFormer SW bass, 3 s window | 1.89 s (GPU alone 1.81 s) | 1.75 s (GPU alone 1.64 s); 0 of 16 runs late at a 2 s hop, worst 1.82 s | 47.3 dB vs the desktop RoFormer |
+
+Start-up is 4 s for Demucs (7–11 s before). fp32 Demucs takes 1.45 s. Peak RSS 0.9 GB (Demucs), 1.0 GB (RoFormer). Four load → run → drop cycles of RoFormer return to the same RSS each time.
+
+Notes:
+- GPU options go in as an opaque option named `gpu_options` whose payload is TOML (`precision = 1` for fp16, `2` for fp32); the `Lrt*GpuOptions` helpers are not exported by `libLiteRt.so`. `buffer_storage_type`, `wait_type` and `prefer_texture_weights` made RoFormer slower or no faster.
+- The accelerator library is found through the dynamic linker's search path (`LD_LIBRARY_PATH=.` over adb). Inside an APK that has not been tried; if it is not found there, the environment option `kLiteRtEnvOptionTagRuntimeLibraryDir` (tag 22, a string) names the directory.
+- Every start prints "NPU accelerator could not be loaded"; harmless.
+- `tools/mldrift_run.c` is the minimal C runner used for the first measurements and the NPU probes. It needs the C headers of the LiteRT repo at tag `v2.3.2` (`litert/c/`, copied to `~/Android/litert-2/include`, with an empty `litert/build_common/build_config.h`): `aarch64-linux-android26-clang -O2 -I ~/Android/litert-2/include tools/mldrift_run.c -o mldrift_run -L ~/Android/litert-2/litert/jni/arm64-v8a -lLiteRt`.
+
+**Tensor NPU (tried, not usable on-device).** `ACCEL=npu` in `mldrift_run` selects it; it needs the two `.so` files of `litert-npu-runtime-google-tensor` 2.3.2 beside the binary and `LD_LIBRARY_PATH=.:/vendor/lib64` (the phone has `libedgetpu_litert.so`). From the shell the on-device compiler does run:
+
+| probe on `[1, 256, 62, 259]` | NPU | GPU (ML Drift, fp16) |
+|---|---|---|
+| `tanh(x) * sigmoid(x)` | compiles in 33 s, runs in 7 ms | ~1 ms on the old delegate for a comparable op |
+| two 1×1 convolutions + GELU (a RoFormer feed-forward) | the compile service dies (`DEAD_OBJECT`), 5 of 5 tries | 26 ms |
+| slice + concat; RMS norm | the compile service dies | – |
+| attention (matmul + softmax) | "unrecoverable compilation errors" | 11–13 ms |
+| the whole Demucs 4 s model | all 3308 ops selected, then "unrecoverable compilation errors" | – |
+
+The system service (`vendor.google.edgetpu_vendor_service`) logs "DarwiNN compiler virtual memory limit set to 4096MB" and exits a few seconds into each compile, with no reason visible to the shell. Google's supported route is compiling ahead of time on a Linux desktop (`ai_edge_litert.aot` with the pip package `ai-edge-litert-sdk-google-tensor`, which downloads the Tensor ML SDK and its compiler from Google under their licence agreements). Tried on 2026-11-15 with the owner's go-ahead: the install fails, because the compiler archive it downloads (`tensor-ml-sdk/sdk/releases/6.1.0/litert_plugin_compiler.tar.gz`) returns 404, and earlier package versions only accept a tarball you already have. Google's page says the SDK is a beta you sign up for, so the NPU waits on that access.
 
 ## app/ and core/ — the live app
 
@@ -116,10 +187,10 @@ Notes:
 - **Sources:** the shell-uid helper (default; works for Spotify, see below), or Android's screen-capture consent ("Use screen capture instead"; only for apps that allow capture, and the original keeps playing).
 - **Threads:** reader (source → 2 s hops) → worker (separator) → player (20 ms blocks, levels applied at playback so the controls act at once). When the worker falls behind it skips to the newest hop.
 
-Setup (once): Android SDK at `~/Android/sdk` (cmdline-tools, `platforms;android-35`, `build-tools;35.0.0`), Gradle 8.11.1 at `~/Android/gradle-8.11.1`, `app/local.properties` with `sdk.dir=`, and the two LiteRT `.so` files copied into `app/src/main/jniLibs/arm64-v8a/`.
+Setup (once): Android SDK at `~/Android/sdk` (cmdline-tools, `platforms;android-35`, `build-tools;35.0.0`), Gradle 8.11.1 at `~/Android/gradle-8.11.1`, `app/local.properties` with `sdk.dir=`, and LiteRT 2's `libLiteRt.so` and `libLiteRtClGlAccelerator.so` (from `~/Android/litert-2`) copied into `app/src/main/jniLibs/arm64-v8a/`.
 
 ```bash
-cd android/core && ANDROID_NDK_HOME=~/Android/android-ndk-r29 LITERT_LIB_DIRS=~/Android/litert-1.4.2/litert/jni/arm64-v8a:~/Android/litert-1.4.2/litert-gpu/jni/arm64-v8a cargo ndk -t arm64-v8a -P 26 -o ../app/src/main/jniLibs build --release
+cd android/core && ANDROID_NDK_HOME=~/Android/android-ndk-r29 LITERT_LIB_DIRS=~/Android/litert-2/litert/jni/arm64-v8a cargo ndk -t arm64-v8a -P 26 -o ../app/src/main/jniLibs build --release --features litert2
 ```
 
 ```bash
@@ -151,6 +222,10 @@ With [Shizuku](https://shizuku.rikka.app/) installed and started on the phone (o
 **With the faster models (same day):** ft2, 7.8 s window, 1.5 s hop: **0.87–0.94 s per run** in the app, none late over the first 13 runs. Models are freed when isolation is switched off or another model is picked (`engineFree`, `Drop for LiteRtDemucs`).
 
 **Karaoke (same day):** `htdemucs_ft_vocals_344064.tflite`, exported with `export_litert.py OUT vocals 7.8` (stock weights), runs at 0.82–0.92 s per 1.5 s hop. Its fp16 output has not been compared numerically against fp32 as the bass model's was.
+
+**BS-RoFormer SW in the app (2026-11-15):** `core` loads files named `bsrofo*` with `LiteRtRoformer`, and `Models.kt` gives them a 2 s hop and 0.9 s lookahead (the window is 2.995 s). `bsrofo_sw_vocals_132096.tflite` loads in 7.4 s and ran at **1.85–1.87 s per 2 s hop** for six runs, 758 MB PSS. Then runs took 2.4–3.8 s and three hops were skipped; the phone was cool (thermal status 0, skin 25 °C) and another app was on screen, so most likely the GPU was shared with someone using the phone (not confirmed). The ~5 % margin is too thin for anything but an idle phone. Listening only: SW's weights are not ours to ship.
+
+**The app on LiteRT 2.3.2 (2026-11-15):** `core` is now built with `--features litert2` and `LITERT_LIB_DIRS=~/Android/litert-2/litert/jni/arm64-v8a`, and `jniLibs` holds `libLiteRt.so` and `libLiteRtClGlAccelerator.so` instead of the two 1.4.2 libraries (never both sets). `Native.kt` loads both with `System.loadLibrary`; with `useLegacyPackaging` the accelerator is found inside the APK install without the RuntimeLibraryDir option. SW vocals: ready in 6.1 s, **1.73–1.78 s per 2 s hop**, 0 of 10 runs late on an idle phone, 893 MB PSS. ft2 bass (7.8 s window, 1.5 s hop): **0.84–0.91 s per run**, none late over 18 runs, 732 MB PSS.
 
 Not done: a timeout when the helper fails to start (the status just stays on "Starting the capture helper…").
 

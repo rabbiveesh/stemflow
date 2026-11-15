@@ -16,10 +16,14 @@ object Models {
         val label get() = "%s · %.1f s window".format(name, seconds)
         /**
          * Seconds of new audio per run. Measured on a Pixel 10a (GPU fp16): the 7.8 s
-         * window takes 0.96 s per run and the 4 s window 0.54 s, so these leave about
-         * a third of each hop as headroom for a warm phone or a busy screen.
+         * Demucs window takes 0.96 s per run and the 4 s one 0.54 s, so those leave
+         * about a third of each hop as headroom for a warm phone or a busy screen.
+         * BS-RoFormer takes 1.89 s for its 3 s window: 2 s hops, with almost none.
          */
-        val hop get() = if (seconds > 6f) 1.5f else 1.0f
+        val hop get() = if (roformer) 2.0f else if (seconds > 6f) 1.5f else 1.0f
+        /** Seconds of future context; hop + lookahead must fit inside the window. */
+        val lookahead get() = if (roformer) 0.9f else 1.0f
+        val roformer get() = name.startsWith("bsrofo")
     }
 
     private val pattern = Regex("""(.+)_(bass|vocals|drums|other)_(\d+)\.tflite""")

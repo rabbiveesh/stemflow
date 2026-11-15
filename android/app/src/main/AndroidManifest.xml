@@ -17,7 +17,7 @@
 
     <application
         android:label="stemflow"
-        android:icon="@android:drawable/ic_media_play"
+        android:icon="@mipmap/ic_launcher"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
         android:allowBackup="false">
         <activity
@@ -42,7 +42,7 @@
             android:name=".StemTile"
             android:exported="true"
             android:label="Bass isolation"
-            android:icon="@android:drawable/ic_media_play"
+            android:icon="@drawable/ic_stemflow"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
             <intent-filter>
                 <action android:name="android.service.quicksettings.action.QS_TILE" />

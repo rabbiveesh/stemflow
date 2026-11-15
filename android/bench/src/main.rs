@@ -110,7 +110,12 @@ fn main() -> Result<()> {
             Some("fp16") => litert::Accel::GpuFp16,
             Some(o) => bail!("--gpu {o}: expected fp32 or fp16"),
         };
-        Box::new(litert::LiteRtDemucs::load(&a.model, accel, a.threads)?)
+        // Told apart by file name, as written by the two export scripts.
+        if a.model.file_name().is_some_and(|n| n.to_string_lossy().starts_with("bsrofo")) {
+            Box::new(litert::LiteRtRoformer::load(&a.model, accel, a.threads)?)
+        } else {
+            Box::new(litert::LiteRtDemucs::load(&a.model, accel, a.threads)?)
+        }
     } else {
         Box::new(HtDemucs::load(&a.model, Device::Cpu, a.threads)?)
     };

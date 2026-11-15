@@ -61,7 +61,6 @@ class CaptureService : Service() {
         const val RATE = 44100
         const val HELPER_PORT = 28711
         const val CMD = "org.stemflow.app.CMD"
-        const val LOOKAHEAD_S = 1.0f
         const val XFADE_S = 0.25f
         const val BLOCK = RATE / 50 // 20 ms, as the desktop's limiter assumes
 
@@ -121,7 +120,7 @@ class CaptureService : Service() {
         return Notification.Builder(this, "live")
             .setContentTitle("stemflow · ${Control.describe()}")
             .setContentText(status.lineSequence().first())
-            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setSmallIcon(R.drawable.ic_stemflow)
             .setContentIntent(open)
             .setOngoing(true)
             .addAction(action("Bass solo", "snap", "solo", 1))
@@ -180,7 +179,7 @@ class CaptureService : Service() {
         try {
             val t = System.nanoTime()
             unload() // first, so two models are never in memory at once
-            engine = Native.engineNew(m.file.path, Native.GPU_FP16, m.hop, LOOKAHEAD_S, XFADE_S)
+            engine = Native.engineNew(m.file.path, Native.GPU_FP16, m.hop, m.lookahead, XFADE_S)
             engineModel = m.file.path
             Log.i(TAG, "model ready in %.1f s".format((System.nanoTime() - t) / 1e9))
             return true
@@ -262,7 +261,7 @@ class CaptureService : Service() {
                 }
                 if (computeS > hopS) late++
                 stems.put(Stems(bass, band))
-                val latency = hopS + LOOKAHEAD_S + computeS + chunks.size * 0.1f
+                val latency = hopS + model.lookahead + computeS + chunks.size * 0.1f
                 status = "%s · %s\n%.2f s per %.1f s hop · ~%.1f s behind%s\ninput %.0f dBFS".format(
                     model.label, if (source == "helper") "helper" else "screen capture",
                     computeS, hopS, latency, if (skipped > 0) " · skipped $skipped" else "", levelDb,

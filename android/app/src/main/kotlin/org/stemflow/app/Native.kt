@@ -3,9 +3,11 @@ package org.stemflow.app
 /** The Rust core (android/core): separator + streaming ("engine") and mixer + limiter. */
 object Native {
     init {
-        // Order matters: the core links against the two LiteRT libraries.
-        System.loadLibrary("tensorflowlite_jni")
-        System.loadLibrary("tensorflowlite_gpu_jni")
+        // Order matters: the core links against LiteRT (2.x, core built with the
+        // `litert2` feature). The accelerator is opened by LiteRT itself when a model
+        // is compiled for the GPU; loading it here first makes a missing file fail early.
+        System.loadLibrary("LiteRt")
+        System.loadLibrary("LiteRtClGlAccelerator")
         System.loadLibrary("stemflow_core")
     }
 

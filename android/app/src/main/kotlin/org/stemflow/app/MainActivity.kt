@@ -230,7 +230,7 @@ class MainActivity : Activity() {
     private fun addTile() {
         getSystemService(StatusBarManager::class.java).requestAddTileService(
             ComponentName(this, StemTile::class.java), "Bass isolation",
-            Icon.createWithResource(this, android.R.drawable.ic_media_play), mainExecutor,
+            Icon.createWithResource(this, R.drawable.ic_stemflow), mainExecutor,
         ) {}
     }
 
