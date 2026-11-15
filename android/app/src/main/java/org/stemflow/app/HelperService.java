@@ -7,7 +7,7 @@ import android.os.Parcel;
 /**
  * Helper as a Shizuku "user service": Shizuku starts this class in a process of its
  * own running as the shell uid and hands the app its binder. One call, START, with
- * the app's port and the uids to capture; the process exits when the app closes the
+ * the app's port and the uids to leave out of the capture; the process exits when the app closes the
  * socket or unbinds.
  */
 public class HelperService extends Binder {
@@ -27,10 +27,10 @@ public class HelperService extends Binder {
         }
         if (code == START) {
             final int port = data.readInt();
-            final int[] uids = data.createIntArray();
+            final int[] exclude = data.createIntArray();
             new Thread(() -> {
                 try {
-                    Helper.run(port, uids);
+                    Helper.run(port, exclude);
                 } catch (Throwable t) {
                     android.util.Log.e("stemflow", "helper failed", t);
                     System.exit(1);

@@ -43,8 +43,8 @@ object Shizu {
         Shizuku.requestPermission(1)
     }
 
-    /** Start the helper, capturing `uids` into our socket on `port`. */
-    fun start(c: Context, port: Int, uids: IntArray) {
+    /** Start the helper: all media playback except `exclude`'s, into our socket on `port`. */
+    fun start(c: Context, port: Int, exclude: IntArray) {
         val a = Shizuku.UserServiceArgs(ComponentName(c.packageName, HelperService::class.java.name))
             .daemon(false)
             .processNameSuffix("helper")
@@ -56,7 +56,7 @@ object Shizu {
                 val reply = Parcel.obtain()
                 try {
                     data.writeInt(port)
-                    data.writeIntArray(uids)
+                    data.writeIntArray(exclude)
                     binder.transact(1, data, reply, 0) // HelperService.START
                     reply.readException()
                     Log.i(CaptureService.TAG, "helper started through Shizuku")

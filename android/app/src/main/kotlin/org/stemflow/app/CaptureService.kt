@@ -289,21 +289,15 @@ class CaptureService : Service() {
         }
     }
 
-    /** The app whose playback the helper captures. */
-    private fun targetUids(): IntArray =
-        listOf("com.spotify.music").mapNotNull {
-            try { packageManager.getPackageUid(it, 0) } catch (_: Exception) { null }
-        }.toIntArray()
-
     private fun readHelper() {
         val hopper = Feeder()
         try {
             ServerSocket(HELPER_PORT, 1, InetAddress.getLoopbackAddress()).use { server ->
                 serverSocket = server
-                val uids = targetUids()
-                if (Shizu.granted() && uids.isNotEmpty()) {
+                if (Shizu.granted()) {
                     status = "Starting the capture helper…"
-                    Shizu.start(this, HELPER_PORT, uids)
+                    // All media playback except our own output.
+                    Shizu.start(this, HELPER_PORT, intArrayOf(Process.myUid()))
                 } else {
                     status = "Waiting for the capture helper\n${Shizu.state()}"
                 }

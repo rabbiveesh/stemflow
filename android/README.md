@@ -184,7 +184,7 @@ The system service (`vendor.google.edgetpu_vendor_service`) logs "DarwiNN compil
 - **Main screen**, modelled on the GNOME menu: Bass isolation switch, what the mix is, the Solo ↔ No bass balance line (detent at the full mix), Boost to 200%, the Bass solo / Full mix / No bass snaps, a status line.
 - **Karaoke switch and Model picker**, as in the menu: models are the `<name>_<stem>_<samples>.tflite` files in the app's files; Karaoke needs a `vocals` one and switches the target (labels follow: "Vocals solo", "No vocals"). A model picked while running is swapped in live (5–8 s to load on a Pixel 10a; the old one is freed first, so memory stays near 0.9 GB). Each target remembers its own levels: bass starts at Bass solo, karaoke at No vocals.
 - **Notification** with the three snaps, and a **Quick Settings tile** for on/off ("Add quick tile" on the main screen).
-- **Sources:** the shell-uid helper (default; works for Spotify, see below), or Android's screen-capture consent ("Use screen capture instead"; only for apps that allow capture, and the original keeps playing).
+- **Sources:** the shell-uid helper (default; takes whatever app is playing, Spotify included, see below), or Android's screen-capture consent ("Use screen capture instead"; only for apps that allow capture, and the original keeps playing).
 - **Threads:** reader (source → 2 s hops) → worker (separator) → player (20 ms blocks, levels applied at playback so the controls act at once). When the worker falls behind it skips to the newest hop.
 
 Setup (once): Android SDK at `~/Android/sdk` (cmdline-tools, `platforms;android-35`, `build-tools;35.0.0`), Gradle 8.11.1 at `~/Android/gradle-8.11.1`, `app/local.properties` with `sdk.dir=`, and LiteRT 2's `libLiteRt.so` and `libLiteRtClGlAccelerator.so` (from `~/Android/litert-2`) copied into `app/src/main/jniLibs/arm64-v8a/`.
@@ -231,7 +231,7 @@ Not done: a timeout when the helper fails to start (the status just stays on "St
 
 ### The helper (`app/src/main/java/org/stemflow/app/Helper.java`)
 
-Our own shell-uid capturer, in the app's APK but run outside the app. It registers a `LOOP_BACK`-only mix matching the target app's uid and streams 44.1 kHz stereo PCM to the app over a loopback TCP socket (port 28711); the app needs no MediaProjection consent with this source. For development it is started over adb, once the app says it is waiting:
+Our own shell-uid capturer, in the app's APK but run outside the app. It registers a `LOOP_BACK`-only mix matching every player with a media, game or unknown usage, excluding stemflow's own uid (so whatever app is playing is taken, and our output doesn't loop back in), and streams 44.1 kHz stereo PCM to the app over a loopback TCP socket (port 28711); the app needs no MediaProjection consent with this source. For development it is started over adb, once the app says it is waiting:
 
 ```bash
 android/helper.sh
@@ -245,3 +245,5 @@ Findings:
 - Killing the helper (or the app closing the socket) is enough to restore normal playback.
 
 Not yet tested: YouTube Music; Shizuku as the way to start the helper without adb.
+
+**All media, not one app (2026-11-15):** checked in `dumpsys media.audio_policy` while live: the mix's criteria are `RULE_EXCLUDE_UID <stemflow>` plus `RULE_MATCH_ATTRIBUTE_USAGE` for MEDIA, GAME and UNKNOWN; Spotify's track sits on the remote-submix output and stemflow's own track on the speaker's deep-buffer output. Only tried with Spotify playing; other players (Musicolet, YouTube Music) are untested.
