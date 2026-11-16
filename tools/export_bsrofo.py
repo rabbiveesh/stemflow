@@ -16,6 +16,10 @@ Usage: .venv/bin/python -I export_bsrofo.py ../models/ext/bsrofo ../models [stem
 stem is one of the checkpoint's instruments (bass, drums, other, vocals, guitar,
 piano); it writes bsrofo_sw_<stem>.onnx and reference vectors to ref_bsrofo
 (bass) or ref_bsrofo_<stem>.
+
+Several stems, comma-separated (e.g. bass,vocals), share one pass through the
+trunk: the graph then returns [1, 4 * stems, 1025, T], each stem's 4 channels in
+the order given, and is named bsrofo_sw_<stem>+<stem>.onnx.
 """
 import os
 import sys
@@ -41,7 +45,8 @@ Loader.add_constructor("tag:yaml.org,2002:python/tuple", lambda l, n: tuple(l.co
 
 src_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "../models/ext/bsrofo")
 out_dir = Path(sys.argv[2] if len(sys.argv) > 2 else "../models")
-STEM = sys.argv[3] if len(sys.argv) > 3 else "bass"
+STEMS = (sys.argv[3] if len(sys.argv) > 3 else "bass").split(",")
+STEM = "+".join(STEMS)
 cfg = yaml.load((src_dir / "config.yaml").read_text(), Loader=Loader)
 mcfg = dict(cfg["model"], flash_attn=False)
 assert (mcfg["stft_n_fft"], mcfg["stft_hop_length"], mcfg.get("stft_normalized")) == (N_FFT, HOP, False)
@@ -49,16 +54,16 @@ m = BSRoformer(**mcfg).eval()
 m.requires_grad_(False)  # no autograd state while tracing: the export took >12 GB of RAM without this
 state = torch.load(src_dir / "model.ckpt", map_location="cpu", weights_only=False)
 m.load_state_dict(state.get("state_dict", state))
-head_idx = cfg["training"]["instruments"].index(STEM)
+head_idx = [cfg["training"]["instruments"].index(s) for s in STEMS]
 assert not m.skip_connection and m.zero_dc
 
 
 class Core(torch.nn.Module):
-    """BSRoformer.forward between the STFT and the iSTFT, one head only."""
+    """BSRoformer.forward between the STFT and the iSTFT, only the heads asked for."""
 
-    def __init__(self, m, head):
+    def __init__(self, m, heads):
         super().__init__()
-        self.m, self.head = m, m.mask_estimators[head]
+        self.m, self.heads = m, torch.nn.ModuleList(m.mask_estimators[h] for h in heads)
 
     def forward(self, spec_in):
         m = self.m
@@ -84,13 +89,16 @@ class Core(torch.nn.Module):
             x = freq_t(x)
             (x,) = unpack(x, ps, "* f d")
         x = m.final_norm(x)
-        mask = rearrange(self.head(x), "b t (f c) -> b f t c", c=2)  # [1, F*2, T, 2]
-        re = z[..., 0] * mask[..., 0] - z[..., 1] * mask[..., 1]
-        im = z[..., 0] * mask[..., 1] + z[..., 1] * mask[..., 0]
-        y = torch.stack([re, im], -1).reshape(1, F, 2, T, 2).permute(0, 2, 4, 1, 3).reshape(1, 4, F, T)
         dc = torch.ones(1, 1, F, 1)
         dc[:, :, 0] = 0
-        return y * dc
+        out = []
+        for head in self.heads:
+            mask = rearrange(head(x), "b t (f c) -> b f t c", c=2)  # [1, F*2, T, 2]
+            re = z[..., 0] * mask[..., 0] - z[..., 1] * mask[..., 1]
+            im = z[..., 0] * mask[..., 1] + z[..., 1] * mask[..., 0]
+            y = torch.stack([re, im], -1).reshape(1, F, 2, T, 2).permute(0, 2, 4, 1, 3).reshape(1, 4, F, T)
+            out.append(y * dc)
+        return out[0] if len(out) == 1 else torch.cat(out, 1)
 
 
 def stft(mix):
@@ -100,6 +108,9 @@ def stft(mix):
 
 
 def istft(spec, n):
+    """[1, 4 * stems, F, T] -> [stems, 2, n]"""
+    if spec.shape[1] > 4:
+        return torch.stack([istft(spec[:, i:i + 4], n) for i in range(0, spec.shape[1], 4)])
     s = spec.reshape(2, 2, spec.shape[2], spec.shape[3]).permute(0, 2, 3, 1).contiguous()
     w = torch.hann_window(N_FFT)
     return torch.istft(torch.view_as_complex(s), N_FFT, HOP, N_FFT, window=w, center=True, length=n)
@@ -123,6 +134,7 @@ with torch.no_grad():
     for n in (EXPORT_N, 588800) if os.environ.get("STEMFLOW_LONG_CHECK", "1") != "0" else (EXPORT_N,):
         mix = test_mix(n)
         full = m(mix)[0, head_idx]
+        full = full[0] if len(head_idx) == 1 else full
         y = istft(core(stft(mix)), n)
         print(f"n={n}: torch split vs stock forward, max abs err {float((y - full).abs().max()):.2e}")
     z = stft(test_mix(EXPORT_N))
@@ -148,6 +160,8 @@ with torch.no_grad():
         print(f"n={n}: onnx vs torch spec max abs err {float(np.abs(o - spec.numpy()).max()):.2e}, "
               f"peak {float(spec.abs().max()):.2f}")
     mix.numpy().tofile(ref / "mix.f32")
-    m(mix)[0, head_idx].numpy().astype(np.float32).tofile(ref / f"{STEM}.f32")
+    full = m(mix)[0]
+    for s, h in zip(STEMS, head_idx):
+        full[h].numpy().astype(np.float32).tofile(ref / f"{s}.f32")
     z.numpy().tofile(ref / "spec_in.f32")
     print(f"wrote reference vectors ({mix.shape[-1]} samples) to", ref)

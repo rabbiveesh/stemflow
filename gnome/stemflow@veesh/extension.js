@@ -35,6 +35,8 @@ const IFACE = `
     <property name="Balance" type="d" access="readwrite"/>
     <property name="Bass" type="d" access="readwrite"/>
     <property name="Band" type="d" access="readwrite"/>
+    <property name="Second" type="s" access="read"/>
+    <property name="SecondLevel" type="d" access="readwrite"/>
     <property name="Description" type="s" access="read"/>
     <property name="Target" type="s" access="read"/>
     <property name="Model" type="s" access="readwrite"/>
@@ -99,13 +101,17 @@ function unitState(cb) {
 }
 
 /* The stems a model can isolate, as src/models.rs knows them: a model's id ends in
- * `_<stem>`, anything else is a bass model. */
-const STEMS = ['bass', 'vocals', 'other', 'piano', 'guitar', 'drums'];
+ * `_<stem>`, or `_<stem>+<stem>` for a model that separates two at once; anything
+ * else is a bass model. */
+const STEMS = ['bass', 'bass+vocals', 'vocals', 'other', 'piano', 'guitar', 'drums'];
 const STEM_LABELS = {
-    bass: 'Bass', vocals: 'Vocals (karaoke)', other: 'Other (horns, strings…)',
-    piano: 'Piano', guitar: 'Guitar', drums: 'Drums',
+    bass: 'Bass', 'bass+vocals': 'Bass + vocals', vocals: 'Vocals (karaoke)',
+    other: 'Other (horns, strings…)', piano: 'Piano', guitar: 'Guitar', drums: 'Drums',
 };
 function stemOf(id) {
+    const two = id.match(/_([a-z]+\+[a-z]+)$/);
+    if (two)
+        return two[1];
     return STEMS.find(s => id.endsWith(`_${s}`)) || 'bass';
 }
 
@@ -195,13 +201,17 @@ class StemflowIndicator extends PanelMenu.Button {
         // Advanced mode: each level on its own (the target slider runs to MAX_BASS).
         this._bass = new SliderRow('Bass', v => this._set('Bass', v * MAX_BASS));
         this._band = new SliderRow('Band', v => this._set('Band', v));
+        // A two-stem model (bass + vocals) always shows three plain sliders: bass,
+        // that stem (labelled with its name) and the band (everything else).
+        this._second = new SliderRow('', v => this._set('SecondLevel', v));
         this.menu.addMenuItem(this._bass);
+        this.menu.addMenuItem(this._second);
         this.menu.addMenuItem(this._band);
 
         const snaps = new PopupMenu.PopupBaseMenuItem({ activate: false, reactive: false });
         const box = new St.BoxLayout({ x_expand: true, style: 'spacing: 6px;' });
         this._snapButtons = {};
-        for (const [label, name] of [['Bass solo', 'solo'], ['Full mix', 'full'], ['No bass', 'nobass']]) {
+        for (const [label, name] of [['Bass solo', 'solo'], ['Full mix', 'full'], ['No bass', 'nobass'], ['No vocals', 'novocals']]) {
             const b = new St.Button({ label, style_class: 'button', x_expand: true, can_focus: true });
             b.connect('clicked', () => this._snap(name));
             box.add_child(b);
@@ -465,7 +475,7 @@ class StemflowIndicator extends PanelMenu.Button {
         // Off: the clef takes the bar's own colour (white); on: water-blue.
         if (!on || this._clef.style !== CLEF_WARN)
             this._clef.style = on ? CLEF : '';
-        for (const w of [this._desc, this._snaps, this._one, this._boost, this._bass, this._band, this._status, this._models, this._stems])
+        for (const w of [this._desc, this._snaps, this._one, this._boost, this._bass, this._band, this._second, this._status, this._models, this._stems])
             w.visible = on;
         // An older daemon has no Model property: no pickers.
         this._stems.visible = on && !!this._proxy.Model;
@@ -484,14 +494,20 @@ class StemflowIndicator extends PanelMenu.Button {
             this._clef.style = starting ? CLEF_DIM : '';
             return;
         }
-        this._one.visible = this._boost.visible = !adv;
-        this._bass.visible = this._band.visible = adv;
+        // Older daemons have no Second.
+        const second = this._proxy.Second || '';
+        const three = !!second;
+        this._one.visible = this._boost.visible = !adv && !three;
+        this._bass.visible = this._band.visible = adv || three;
+        this._second.visible = three;
+        this._snapButtons.novocals.visible = three;
         const p = this._proxy;
         // "Bass" is whichever stem stemflow targets (the Stem picker, or
         // `stemflow live --target vocals`). Older daemons have no Target.
         const t = p.Target || 'bass';
         const T = t[0].toUpperCase() + t.slice(1);
-        this._switch.label.text = `${T} isolation${t === 'vocals' ? ' (karaoke)' : ''}`;
+        this._switch.label.text = three ? `${T} + ${second} isolation`
+            : `${T} isolation${t === 'vocals' ? ' (karaoke)' : ''}`;
         this._bass._label.text = T;
         this._snapButtons.solo.label = `${T} solo`;
         this._snapButtons.nobass.label = `No ${t}`;
@@ -509,6 +525,12 @@ class StemflowIndicator extends PanelMenu.Button {
             p.Bass > 1 ? `+${Math.round((p.Bass - 1) * 100)}%` : 'off');
         this._bass.set(p.Bass / MAX_BASS, `${Math.round(p.Bass * 100)}%`);
         this._band.set(p.Band, `${Math.round(p.Band * 100)}%`);
+        if (three) {
+            this._second._label.text = second[0].toUpperCase() + second.slice(1);
+            const lv = p.SecondLevel;
+            this._second.set(lv, `${Math.round(lv * 100)}%`);
+            this._snapButtons.novocals.label = `No ${second}`;
+        }
     }
 
     destroy() {

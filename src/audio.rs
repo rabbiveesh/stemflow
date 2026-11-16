@@ -85,7 +85,7 @@ pub fn live(
     grab: &str,
     output: Option<String>,
     slack: f32,
-    load: impl Fn(&str) -> Result<(Live, &'static str)>,
+    load: impl Fn(&str) -> Result<(Live, &'static str, Option<&'static str>)>,
 ) -> Result<()> {
     let mut st = Some(st);
     let output = match output {
@@ -190,10 +190,12 @@ pub fn live(
     let pctl = ctl.clone();
     let refill = hop + (slack * SAMPLE_RATE as f32) as usize;
     let player = std::thread::spawn(move || -> Result<()> {
-        let (mut bass, mut band) = (Vec::<f32>::new(), Vec::<f32>::new());
-        let mut pos = 0; // frames already played from the front of bass/band
+        // bass, band and a second stem (all zero for one-stem models)
+        let (mut bass, mut band, mut sec) =
+            (Vec::<f32>::new(), Vec::<f32>::new(), Vec::<f32>::new());
+        let mut pos = 0; // frames already played from the front of the buffers
         let mut buffering = true;
-        let mut g = pctl.gains();
+        let mut g = pctl.gains3();
         let mut out = vec![0f32; 2 * block];
         let mut lim = Limiter::new();
         loop {
@@ -207,7 +209,12 @@ pub fn live(
             if let Some(st) = next {
                 bass.drain(..2 * pos);
                 band.drain(..2 * pos);
+                sec.drain(..2 * pos);
                 pos = 0;
+                match st.extra.into_iter().next() {
+                    Some(v) => sec.extend(v),
+                    None => sec.resize(sec.len() + st.bass.len(), 0.0),
+                }
                 bass.extend(st.bass);
                 band.extend(st.band);
             } else if buffering || avail < block {
@@ -221,20 +228,21 @@ pub fn live(
                 buffering = false;
             }
             while bass.len() / 2 - pos >= block {
-                let target = pctl.gains();
+                let target = pctl.gains3();
                 for i in 0..block {
                     let a = (i as f32 + 1.0) / block as f32; // ramp: no zipper noise
                     let gb = g.0 + (target.0 - g.0) * a;
                     let gr = g.1 + (target.1 - g.1) * a;
+                    let gs = g.2 + (target.2 - g.2) * a;
                     for ch in 0..2 {
                         let k = 2 * (pos + i) + ch;
-                        out[2 * i + ch] = gb * bass[k] + gr * band[k];
+                        out[2 * i + ch] = gb * bass[k] + gr * band[k] + gs * sec[k];
                     }
                 }
                 // Look one block ahead (it's already buffered) so the limiter is down
                 // before a peak arrives rather than clipping it.
                 let ahead = (bass.len() / 2 - pos - block).min(block);
-                let next = mix_peak(&bass, &band, pos + block, ahead, target);
+                let next = mix_peak([&bass, &band, &sec], pos + block, ahead, target);
                 lim.apply(&mut out, next);
                 g = target;
                 pos += block;
@@ -261,8 +269,8 @@ pub fn live(
             eprintln!("stemflow: switching to {id}");
             drop(st.take()); // free the GPU before loading the next one
             st = Some(match load(&id) {
-                Ok((s, target)) => {
-                    ctl.switched(&id, target);
+                Ok((s, target, second)) => {
+                    ctl.switched(&id, target, second);
                     s
                 }
                 Err(e) => {
@@ -318,12 +326,11 @@ fn running_low(bass: &[f32], pos: usize, block: usize) -> bool {
     bass.len() / 2 - pos < 2 * block
 }
 
-/// Peak of `gains.0 * bass + gains.1 * band` over `n` frames from `start`.
-fn mix_peak(bass: &[f32], band: &[f32], start: usize, n: usize, gains: (f32, f32)) -> f32 {
-    bass[2 * start..2 * (start + n)]
-        .iter()
-        .zip(&band[2 * start..2 * (start + n)])
-        .fold(0f32, |m, (b, r)| m.max((gains.0 * b + gains.1 * r).abs()))
+/// Peak of the mix (bass, band, second stem at `gains`) over `n` frames from `start`.
+fn mix_peak(s: [&[f32]; 3], start: usize, n: usize, gains: (f32, f32, f32)) -> f32 {
+    (2 * start..2 * (start + n)).fold(0f32, |m, k| {
+        m.max((gains.0 * s[0][k] + gains.1 * s[1][k] + gains.2 * s[2][k]).abs())
+    })
 }
 
 /// Block peak limiter with one block of lookahead: the gain ramps down across a

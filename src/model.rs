@@ -32,14 +32,22 @@ impl<S: Separator + ?Sized> Separator for Box<S> {
     fn valid_len(&self) -> usize {
         (**self).valid_len()
     }
+    fn stems(&self) -> usize {
+        (**self).stems()
+    }
 }
 
 pub trait Separator {
     /// Window length in samples (per channel) the model is run on.
     fn window_len(&self) -> usize;
     /// `mix` is planar stereo `[L.. , R..]` of `window_len()` each; returns the
-    /// bass stem in the same layout.
+    /// bass stem in the same layout, followed by any further stems (`stems()`) the
+    /// model separates in the same run, each laid out the same way.
     fn separate(&mut self, mix: &[f32]) -> Result<Vec<f32>>;
+    /// How many stems `separate` returns: the target first, then the rest.
+    fn stems(&self) -> usize {
+        1
+    }
     /// How many trailing samples of the output are real estimates (an ensemble of
     /// models with different windows only fully covers the shortest one).
     fn valid_len(&self) -> usize {
@@ -336,6 +344,8 @@ pub struct BsRoformer {
     session: Session,
     stft: HannStft,
     seg: usize,
+    /// Output heads in the graph (tools/export_bsrofo.py with several stems).
+    stems: usize,
 }
 
 impl BsRoformer {
@@ -344,13 +354,28 @@ impl BsRoformer {
             session: session(path, device, threads, gpu_mem_mb())?,
             stft: HannStft::new(2048, 512),
             seg,
+            stems: 1,
         };
-        m.separate(&vec![0.0; 2 * seg])?;
+        // The output has 4 channels per stem; the dry run finds out how many.
+        m.stems = m.run(m.spec_in(&vec![0.0; 2 * seg]))?.len() / (4 * m.plane());
         Ok(m)
     }
 
     fn frames(&self) -> usize {
         self.stft.frames_for(self.seg)
+    }
+
+    fn plane(&self) -> usize {
+        self.stft.bins() * self.frames()
+    }
+
+    fn run(&mut self, spec_in: Vec<f32>) -> Result<Vec<f32>> {
+        let (fr, bins) = (self.frames(), self.stft.bins());
+        let outputs = self.session.run(
+            ort::inputs!["spec_in" => Tensor::from_array(([1usize, 4, bins, fr], spec_in))?],
+        )?;
+        let (_, spec) = outputs["spec"].try_extract_tensor::<f32>()?;
+        Ok(spec.to_vec())
     }
 
     /// Model input: `[4, 1025, frames]` = L re, L im, R re, R im.
@@ -376,6 +401,10 @@ impl Separator for BsRoformer {
         self.seg
     }
 
+    fn stems(&self) -> usize {
+        self.stems
+    }
+
     fn separate(&mut self, mix: &[f32]) -> Result<Vec<f32>> {
         let seg = self.seg;
         assert_eq!(mix.len(), 2 * seg);
@@ -387,21 +416,19 @@ impl Separator for BsRoformer {
 impl BsRoformer {
     /// The model + iSTFT half of `separate`, from a ready-made input spectrogram.
     pub fn separate_spec(&mut self, spec_in: Vec<f32>) -> Result<Vec<f32>> {
-        let (seg, fr, bins) = (self.seg, self.frames(), self.stft.bins());
-        let outputs = self.session.run(
-            ort::inputs!["spec_in" => Tensor::from_array(([1usize, 4, bins, fr], spec_in))?],
-        )?;
-        let (_, spec) = outputs["spec"].try_extract_tensor::<f32>()?;
-        let plane = bins * fr;
-        let mut out = vec![0f32; 2 * seg];
+        let (seg, fr, plane) = (self.seg, self.frames(), self.plane());
+        let spec = self.run(spec_in)?;
+        let mut out = vec![0f32; 2 * seg * self.stems];
         let mut z = vec![Complex32::new(0.0, 0.0); plane];
-        for ch in 0..2 {
-            let re = &spec[2 * ch * plane..(2 * ch + 1) * plane];
-            let im = &spec[(2 * ch + 1) * plane..(2 * ch + 2) * plane];
+        // per stem: L re, L im, R re, R im
+        for (k, ch) in (0..self.stems).flat_map(|s| [(s, 0), (s, 1)]) {
+            let c = 2 * k + ch;
+            let re = &spec[2 * c * plane..(2 * c + 1) * plane];
+            let im = &spec[(2 * c + 1) * plane..(2 * c + 2) * plane];
             for i in 0..plane {
                 z[i] = Complex32::new(re[i], im[i]);
             }
-            self.stft.istft(&z, fr, &mut out[ch * seg..(ch + 1) * seg]);
+            self.stft.istft(&z, fr, &mut out[c * seg..(c + 1) * seg]);
         }
         Ok(out)
     }
@@ -424,6 +451,10 @@ impl Ensemble {
             .max()
             .expect("empty ensemble");
         let valid = members.iter().map(|(m, _)| m.valid_len()).min().unwrap();
+        assert!(
+            members.iter().all(|(m, _)| m.stems() == 1),
+            "ensembles take one-stem models"
+        );
         Ensemble {
             members,
             seg,
@@ -484,6 +515,10 @@ pub struct MonoFold<S>(pub S);
 impl<S: Separator> Separator for MonoFold<S> {
     fn window_len(&self) -> usize {
         self.0.window_len()
+    }
+
+    fn stems(&self) -> usize {
+        self.0.stems()
     }
 
     fn valid_len(&self) -> usize {

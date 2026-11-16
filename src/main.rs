@@ -152,6 +152,10 @@ struct Opts {
     /// Band (everything but the target) loudness in percent of full. Overrides --balance.
     #[arg(long)]
     band: Option<f32>,
+    /// With a two-stem model (bass+vocals): how much of the second stem stays in the
+    /// band, in percent (0 = take it out).
+    #[arg(long)]
+    second: Option<f32>,
     /// CPU threads for inference (0 = ONNX Runtime default).
     #[arg(long, default_value_t = 0)]
     threads: usize,
@@ -305,7 +309,8 @@ fn main() -> Result<()> {
                 None => streamer(&opts)?, // the ensemble
             };
             let target = m.as_ref().map_or(opts.target().name(), |m| m.target);
-            let ctl = levels(&opts, target, true);
+            let second = m.as_ref().and_then(|m| m.second);
+            let ctl = levels(&opts, target, second, true);
             ctl.set_model(m.as_ref().map_or("ensemble", |m| &m.id));
             let (lat, hop) = (
                 st.latency() as f64 / SAMPLE_RATE as f64,
@@ -324,10 +329,10 @@ fn main() -> Result<()> {
             // Switching models from the menu: drop the running one (frees the GPU),
             // then load the new one with the same settings.
             let load =
-                move |id: &str| -> Result<(Streamer<Box<dyn Separator + Send>>, &'static str)> {
+                move |id: &str| -> Result<(audio::Live, &'static str, Option<&'static str>)> {
                     let m = models::find(&opts.models, id)
                         .with_context(|| format!("no model `{id}`"))?;
-                    Ok((wrap(&opts, load_model(&opts, &m)?)?, m.target))
+                    Ok((wrap(&opts, load_model(&opts, &m)?)?, m.target, m.second))
                 };
             audio::live(st, ctl, &grab, output, slack, load)
         }
@@ -365,10 +370,23 @@ fn main() -> Result<()> {
 }
 
 /// Starting levels: explicit flags, else the remembered ones, else bass solo.
-fn levels(o: &Opts, target: &'static str, remember: bool) -> std::sync::Arc<control::Control> {
+fn levels(
+    o: &Opts,
+    target: &'static str,
+    second: Option<&'static str>,
+    remember: bool,
+) -> std::sync::Arc<control::Control> {
     let ctl = control::Control::new(target, 1.0, 0.0);
-    if let Some((a, b)) = remember.then(|| control::load_levels(target)).flatten() {
+    ctl.set_second(second);
+    if let Some((a, b, c)) = remember
+        .then(|| control::load_levels(&ctl.levels_key()).or_else(|| control::load_levels(target)))
+        .flatten()
+    {
         ctl.set_levels(a, b);
+        ctl.set_second_level(c.unwrap_or(1.0));
+    }
+    if let Some(v) = o.second {
+        ctl.set_second_level(v / 100.0);
     }
     if let Some(b) = o.balance {
         ctl.set_balance(b);
@@ -408,7 +426,12 @@ fn file(o: &Opts, input: &Path, output: &Path) -> Result<()> {
     };
 
     let mut s = streamer(o)?;
-    let ctl = levels(o, o.target().name(), false);
+    let second = o
+        .model
+        .as_ref()
+        .and_then(|id| models::find(&o.models, id))
+        .and_then(|m| m.second);
+    let ctl = levels(o, o.target().name(), second, false);
     let (hop, lat) = (s.hop, s.delay());
     let frames = stereo.len() / 2;
     let mut padded = stereo;
@@ -418,8 +441,8 @@ fn file(o: &Opts, input: &Path, output: &Path) -> Result<()> {
     let mut times = Vec::new();
     for chunk in padded.chunks(2 * hop) {
         let t = Instant::now();
-        let (bg, rg) = ctl.gains();
-        out.extend(s.process(chunk)?.mix(bg, rg));
+        let (bg, rg, sg) = ctl.gains3();
+        out.extend(s.process(chunk)?.mix(bg, rg, sg));
         times.push(t.elapsed().as_secs_f32());
     }
     let hop_s = hop as f32 / SAMPLE_RATE as f32;
