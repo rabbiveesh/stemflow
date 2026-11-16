@@ -4,6 +4,8 @@
 //! and time-branch waveform [1, 2, seg]. The STFT, iSTFT and final sum are the
 //! desktop's (spec.rs), as in model.rs' HtDemucs.
 //! LiteRtRoformer does the same for BS-RoFormer (../tools/export_bsrofo_litert.py).
+//! LiteRtBeatNet runs Beat This! (../tools/export_beat_this_litert.py), which needs no
+//! transform here: log-mel in, logits out.
 //!
 //! Two runtimes, chosen at build time (their libraries export clashing symbols):
 //!   - default: LiteRT 1.4.2's interpreter and GPU delegate
@@ -291,8 +293,8 @@ mod engine {
     }
 
     impl Engine {
-        /// `threads` is unused: the CPU accelerator picks its own.
-        pub fn load(path: &Path, accel: Accel, _threads: usize) -> Result<Self> {
+        /// `threads` is for the CPU accelerator (XNNPACK); 0 leaves it to the runtime.
+        pub fn load(path: &Path, accel: Accel, threads: usize) -> Result<Self> {
             let cpath = CString::new(path.to_str().context("model path")?)?;
             let null = std::ptr::null_mut();
             // Filled in step by step, so that Drop frees whatever exists if a step fails.
@@ -304,16 +306,23 @@ mod engine {
             let built = (|| {
                 let hw = if accel == Accel::Cpu { HW_CPU } else { HW_GPU };
                 ok!(LiteRtSetOptionsHardwareAccelerators(opts, hw), "choosing the accelerator");
-                if accel != Accel::Cpu {
-                    // GPU options travel as TOML under the name "gpu_options" (what
-                    // litert_gpu_options.cc serializes). precision: 1 = fp16, 2 = fp32.
-                    let toml = CString::new(format!("precision = {}\n", if accel == Accel::GpuFp16 { 1 } else { 2 }))?;
+                // Accelerator options travel as TOML under the accelerator's name, as
+                // litert_gpu_options.cc and litert_cpu_options.cc serialize them (the
+                // Lrt*Options helpers themselves are not exported by libLiteRt.so).
+                // GPU precision: 1 = fp16, 2 = fp32.
+                let named = match accel {
+                    Accel::Cpu if threads == 0 => None,
+                    Accel::Cpu => Some((c"xnnpack", format!("num_threads = {threads}\n"))),
+                    Accel::Gpu => Some((c"gpu_options", "precision = 2\n".to_string())),
+                    Accel::GpuFp16 => Some((c"gpu_options", "precision = 1\n".to_string())),
+                };
+                if let Some((name, toml)) = named {
                     let mut opaque = null;
                     ok!(
-                        LiteRtCreateOpaqueOptions(c"gpu_options".as_ptr(), toml.into_raw().cast(), free_payload, &mut opaque),
-                        "creating GPU options"
+                        LiteRtCreateOpaqueOptions(name.as_ptr(), CString::new(toml)?.into_raw().cast(), free_payload, &mut opaque),
+                        "creating accelerator options"
                     );
-                    ok!(LiteRtAddOpaqueOptions(opts, opaque), "adding GPU options");
+                    ok!(LiteRtAddOpaqueOptions(opts, opaque), "adding accelerator options");
                 }
                 ok!(
                     LiteRtCreateCompiledModel(e.env, e.model, opts, &mut e.compiled),
@@ -589,5 +598,46 @@ impl Separator for LiteRtRoformer {
             self.stft.istft(&self.z, self.frames, &mut out[ch * seg..(ch + 1) * seg]);
         }
         Ok(out)
+    }
+}
+
+/// Beat This! on LiteRT, from ../tools/export_beat_this_litert.py: a log-mel spectrogram
+/// `[1, frames, mels]` in (50 fps; 1500 x 128 as exported), beat and downbeat logits
+/// `[1, frames]` out. Meant for the CPU: the GPU is the separator's.
+pub struct LiteRtBeatNet {
+    engine: Engine,
+    frames: usize,
+    mels: usize,
+}
+
+impl LiteRtBeatNet {
+    pub fn load(path: &Path, accel: Accel, threads: usize) -> Result<Self> {
+        let engine = Engine::load(path, accel, threads)?;
+        ensure!(engine.io_counts() == (1, 2), "expected 1 input and 2 outputs");
+        let d = engine.input_dims(0);
+        let (frames, mels) = match d.as_slice() {
+            [1, f, m] => (*f, *m),
+            _ => bail!("unexpected input shape {d:?}"),
+        };
+        for i in 0..2 {
+            ensure!(engine.output_dims(i) == [1, frames], "output {i} shape");
+        }
+        Ok(LiteRtBeatNet { engine, frames, mels })
+    }
+
+    /// Spectrogram frames per run.
+    pub fn frames(&self) -> usize {
+        self.frames
+    }
+
+    /// `frames x mels` spectrogram in (row-major, one frame after another); beat and
+    /// downbeat logits out, `frames` each.
+    pub fn run(&mut self, spect: &[f32]) -> Result<(Vec<f32>, Vec<f32>)> {
+        ensure!(spect.len() == self.frames * self.mels, "spectrogram size");
+        self.engine.input(0, spect.len())?.copy_from_slice(spect);
+        self.engine.invoke()?;
+        let beat = self.engine.output(0, self.frames)?.to_vec();
+        let downbeat = self.engine.output(1, self.frames)?.to_vec();
+        Ok((beat, downbeat))
     }
 }

@@ -177,6 +177,32 @@ Notes:
 
 The system service (`vendor.google.edgetpu_vendor_service`) logs "DarwiNN compiler virtual memory limit set to 4096MB" and exits a few seconds into each compile, with no reason visible to the shell. Google's supported route is compiling ahead of time on a Linux desktop (`ai_edge_litert.aot` with the pip package `ai-edge-litert-sdk-google-tensor`, which downloads the Tensor ML SDK and its compiler from Google under their licence agreements). Tried on 2026-11-15 with the owner's go-ahead: the install fails, because the compiler archive it downloads (`tensor-ml-sdk/sdk/releases/6.1.0/litert_plugin_compiler.tar.gz`) returns 404, and earlier package versions only accept a tarball you already have. Google's page says the SDK is a beta you sign up for, so the NPU waits on that access.
 
+### Beat This! (beat tracker) on LiteRT
+
+`tools/export_beat_this_litert.py` converts Beat This! (CPJKU, MIT) so the beat click needs no ONNX Runtime in the APK. Same contract as the desktop's ONNX files (`tools/export_beat_this.py`): input log-mel `[1, 1500, 128]` (30 s at 50 fps), outputs beat and downbeat logits `[1, 1500]`, in that order. Same env as the other exports; `beat_this` itself is taken from the main checkout's `tools/.venv-gpu`:
+
+```sh
+cd android/tools && ~/Android/litert-env/.venv/bin/python -I export_beat_this_litert.py ~/Android/litert-models ../../tools/.venv-gpu/lib/python3.10/site-packages ../../models/beats
+```
+
+| model | file | LiteRT vs PyTorch, max abs logit error (reference clip, logits peak 11–13) | laptop CPU, 4 threads |
+|---|---|---|---|
+| small0 | `beat_this_small0_1500.tflite`, 9.0 MB | beat 2.5e-5, downbeat 2.5e-5 | 0.39 s |
+| final0 | `beat_this_final0_1500.tflite`, 81.6 MB | beat 8.7e-5, downbeat 5.7e-5 | 0.64 s |
+
+The one change to the model: the attention is written out in the export script, because `rotary_embedding_torch` and Beat This!'s `SumHead` wrap their maths in `torch.autocast`, which `torch.export`'s decompositions refuse ("expected compiled_fn to be GraphModule"). The rotary angles become constants per sequence length. The rewrite gives bit-identical output to the stock forward in PyTorch.
+
+It is meant for the CPU (XNNPACK): the GPU belongs to the separator. The graph was not reshaped for the GPU delegate (3-D tensors, time folded into the batch), so the GPU is untried.
+
+`LiteRtBeatNet` in `bench/src/litert.rs` loads it: `load(path, Accel::Cpu, threads)`, `run(&spect) -> (beat, downbeat)`. On LiteRT 2 the CPU thread count now reaches XNNPACK (opaque options named `xnnpack`, TOML `num_threads = N`; it was ignored before). The bench times it and checks it against a reference folder (`spect.f32`, `beat.f32`, `downbeat.f32`, raw f32), one run every `--hop` seconds as the app would:
+
+```sh
+adb push ~/Android/litert-models/beat_this_small0_1500.tflite ../../models/beats/ref_beat_this_small0 /data/local/tmp/stemflow/
+adb shell "cd /data/local/tmp/stemflow && LD_LIBRARY_PATH=. ./stemflow-bench beat_this_small0_1500.tflite --beat-ref ref_beat_this_small0 --threads 2 --hop 3 --runs 10"
+```
+
+**Phone timing: not measured yet** (the phone was off Wi-Fi on 2026-11-16).
+
 ## app/ and core/ — the live app
 
 `core/` is a Rust `cdylib` (JNI) holding the separator on LiteRT/GPU (`bench/src/litert.rs`), the desktop's STFT and sliding-window streaming (`src/spec.rs`, `src/stream.rs`, by path), and a mixer with the desktop's loudness curve and limiter. `app/` is a Kotlin app (no AndroidX):
