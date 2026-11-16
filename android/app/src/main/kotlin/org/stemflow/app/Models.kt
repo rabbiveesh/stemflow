@@ -6,8 +6,8 @@ import java.io.File
 /**
  * The models on the phone: every `<name>_<stem>_<samples>.tflite` in the app's files
  * (android/tools/export_litert.py names them so), e.g. `ft2_bass_344064.tflite`.
- * As on the desktop, karaoke is the vocals model last used, and switching it off goes
- * back to the last bass model.
+ * As on the desktop, the controls act on one stem at a time (bass, vocals for karaoke,
+ * other for the horns, ...), and each stem remembers the model last used for it.
  */
 object Models {
     class Model(val file: File, val name: String, val stem: String, val samples: Int) {
@@ -26,7 +26,15 @@ object Models {
         val roformer get() = name.startsWith("bsrofo")
     }
 
-    private val pattern = Regex("""(.+)_(bass|vocals|drums|other)_(\d+)\.tflite""")
+    /** The stems a model can isolate, in menu order (as src/models.rs). */
+    val STEMS = listOf("bass", "vocals", "other", "piano", "guitar", "drums")
+    private val LABELS = mapOf(
+        "bass" to "Bass", "vocals" to "Vocals (karaoke)", "other" to "Other (horns, strings…)",
+        "piano" to "Piano", "guitar" to "Guitar", "drums" to "Drums",
+    )
+    fun stemLabel(stem: String) = LABELS[stem] ?: stem
+
+    private val pattern = Regex("""(.+)_(${STEMS.joinToString("|")})_(\d+)\.tflite""")
 
     fun all(c: Context): List<Model> =
         listOfNotNull(c.filesDir, c.getExternalFilesDir(null))
@@ -40,12 +48,22 @@ object Models {
 
     private fun prefs(c: Context) = c.getSharedPreferences("models", Context.MODE_PRIVATE)
 
-    fun karaoke(c: Context) = prefs(c).getBoolean("karaoke", false) && all(c).any { it.stem == "vocals" }
+    /** The stems there is a model for. */
+    fun stems(c: Context): List<String> {
+        val have = all(c).map { it.stem }.toSet()
+        return STEMS.filter { it in have }
+    }
 
-    fun setKaraoke(c: Context, on: Boolean) = prefs(c).edit().putBoolean("karaoke", on).apply()
+    /** The stem the controls act on: the one picked, while there is a model for it. */
+    fun target(c: Context): String {
+        val p = prefs(c)
+        // "karaoke" is the switch this picker replaced.
+        val saved = p.getString("stem", null) ?: if (p.getBoolean("karaoke", false)) "vocals" else "bass"
+        val have = stems(c)
+        return if (saved in have) saved else have.firstOrNull() ?: "bass"
+    }
 
-    /** The stem the controls act on. */
-    fun target(c: Context) = if (karaoke(c)) "vocals" else "bass"
+    fun setTarget(c: Context, stem: String) = prefs(c).edit().putString("stem", stem).remove("karaoke").apply()
 
     fun choices(c: Context) = all(c).filter { it.stem == target(c) }
 

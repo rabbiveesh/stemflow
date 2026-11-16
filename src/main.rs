@@ -63,12 +63,18 @@ enum Cmd {
     },
 }
 
-/// The stem the mix controls act on. BS-RoFormer SW and htdemucs_ft have vocals.
+/// The stem the mix controls act on. BS-RoFormer SW has a head for each; htdemucs_ft
+/// has bass, vocals, other and drums.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum Target {
     Bass,
     /// karaoke: solo / full / remove act on the vocals
     Vocals,
+    /// what's left without the other stems: in a jazz combo, the horns
+    Other,
+    Piano,
+    Guitar,
+    Drums,
 }
 
 impl Target {
@@ -76,6 +82,10 @@ impl Target {
         match self {
             Target::Bass => "bass",
             Target::Vocals => "vocals",
+            Target::Other => "other",
+            Target::Piano => "piano",
+            Target::Guitar => "guitar",
+            Target::Drums => "drums",
         }
     }
 }
@@ -98,7 +108,8 @@ struct Opts {
     /// last picked in the menu is used.
     #[arg(long, value_enum)]
     sep: Option<Sep>,
-    /// Stem to isolate or remove (default bass). `vocals` (karaoke) needs --sep bsrofo or demucs.
+    /// Stem to isolate or remove (default bass). Anything but bass needs --sep bsrofo or
+    /// demucs, and that stem's model file.
     #[arg(long, value_enum)]
     target: Option<Target>,
     /// A model by id: its path under --models without `.onnx`, e.g. `ft2/htdemucs_ft_bass`

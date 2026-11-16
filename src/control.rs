@@ -5,8 +5,8 @@
 //! Balance runs from -1 to +1 on one line:
 //!   -1 = bass solo, band fades in as it rises;  0 = the original mix;
 //!   +1 = no bass (play-along), bass fades out as it rises.
-//! "Bass" is really the target stem: in karaoke mode (`--target vocals`) the same
-//! line runs from vocals solo to no vocals. The D-Bus property names stay `Bass` and
+//! "Bass" is really the target stem: with another one (`--target vocals` for karaoke,
+//! `other` for the horns, ...) the same line runs from that stem solo to none of it. The D-Bus property names stay `Bass` and
 //! `Band`; `Target` says which stem `Bass` means.
 //! Each half is scaled by *perceived* loudness: 50% sounds half as loud (-10 dB),
 //! so the useful quiet range isn't crammed into the bottom of the slider.
@@ -36,7 +36,7 @@ pub fn loudness_to_gain(p: f32) -> f32 {
 /// "balance" is a view onto them; advanced mode sets each directly.
 #[derive(Default)]
 pub struct Control {
-    /// Which stem "bass" refers to: "bass", or "vocals" in karaoke mode. Changes when
+    /// Which stem "bass" refers to (one of `models::STEMS`). Changes when
     /// the menu switches to a model with another target.
     target: Mutex<&'static str>,
     /// The running model's id, the one the menu asked for (until the audio thread
@@ -104,8 +104,8 @@ impl Control {
         if old != target {
             match load_levels(target) {
                 Some((a, b)) => self.set_levels(a, b),
-                // first time in karaoke: start with the vocals out
-                None if target == "vocals" => self.set_balance(1.0),
+                // first time with vocals, horns, ...: start with them out (play-along)
+                None if target != "bass" => self.set_balance(1.0),
                 None => {}
             }
         }
@@ -302,7 +302,7 @@ impl Service {
     fn description(&self) -> String {
         self.ctl.describe()
     }
-    /// Which stem `Bass`, solo and remove refer to: "bass" or "vocals" (karaoke).
+    /// Which stem `Bass`, solo and remove refer to: "bass", "vocals" (karaoke), "other", ...
     #[zbus(property)]
     fn target(&self) -> String {
         self.ctl.target().to_string()

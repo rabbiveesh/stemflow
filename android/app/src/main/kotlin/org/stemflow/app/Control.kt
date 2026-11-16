@@ -13,7 +13,7 @@ object Control {
     const val MAX_BASS = 2f
     @Volatile var bass = 1f; private set
     @Volatile var band = 0f; private set
-    /** The stem `bass` acts on: "bass", or "vocals" in karaoke. */
+    /** The stem `bass` acts on: one of Models.STEMS. */
     @Volatile var target = "bass"; private set
 
     fun setLevels(bass: Float, band: Float) {
@@ -53,7 +53,8 @@ object Control {
 
     /**
      * Each target remembers its own levels, as on the desktop. A target used for the
-     * first time starts where it is most useful: bass solo, or no vocals for karaoke.
+     * first time starts where it is most useful: bass solo, or without the vocals,
+     * horns, ... (play-along).
      */
     fun load(c: Context) {
         target = Models.target(c)
@@ -67,10 +68,10 @@ object Control {
             .putFloat("target_$target", bass).putFloat("band_$target", band).apply()
     }
 
-    /** Karaoke on or off: keep the old target's levels, bring back the new one's. */
-    fun setKaraoke(c: Context, on: Boolean) {
+    /** Another stem: keep the old target's levels, bring back the new one's. */
+    fun setTarget(c: Context, stem: String) {
         save(c)
-        Models.setKaraoke(c, on)
+        Models.setTarget(c, stem)
         load(c)
     }
 

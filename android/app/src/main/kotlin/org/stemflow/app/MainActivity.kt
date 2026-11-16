@@ -38,7 +38,8 @@ class MainActivity : Activity() {
     private lateinit var boost: SeekBar
     private lateinit var boostValue: TextView
     private lateinit var status: TextView
-    private lateinit var karaoke: Switch
+    private lateinit var stemPicker: Spinner
+    private var stems = listOf<String>()
     private lateinit var modelPicker: Spinner
     private var modelIds = listOf<String>()
     private lateinit var sourcePicker: Spinner
@@ -108,14 +109,17 @@ class MainActivity : Activity() {
             snapRow.addView(b)
         }
 
-        // As in the menu: Karaoke switches the target to vocals (the vocals model last
+        // As in the menu: Stem picks what the controls act on (the model last
         // used), and Model picks among the models for the current target.
-        karaoke = Switch(this).apply {
-            text = "Karaoke"
-            textSize = 16f
-            setOnClickListener {
-                Control.setKaraoke(this@MainActivity, isChecked)
-                refresh()
+        stemPicker = Spinner(this).apply {
+            layoutParams = LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+            onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(p: AdapterView<*>, v: View?, pos: Int, id: Long) {
+                    val c = this@MainActivity
+                    val stem = stems.getOrNull(pos) ?: return
+                    if (stem != Control.target) { Control.setTarget(c, stem); refresh() }
+                }
+                override fun onNothingSelected(p: AdapterView<*>) {}
             }
         }
         modelPicker = Spinner(this).apply {
@@ -167,7 +171,7 @@ class MainActivity : Activity() {
             addView(row(label("Boost "), boost, boostValue))
             addView(snapRow)
             addView(status.apply { setPadding(0, dp(14), 0, dp(14)) })
-            addView(karaoke)
+            addView(row(label("Stem  "), stemPicker))
             addView(row(label("Model "), modelPicker))
             addView(row(label("From  "), sourcePicker))
             addView(extras)
@@ -209,14 +213,20 @@ class MainActivity : Activity() {
         status.text = if (CaptureService.running) CaptureService.status else "Off · ${Shizu.state()}"
         val t = Control.target
         val tc = t.replaceFirstChar { it.uppercase() }
-        power.text = if (t == "bass") "Bass isolation" else "Karaoke (vocals)"
+        power.text = "$tc isolation" + if (t == "vocals") " (karaoke)" else ""
         snaps["solo"]?.text = "$tc solo"
         snaps["nobass"]?.text = "No $t"
         noLabel.text = "  No $t"
-        val hasVocals = Models.all(this).any { it.stem == "vocals" }
-        karaoke.isEnabled = hasVocals
-        karaoke.isChecked = Models.karaoke(this)
-        karaoke.text = if (hasVocals) "Karaoke" else "Karaoke (no vocals model on the phone)"
+        val have = Models.stems(this)
+        if (have != stems) {
+            stems = have
+            stemPicker.adapter = ArrayAdapter(
+                this, android.R.layout.simple_spinner_dropdown_item,
+                if (have.isEmpty()) listOf("no model on the phone") else have.map { Models.stemLabel(it) },
+            )
+        }
+        val si = stems.indexOf(t)
+        if (si >= 0 && stemPicker.selectedItemPosition != si) stemPicker.setSelection(si)
         val choices = Models.choices(this)
         val ids = choices.map { it.id }
         if (ids != modelIds) {

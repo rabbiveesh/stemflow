@@ -87,9 +87,10 @@ class CaptureService : Service() {
 
     private val commands = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
-            // Karaoke first: it brings in that target's own levels, which a snap or
-            // level in the same command then overrides.
-            if (i.hasExtra("karaoke")) Control.setKaraoke(c, i.getBooleanExtra("karaoke", false))
+            // The stem first: it brings in that target's own levels, which a snap or
+            // level in the same command then overrides. ("karaoke" is the old name.)
+            if (i.hasExtra("karaoke")) Control.setTarget(c, if (i.getBooleanExtra("karaoke", false)) "vocals" else "bass")
+            i.getStringExtra("stem")?.let { if (it in Models.STEMS) Control.setTarget(c, it) }
             i.getStringExtra("snap")?.let { Control.snap(it) }
             if (i.hasExtra("balance")) Control.setBalance(i.getFloatExtra("balance", 0f))
             if (i.hasExtra("bass") || i.hasExtra("band")) {
@@ -219,7 +220,7 @@ class CaptureService : Service() {
         var buf = FloatArray(2 * hop)
         var fill = 0
         while (running) {
-            // The model picked in the UI (or karaoke) changed: swap it in. Audio that
+            // The model picked in the UI (or the stem) changed: swap it in. Audio that
             // arrives meanwhile is dropped by the catch-up below.
             val want = Models.current(this)
             if (want != null && want.file.path != engineModel) {

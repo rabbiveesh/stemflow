@@ -64,6 +64,17 @@ function systemd(method) {
         });
 }
 
+/* The stems a model can isolate, as src/models.rs knows them: a model's id ends in
+ * `_<stem>`, anything else is a bass model. */
+const STEMS = ['bass', 'vocals', 'other', 'piano', 'guitar', 'drums'];
+const STEM_LABELS = {
+    bass: 'Bass', vocals: 'Vocals (karaoke)', other: 'Other (horns, strings…)',
+    piano: 'Piano', guitar: 'Guitar', drums: 'Drums',
+};
+function stemOf(id) {
+    return STEMS.find(s => id.endsWith(`_${s}`)) || 'bass';
+}
+
 /* A switch row that flips without closing the menu (GNOME's own closes it, which
  * is jarring for switches that only rearrange the menu). */
 function stayOpen(item) {
@@ -166,12 +177,13 @@ class StemflowIndicator extends PanelMenu.Button {
         this._status.label.style = 'font-size: smaller;';
         this.menu.addMenuItem(this._status);
 
-        // Karaoke: the same controls, acting on the vocals. Switches to the vocals
-        // model last used (or the first one), and back to the last bass model.
-        this._karaoke = stayOpen(new PopupMenu.PopupSwitchMenuItem('Karaoke', false));
-        this._karaoke.connect('toggled', (_i, on) => this._setMode(on ? 'vocals' : 'bass'));
-        this.menu.addMenuItem(this._karaoke);
+        // Stem: which part of the music the controls act on (vocals = karaoke,
+        // other = the horns in a jazz combo). Picking one switches to the model last
+        // used for it (or the first one); only stems with a model are listed.
+        this._stems = new PopupMenu.PopupSubMenuMenuItem('Stem');
+        this.menu.addMenuItem(this._stems);
         this._lastModel = {};
+        this._pending = null; // the model asked for, until it is loaded (or fails)
 
         // Experiments: switch models live. The list comes from stemflow, which rescans
         // its models folder each time, so new exports appear without reloading anything.
@@ -306,43 +318,67 @@ class StemflowIndicator extends PanelMenu.Button {
 
     _setMode(target) {
         const list = this._modelList || [];
-        const of = id => (id.endsWith('_vocals') ? 'vocals' : 'bass');
         const known = id => list.some(([m]) => m === id);
         const id = known(this._lastModel[target]) ? this._lastModel[target]
-            : (list.find(([m]) => of(m) === target) || [])[0];
+            : (list.find(([m]) => stemOf(m) === target) || [])[0];
         if (id)
             this._setModel(id);
         else
             Main.notify('stemflow', `No ${target} model in the models folder`);
     }
 
+    _loading() {
+        return !!this._proxy && (this._proxy.Status || '').startsWith('Loading');
+    }
+
     _fillModels(models, current) {
         this._modelList = models;
         if (current)
-            this._lastModel[current.endsWith('_vocals') ? 'vocals' : 'bass'] = current;
-        const key = JSON.stringify([models, current]);
+            this._lastModel[stemOf(current)] = current;
+        // While a model loads, the pickers already show the one asked for.
+        const loading = this._loading();
+        const shown = loading && this._pending ? this._pending : current;
+        const key = JSON.stringify([models, shown, loading]);
         if (key === this._modelsKey)
-            return; // rebuilding while the submenu is open would close it
+            return; // rebuilding while a submenu is open would close it
         this._modelsKey = key;
         this._shownModel = current;
+        const stem = stemOf(shown || '');
+        const tail = loading ? ' · loading…' : '';
+        const dot = on => (on ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE);
+
+        this._stems.menu.removeAll();
+        for (const s of STEMS.filter(t => models.some(([id]) => stemOf(id) === t))) {
+            const item = new PopupMenu.PopupMenuItem(STEM_LABELS[s]);
+            item.setOrnament(dot(s === stem));
+            item.connect('activate', () => {
+                if (s !== stem)
+                    this._setMode(s);
+            });
+            this._stems.menu.addMenuItem(item);
+        }
+        this._stems.label.text = `Stem: ${STEM_LABELS[stem]}${tail}`;
+
         this._models.menu.removeAll();
-        for (const [id, label] of models) {
+        for (const [id, label] of models.filter(([id]) => stemOf(id) === stem)) {
             const item = new PopupMenu.PopupMenuItem(label);
-            item.setOrnament(id === current ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE);
+            item.setOrnament(dot(id === shown));
             item.connect('activate', () => this._setModel(id));
             this._models.menu.addMenuItem(item);
         }
-        const cur = models.find(([id]) => id === current);
-        this._models.label.text = `Model: ${cur ? cur[1] : current}`;
+        const cur = models.find(([id]) => id === shown);
+        this._models.label.text = `Model: ${cur ? cur[1] : shown}${tail}`;
     }
 
     _setModel(id) {
+        this._pending = id;
         Gio.DBus.session.call(BUS_NAME, OBJ_PATH, 'org.freedesktop.DBus.Properties', 'Set',
             new GLib.Variant('(ssv)', ['org.stemflow.Control', 'Model', new GLib.Variant('s', id)]),
             null, Gio.DBusCallFlags.NONE, -1, null, (conn, res) => {
                 try {
                     conn.call_finish(res);
                 } catch (e) {
+                    this._pending = null;
                     Main.notify('stemflow', e.message);
                 }
             });
@@ -355,10 +391,10 @@ class StemflowIndicator extends PanelMenu.Button {
         // Off: the clef takes the bar's own colour (white); on: water-blue.
         if (!on || this._clef.style !== CLEF_WARN)
             this._clef.style = on ? CLEF : '';
-        for (const w of [this._desc, this._snaps, this._one, this._boost, this._bass, this._band, this._status, this._models, this._karaoke])
+        for (const w of [this._desc, this._snaps, this._one, this._boost, this._bass, this._band, this._status, this._models, this._stems])
             w.visible = on;
-        this._karaoke.visible = on && !!this._proxy.Model;
-        // An older daemon has no Model property: no switcher.
+        // An older daemon has no Model property: no pickers.
+        this._stems.visible = on && !!this._proxy.Model;
         this._models.visible = on && this._settings.get_boolean('experiments') && !!this._proxy.Model;
         if (!on) {
             this._status.label.text = '';
@@ -367,19 +403,23 @@ class StemflowIndicator extends PanelMenu.Button {
         this._one.visible = this._boost.visible = !adv;
         this._bass.visible = this._band.visible = adv;
         const p = this._proxy;
-        // "Bass" is whichever stem stemflow targets: vocals in karaoke mode
-        // (`stemflow live --target vocals`). Older daemons have no Target.
+        // "Bass" is whichever stem stemflow targets (the Stem picker, or
+        // `stemflow live --target vocals`). Older daemons have no Target.
         const t = p.Target || 'bass';
         const T = t[0].toUpperCase() + t.slice(1);
-        this._switch.label.text = t === 'bass' ? 'Bass isolation' : `${T} isolation (karaoke)`;
-        this._karaoke.setToggleState(t === 'vocals');
+        this._switch.label.text = `${T} isolation${t === 'vocals' ? ' (karaoke)' : ''}`;
         this._bass._label.text = T;
         this._snapButtons.solo.label = `${T} solo`;
         this._snapButtons.nobass.label = `No ${t}`;
         // "Loading …" or a load error, while there is one.
         this._desc.label.text = p.Status || p.Description;
-        if (p.Model && this._modelsKey && p.Model !== this._shownModel)
-            this._refreshStats(); // switched: move the dot
+        // Loading started or ended, or the model switched: the pickers follow.
+        const loading = this._loading();
+        if (this._wasLoading && !loading)
+            this._pending = null;
+        this._wasLoading = loading;
+        if (p.Model && this._modelList)
+            this._fillModels(this._modelList, p.Model);
         this._one.set((p.Balance + 1) / 2, `No ${t}`);
         this._boost.set(Math.max(0, p.Bass - 1) / (MAX_BASS - 1),
             p.Bass > 1 ? `+${Math.round((p.Bass - 1) * 100)}%` : 'off');

@@ -3,8 +3,8 @@
 //! A model is an exported `.onnx` file, either at the top of the folder or one level
 //! down (`models/<experiment>/<file>.onnx`, e.g. a symlink to a fine-tune's export
 //! folder). The file name says what it is: the prefix picks the architecture
-//! (`bsrofo_`, `htdemucs`, `scnet_`) and a `_vocals` suffix makes it a karaoke
-//! (vocals) model. The id is the path relative to the folder without `.onnx`, e.g.
+//! (`bsrofo_`, `htdemucs`, `scnet_`) and the suffix names the stem it isolates
+//! (`_vocals`, `_other`, ...; anything else is a bass model). The id is the path relative to the folder without `.onnx`, e.g.
 //! `bsrofo_sw_bass` or `ft2/htdemucs_ft_bass`. Dropping a new file in shows up in the
 //! menu the next time it opens; nothing needs restarting.
 
@@ -22,10 +22,14 @@ pub struct Model {
     pub id: String,
     pub label: String,
     pub arch: Arch,
-    /// "bass" or "vocals"
+    /// The stem it isolates: one of `STEMS`.
     pub target: &'static str,
     pub path: PathBuf,
 }
+
+/// The stems a model can target, in menu order. "other" is what's left once the
+/// rest are taken out: in a jazz combo, the horns.
+pub const STEMS: [&str; 6] = ["bass", "vocals", "other", "piano", "guitar", "drums"];
 
 fn classify(stem: &str) -> Option<(Arch, &'static str, &'static str)> {
     let (arch, name) = if stem.starts_with("bsrofo_sw") {
@@ -39,11 +43,10 @@ fn classify(stem: &str) -> Option<(Arch, &'static str, &'static str)> {
     } else {
         return None;
     };
-    let target = if stem.ends_with("_vocals") {
-        "vocals"
-    } else {
-        "bass"
-    };
+    let target = STEMS
+        .into_iter()
+        .find(|t| stem.strip_suffix(t).is_some_and(|s| s.ends_with('_')))
+        .unwrap_or("bass");
     Some((arch, target, name))
 }
 
@@ -62,10 +65,10 @@ fn model(dir: &Path, rel: &Path) -> Option<Model> {
         Some(exp) => format!("{exp}: {name}"),
         None => name.to_string(),
     };
-    let label = if target == "vocals" {
-        format!("{label} (vocals)")
-    } else {
+    let label = if target == "bass" {
         label
+    } else {
+        format!("{label} ({target})")
     };
     Some(Model {
         id,
@@ -76,7 +79,7 @@ fn model(dir: &Path, rel: &Path) -> Option<Model> {
     })
 }
 
-/// Every model in `dir`, bass models first, then built-ins before experiments.
+/// Every model in `dir`, by stem (bass models first), then built-ins before experiments.
 pub fn scan(dir: &Path) -> Vec<Model> {
     let mut out = Vec::new();
     let entries = |p: &Path| -> Vec<std::fs::DirEntry> {
@@ -100,7 +103,8 @@ pub fn scan(dir: &Path) -> Vec<Model> {
             out.extend(model(dir, &name));
         }
     }
-    out.sort_by_key(|m| (m.target != "bass", m.id.contains('/'), m.id.clone()));
+    let rank = |t: &str| STEMS.iter().position(|s| *s == t);
+    out.sort_by_key(|m| (rank(m.target), m.id.contains('/'), m.id.clone()));
     out
 }
 
@@ -130,6 +134,13 @@ mod tests {
             (m.label.as_str(), m.target),
             ("BS-RoFormer SW (vocals)", "vocals")
         );
+        let m = model(d, Path::new("bsrofo_sw_other.onnx")).unwrap();
+        assert_eq!(
+            (m.label.as_str(), m.target),
+            ("BS-RoFormer SW (other)", "other")
+        );
+        // not a stem suffix: "another" ends in "other" but not "_other"
+        assert_eq!(model(d, Path::new("scnet_another.onnx")).unwrap().target, "bass");
         assert!(model(d, Path::new("scnet_xl_ihf.ckpt")).is_none());
         assert!(model(d, Path::new("other.onnx")).is_none());
     }
