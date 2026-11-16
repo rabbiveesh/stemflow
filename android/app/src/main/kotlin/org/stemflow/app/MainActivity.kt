@@ -19,6 +19,7 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.LinearLayout.LayoutParams
+import android.widget.ProgressBar
 import android.widget.SeekBar
 import android.widget.Spinner
 import android.widget.Switch
@@ -34,6 +35,7 @@ import kotlin.math.roundToInt
 class MainActivity : Activity() {
     private lateinit var power: Switch
     private lateinit var desc: TextView
+    private lateinit var spinner: ProgressBar
     private lateinit var balance: SeekBar
     private lateinit var boost: SeekBar
     private lateinit var boostValue: TextView
@@ -85,6 +87,11 @@ class MainActivity : Activity() {
             setOnClickListener { if (isChecked) start() else stop() }
         }
         desc = label("", 17f)
+        // Shown next to the description while a model loads (several seconds).
+        spinner = ProgressBar(this, null, android.R.attr.progressBarStyleSmall).apply {
+            isIndeterminate = true
+            visibility = View.GONE
+        }
         balance = slider(200) { p ->
             var b = p / 100f - 1f
             if (abs(b) < 0.04f) b = 0f // detent at the original mix
@@ -166,7 +173,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(20), dp(20), dp(20))
             addView(power)
-            addView(desc.apply { setPadding(0, dp(14), 0, dp(4)) })
+            addView(row(spinner, desc).apply { setPadding(0, dp(14), 0, dp(4)) })
             addView(row(label("Solo  "), balance, noLabel))
             addView(row(label("Boost "), boost, boostValue))
             addView(snapRow)
@@ -203,14 +210,26 @@ class MainActivity : Activity() {
 
     private fun refresh() {
         power.isChecked = CaptureService.running
-        desc.text = Control.describe()
+        // Loading: from the switch (or another model or stem being picked) until the
+        // worker has that model ready. The worker only notices a new pick between
+        // runs, so compare what is loaded with what is wanted as well.
+        val wanted = Models.current(this)
+        val loading = CaptureService.running &&
+            (CaptureService.loading || (wanted != null && wanted.file.path != CaptureService.loadedModel))
+        spinner.visibility = if (loading) View.VISIBLE else View.GONE
+        desc.text = when {
+            loading -> "  Loading ${wanted?.label ?: "model"}…"
+            else -> Control.describe()
+        }
         if (!dragging) {
             balance.progress = ((Control.balance() + 1f) * 100).roundToInt()
             boost.progress = ((Control.bass - 1f).coerceAtLeast(0f) / (Control.MAX_BASS - 1f) * 100).roundToInt()
         }
         boostValue.text = "${(maxOf(Control.bass, 1f) * 100).roundToInt()}%"
         for ((name, b) in snaps) b.alpha = if (Control.isSnap(name)) 1f else 0.6f
-        status.text = if (CaptureService.running) CaptureService.status else "Off · ${Shizu.state()}"
+        // After a failure the service has stopped: keep its error on screen.
+        val s = CaptureService.status
+        status.text = if (CaptureService.running || s != "Off") s else "Off · ${Shizu.state()}"
         val t = Control.target
         val tc = t.replaceFirstChar { it.uppercase() }
         power.text = "$tc isolation" + if (t == "vocals") " (karaoke)" else ""
@@ -248,7 +267,11 @@ class MainActivity : Activity() {
 
     private fun start() {
         if (!notificationsOk()) return
-        val go = { startForegroundService(Intent(this, CaptureService::class.java)); Unit }
+        val go = {
+            // Spinner at once, not when the service gets round to starting.
+            CaptureService.status = "Starting…"
+            startForegroundService(Intent(this, CaptureService::class.java)); Unit
+        }
         // Shizuku is running but hasn't been asked yet: ask, then start either way
         // (without it the service waits for android/helper.sh).
         if (Shizu.available() && !Shizu.granted()) Shizu.request { go() } else go()

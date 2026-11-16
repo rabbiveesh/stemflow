@@ -66,10 +66,15 @@ class CaptureService : Service() {
 
         @Volatile var running = false
         @Volatile var status = "Off"
+        /** From switching on (or picking another model) until that model is ready or failed. */
+        @Volatile var loading = false
+        /** Path of the model that is loaded, "" if none; the UI compares it with the one picked. */
+        @Volatile var loadedModel = ""; private set
         // The engine holds ~1 GB. Only the worker thread touches it: it loads the
         // model when isolation is switched on and frees it when it is switched off.
         private var engine = 0L
         private var engineModel = ""
+            set(v) { field = v; loadedModel = v }
     }
 
     private class Stems(val bass: FloatArray, val band: FloatArray)
@@ -143,7 +148,8 @@ class CaptureService : Service() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel("live", "Bass isolation", NotificationManager.IMPORTANCE_LOW)
         )
-        status = "Starting"
+        status = "Starting…"
+        loading = true
         // The projection type must be in place before asking for the projection.
         startForeground(
             1, notification(),
@@ -171,6 +177,7 @@ class CaptureService : Service() {
     private fun fail(msg: String) {
         Log.e(TAG, msg)
         status = msg
+        loading = false
         stopSelf()
     }
 
@@ -178,6 +185,7 @@ class CaptureService : Service() {
     private fun load(m: Models.Model): Boolean {
         if (engine != 0L && engineModel == m.file.path) return true
         status = "Loading ${m.label}…"
+        loading = true
         Log.i(TAG, status)
         try {
             val t = System.nanoTime()
@@ -185,6 +193,8 @@ class CaptureService : Service() {
             engine = Native.engineNew(m.file.path, Native.GPU_FP16, m.hop, m.lookahead, XFADE_S)
             engineModel = m.file.path
             Log.i(TAG, "model ready in %.1f s".format((System.nanoTime() - t) / 1e9))
+            loading = false
+            status = "Starting…"
             return true
         } catch (e: Throwable) {
             fail("Model failed: ${e.message}")
@@ -411,7 +421,9 @@ class CaptureService : Service() {
 
     override fun onDestroy() {
         running = false
-        if (!status.contains("failed") && !status.startsWith("No model") && !status.contains("disconnected")) status = "Off"
+        loading = false
+        val error = status.contains("failed") || status.startsWith("No model") || status.contains("disconnected")
+        if (!error) status = "Off"
         try { unregisterReceiver(commands) } catch (_: Exception) {}
         try { serverSocket?.close() } catch (_: Exception) {} // the helper exits on this
         record?.let { try { it.stop() } catch (_: Exception) {}; it.release() }
