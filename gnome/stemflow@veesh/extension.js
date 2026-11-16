@@ -23,6 +23,7 @@ const STEP = 0.1; // hotkey / scroll step on the -1..1 line
 // pre-coloured version.
 const CLEF = 'color: #5aa9e0;';
 const CLEF_WARN = 'color: #f6d32d;';
+const CLEF_DIM = 'color: #5aa9e0; opacity: 0.5;'; // starting up
 function gicon(name) {
     return Gio.icon_new_for_string(`${Me.path}/icons/${name}.svg`);
 }
@@ -49,7 +50,7 @@ const IFACE = `
 </node>`;
 const ControlProxy = Gio.DBusProxy.makeProxyWrapper(IFACE);
 
-function systemd(method) {
+function systemd(method, onError = null) {
     Gio.DBus.session.call(
         'org.freedesktop.systemd1', '/org/freedesktop/systemd1',
         'org.freedesktop.systemd1.Manager', method,
@@ -59,9 +60,42 @@ function systemd(method) {
             try {
                 conn.call_finish(res);
             } catch (e) {
-                Main.notify('stemflow', `${method} failed: ${e.message}`);
+                if (onError)
+                    onError(e.message);
+                else
+                    Main.notify('stemflow', `${method} failed: ${e.message}`);
             }
         });
+}
+
+/* The model stemflow will load on start: the one last picked, as the daemon
+ * remembers it (~/.local/state/stemflow/model), or '' for its default. */
+function lastModel() {
+    try {
+        const [, bytes] = GLib.file_get_contents(
+            GLib.build_filenamev([GLib.get_user_state_dir(), 'stemflow', 'model']));
+        return new TextDecoder().decode(bytes).trim();
+    } catch (e) {
+        return '';
+    }
+}
+
+/* The unit's ActiveState ('active', 'activating', 'failed', 'inactive', …). */
+function unitState(cb) {
+    const sd = (path, iface, method, args, done) => Gio.DBus.session.call(
+        'org.freedesktop.systemd1', path, iface, method, args, null,
+        Gio.DBusCallFlags.NONE, -1, null, (conn, res) => {
+            try {
+                done(conn.call_finish(res).deep_unpack());
+            } catch (e) {
+                cb('inactive'); // not loaded: it isn't running
+            }
+        });
+    sd('/org/freedesktop/systemd1', 'org.freedesktop.systemd1.Manager', 'GetUnit',
+        new GLib.Variant('(s)', [UNIT]), ([path]) =>
+            sd(path, 'org.freedesktop.DBus.Properties', 'Get',
+                new GLib.Variant('(ss)', ['org.freedesktop.systemd1.Unit', 'ActiveState']),
+                ([v]) => cb(v.deep_unpack())));
 }
 
 /* The stems a model can isolate, as src/models.rs knows them: a model's id ends in
@@ -121,6 +155,11 @@ class StemflowIndicator extends PanelMenu.Button {
         super._init(0.0, 'stemflow');
         this._settings = settings;
         this._proxy = null;
+        // From "on" until stemflow shows up on the bus (it does once its model has
+        // loaded, 5-10 s): {since, model}. _startError: why the last start failed.
+        this._starting = null;
+        this._startError = '';
+        this._startTimer = 0;
         this._back = 0; // where toggle-solo / toggle-nobass return to
 
         this._icon = new St.Widget({ layout_manager: new Clutter.BinLayout(), y_align: Clutter.ActorAlign.CENTER });
@@ -131,7 +170,7 @@ class StemflowIndicator extends PanelMenu.Button {
         this.connect('scroll-event', (_a, ev) => this._onScroll(ev));
 
         this._switch = stayOpen(new PopupMenu.PopupSwitchMenuItem('Bass isolation', false));
-        this._switch.connect('toggled', (_i, on) => systemd(on ? 'StartUnit' : 'StopUnit'));
+        this._switch.connect('toggled', (_i, on) => this.setRunning(on));
         this.menu.addMenuItem(this._switch);
 
         this._desc = new PopupMenu.PopupMenuItem('', { reactive: false });
@@ -224,6 +263,7 @@ class StemflowIndicator extends PanelMenu.Button {
                 return;
             }
             this._proxy = proxy;
+            this._stopStarting('');
             this._propsId = proxy.connect('g-properties-changed', () => this._sync());
             this._sync();
         });
@@ -233,6 +273,39 @@ class StemflowIndicator extends PanelMenu.Button {
         if (this._proxy && this._propsId)
             this._proxy.disconnect(this._propsId);
         this._proxy = null;
+        this._sync();
+    }
+
+    setRunning(on) {
+        if (!on) {
+            this._stopStarting('');
+            systemd('StopUnit');
+            return;
+        }
+        if (this._proxy || this._starting)
+            return;
+        this._startError = '';
+        this._starting = { since: GLib.get_monotonic_time(), model: lastModel() };
+        systemd('StartUnit', e => this._stopStarting(`Couldn't start: ${e}`));
+        // Tick the elapsed time, and notice the service dying before it got going.
+        this._startTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
+            unitState(state => {
+                const secs = (GLib.get_monotonic_time() - (this._starting?.since ?? 0)) / 1e6;
+                if (this._starting && secs > 2 && (state === 'failed' || state === 'inactive'))
+                    this._stopStarting("stemflow stopped while starting (journalctl --user -u stemflow)");
+            });
+            this._sync();
+            return GLib.SOURCE_CONTINUE;
+        });
+        this._sync();
+    }
+
+    _stopStarting(err) {
+        if (this._startTimer)
+            GLib.source_remove(this._startTimer);
+        this._startTimer = 0;
+        this._starting = null;
+        this._startError = err;
         this._sync();
     }
 
@@ -387,7 +460,8 @@ class StemflowIndicator extends PanelMenu.Button {
     _sync() {
         const on = this._proxy !== null && this._proxy.Description !== null;
         const adv = this._settings.get_boolean('advanced');
-        this._switch.setToggleState(on);
+        const starting = !on && this._starting;
+        this._switch.setToggleState(on || !!starting);
         // Off: the clef takes the bar's own colour (white); on: water-blue.
         if (!on || this._clef.style !== CLEF_WARN)
             this._clef.style = on ? CLEF : '';
@@ -398,6 +472,16 @@ class StemflowIndicator extends PanelMenu.Button {
         this._models.visible = on && this._settings.get_boolean('experiments') && !!this._proxy.Model;
         if (!on) {
             this._status.label.text = '';
+            // Starting, or why it didn't: one line under the switch.
+            this._desc.visible = !!starting || !!this._startError;
+            if (starting) {
+                const secs = Math.floor((GLib.get_monotonic_time() - starting.since) / 1e6);
+                const what = starting.model ? ` ${starting.model}` : ' the model';
+                this._desc.label.text = `Loading${what}… ${secs} s`;
+            } else {
+                this._desc.label.text = this._startError;
+            }
+            this._clef.style = starting ? CLEF_DIM : '';
             return;
         }
         this._one.visible = this._boost.visible = !adv;
@@ -430,6 +514,8 @@ class StemflowIndicator extends PanelMenu.Button {
     destroy() {
         if (this._timer)
             GLib.source_remove(this._timer);
+        if (this._startTimer)
+            GLib.source_remove(this._startTimer);
         Gio.bus_unwatch_name(this._watch);
         this._settings.disconnect(this._advId);
         this._settings.disconnect(this._expId);
@@ -454,7 +540,7 @@ function enable() {
         'slide-right': () => indicator.nudge(STEP),
         'toggle-solo': () => indicator.toggle('solo', -1),
         'toggle-nobass': () => indicator.toggle('nobass', 1),
-        'toggle-running': () => systemd(indicator._proxy ? 'StopUnit' : 'StartUnit'),
+        'toggle-running': () => indicator.setRunning(!indicator._proxy && !indicator._starting),
     };
     for (const k of KEYS)
         Main.wm.addKeybinding(k, settings, Meta.KeyBindingFlags.NONE,
