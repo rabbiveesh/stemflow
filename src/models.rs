@@ -140,7 +140,10 @@ mod tests {
             ("BS-RoFormer SW (other)", "other")
         );
         // not a stem suffix: "another" ends in "other" but not "_other"
-        assert_eq!(model(d, Path::new("scnet_another.onnx")).unwrap().target, "bass");
+        assert_eq!(
+            model(d, Path::new("scnet_another.onnx")).unwrap().target,
+            "bass"
+        );
         assert!(model(d, Path::new("scnet_xl_ihf.ckpt")).is_none());
         assert!(model(d, Path::new("other.onnx")).is_none());
     }

@@ -18,6 +18,9 @@ use anyhow::Result;
 /// One hop of output, unmixed: the bass and everything else ("band" = mix - bass),
 /// each interleaved stereo. Levels are applied at playback, so a level change is
 /// heard right away instead of after the model's lookahead and buffers.
+/// Below this (-80 dBFS) the input counts as silence and the model isn't run.
+const SILENCE: f32 = 1e-4;
+
 pub struct Stems {
     pub bass: Vec<f32>,
     pub band: Vec<f32>,
@@ -89,9 +92,21 @@ impl<S: Separator> Streamer<S> {
                 *s = input[2 * i + ch];
             }
         }
-        let est = self.sep.separate(&self.win)?;
-
         let start = seg - self.lookahead - hop;
+        // Nothing playing: the stretch we emit (and the crossfade tail after it) is
+        // silent, so its bass is silent too. Skip the model; it would keep the GPU busy
+        // and the machine hot around the clock.
+        let quiet = (0..2).all(|ch| {
+            self.win[ch * seg + start..ch * seg + start + hop + xf]
+                .iter()
+                .all(|s| s.abs() < SILENCE)
+        });
+        let est = if quiet {
+            vec![0f32; 2 * seg]
+        } else {
+            self.sep.separate(&self.win)?
+        };
+
         let mut bass = vec![0f32; 2 * hop];
         let mut band = vec![0f32; 2 * hop];
         for ch in 0..2 {
@@ -130,6 +145,35 @@ mod tests {
         fn separate(&mut self, mix: &[f32]) -> Result<Vec<f32>> {
             Ok(mix.to_vec())
         }
+    }
+
+    /// Counts model runs; returns the input as "bass".
+    struct Counting(usize, usize);
+    impl Separator for Counting {
+        fn window_len(&self) -> usize {
+            self.0
+        }
+        fn separate(&mut self, mix: &[f32]) -> Result<Vec<f32>> {
+            self.1 += 1;
+            Ok(mix.to_vec())
+        }
+    }
+
+    #[test]
+    fn silence_skips_the_model() {
+        let (hop, la) = (100, 37);
+        let mut s = Streamer::new(Counting(1000, 0), hop, la, 20);
+        for _ in 0..30 {
+            let out = s.process(&vec![0.0; 2 * hop]).unwrap();
+            assert!(out.bass.iter().chain(&out.band).all(|v| *v == 0.0));
+        }
+        assert_eq!(s.sep.1, 0);
+        // sound arriving wakes it up once it reaches the emitted slice
+        let tone: Vec<f32> = (0..2 * hop).map(|i| (i as f32 * 0.3).sin()).collect();
+        for _ in 0..5 {
+            s.process(&tone).unwrap();
+        }
+        assert!(s.sep.1 > 0);
     }
 
     #[test]

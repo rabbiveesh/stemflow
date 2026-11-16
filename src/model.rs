@@ -109,6 +109,36 @@ fn runtime(device: Device) -> Result<&'static ort::environment::Environment> {
     Ok(ENV.get_or_init(|| env))
 }
 
+/// Make CUDA put the host thread to sleep while it waits on the GPU, instead of the
+/// default of spinning a core at 100% for the whole run. Must happen before the CUDA
+/// context exists, i.e. before the first CUDA session. A wake-up costs microseconds;
+/// a run takes hundreds of milliseconds.
+#[cfg(feature = "cuda")]
+fn blocking_sync() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        const SCHEDULE_BLOCKING_SYNC: libc::c_uint = 4; // cudaDeviceScheduleBlockingSync
+        let lib = libc::dlopen(
+            c"libcudart.so.12".as_ptr(),
+            libc::RTLD_NOW | libc::RTLD_GLOBAL,
+        );
+        let f = if lib.is_null() {
+            std::ptr::null_mut()
+        } else {
+            libc::dlsym(lib, c"cudaSetDeviceFlags".as_ptr())
+        };
+        if f.is_null() {
+            eprintln!("stemflow: libcudart not found; CUDA will spin a CPU core while it waits");
+            return;
+        }
+        let set: extern "C" fn(libc::c_uint) -> libc::c_int = std::mem::transmute(f);
+        let err = set(SCHEDULE_BLOCKING_SYNC);
+        if err != 0 {
+            eprintln!("stemflow: cudaSetDeviceFlags failed ({err}); CUDA will spin while it waits");
+        }
+    });
+}
+
 fn session(path: &Path, device: Device, threads: usize, gpu_mem_mb: usize) -> Result<Session> {
     let _ = gpu_mem_mb; // unused without the cuda feature
     let env = runtime(device)?;
@@ -120,7 +150,13 @@ fn session(path: &Path, device: Device, threads: usize, gpu_mem_mb: usize) -> Re
     if device == Device::Cuda {
         #[cfg(feature = "cuda")]
         {
+            blocking_sync();
+            // The GPU does the work; don't let ORT's CPU threads spin waiting for it.
             b = b
+                .with_intra_op_spinning(false)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .with_inter_op_spinning(false)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
                 .with_execution_providers([ort::ep::CUDA::default()
                     // Optional cap on this model's GPU pool (0 = no limit).
                     .with_memory_limit(gpu_mem_mb * 1024 * 1024)
