@@ -86,6 +86,16 @@ piano and guitar, which in a jazz combo is the horns), `piano`, `guitar` and `dr
 A model file's suffix names its stem (`bsrofo_sw_other.onnx`), and the menu's Stem
 picker lists the stems there is a model for.
 
+### Beat click
+
+`stemflow live` can mix a click into what you hear on every beat (higher on bar 1), to judge the beat tracking that bar-snapped looping will build on. It needs `models/beats/beat_this_final0_1500.onnx`: Beat This! (CPJKU, MIT), exported by
+
+```bash
+tools/.venv/bin/python -I tools/export_beat_this.py models/beats tools/.venv-gpu/lib/python3.10/site-packages
+```
+
+Switch it on from the menu ("Beat click") or `busctl --user set-property org.stemflow.Control /org/stemflow/Control org.stemflow.Control Click b true`. `Meter` (beats per bar, 0 = auto) and `Feel` (0.5 half time, 1, 2 double time) set the bar lines and the beat; `Beats` says what the tracker found. Every 3 s it re-analyses the last 30 s of input (about 0.35 s on the GPU while separating). The input runs ahead of what you hear by the separator's lookahead, so the click comes from audio already analysed. A change of tempo or meter has to show up three times in a row (9 s) before the click follows it. `stemflow file --click in.wav out.wav` renders the same thing to a file.
+
 ## GNOME Shell extension (GNOME 42)
 
 ```bash

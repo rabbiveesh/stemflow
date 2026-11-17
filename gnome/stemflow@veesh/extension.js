@@ -46,6 +46,10 @@ const IFACE = `
     <property name="Compute" type="d" access="read"/>
     <property name="Hop" type="d" access="read"/>
     <property name="Overruns" type="t" access="read"/>
+    <property name="Click" type="b" access="readwrite"/>
+    <property name="Meter" type="u" access="readwrite"/>
+    <property name="Feel" type="d" access="readwrite"/>
+    <property name="Beats" type="s" access="read"/>
     <method name="Nudge"><arg type="d" direction="in"/><arg type="d" direction="out"/></method>
     <method name="Snap"><arg type="s" direction="in"/><arg type="d" direction="out"/></method>
   </interface>
@@ -225,6 +229,30 @@ class StemflowIndicator extends PanelMenu.Button {
         this._status = new PopupMenu.PopupMenuItem('', { reactive: false });
         this._status.label.style = 'font-size: smaller;';
         this.menu.addMenuItem(this._status);
+
+        // Beat click: a click on every beat (higher on bar 1), to judge the beat
+        // tracking by ear. The submenu sets the bar length and half/double time, and
+        // its title says what the tracker found.
+        this._click = stayOpen(new PopupMenu.PopupSwitchMenuItem('Beat click', false));
+        this._click.connect('toggled', (_i, on) => this._set('Click', on));
+        this.menu.addMenuItem(this._click);
+        this._beatOpts = new PopupMenu.PopupSubMenuMenuItem('Meter and feel');
+        this.menu.addMenuItem(this._beatOpts);
+        this._meterItems = new Map();
+        for (const m of [0, 2, 3, 4, 5, 6, 7]) {
+            const item = new PopupMenu.PopupMenuItem(m === 0 ? 'Auto meter' : `${m} beats per bar`);
+            item.activate = () => this._set('Meter', m);
+            this._beatOpts.menu.addMenuItem(item);
+            this._meterItems.set(m, item);
+        }
+        this._beatOpts.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        this._feelItems = new Map();
+        for (const [f, label] of [[1, 'As heard'], [0.5, 'Half time'], [2, 'Double time']]) {
+            const item = new PopupMenu.PopupMenuItem(label);
+            item.activate = () => this._set('Feel', f);
+            this._beatOpts.menu.addMenuItem(item);
+            this._feelItems.set(f, item);
+        }
 
         // Stem: which part of the music the controls act on (vocals = karaoke,
         // other = the horns in a jazz combo). Picking one switches to the model last
@@ -477,6 +505,22 @@ class StemflowIndicator extends PanelMenu.Button {
             this._clef.style = on ? CLEF : '';
         for (const w of [this._desc, this._snaps, this._one, this._boost, this._bass, this._band, this._second, this._status, this._models, this._stems])
             w.visible = on;
+        // Older daemons have no beat click.
+        const beats = on && this._proxy.Click !== null;
+        this._click.visible = this._beatOpts.visible = beats;
+        if (beats) {
+            const p = this._proxy;
+            this._click.setToggleState(!!p.Click);
+            this._click.label.text = p.Click && p.Beats ? `Beat click · ${p.Beats}` : 'Beat click';
+            const dot = v => (v ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE);
+            for (const [m, item] of this._meterItems)
+                item.setOrnament(dot(m === p.Meter));
+            for (const [f, item] of this._feelItems)
+                item.setOrnament(dot(f === p.Feel));
+            const meter = p.Meter ? `${p.Meter}/bar` : 'auto meter';
+            const feel = p.Feel === 0.5 ? ' · half time' : p.Feel === 2 ? ' · double time' : '';
+            this._beatOpts.label.text = `Meter and feel: ${meter}${feel}`;
+        }
         // An older daemon has no Model property: no pickers.
         this._stems.visible = on && !!this._proxy.Model;
         this._models.visible = on && this._settings.get_boolean('experiments') && !!this._proxy.Model;
