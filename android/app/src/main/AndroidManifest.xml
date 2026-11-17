@@ -49,6 +49,17 @@
                 <action android:name="android.service.quicksettings.action.QS_TILE" />
             </intent-filter>
         </service>
+        <!-- "Notification access": lets the app read the player's media session (song,
+             position, seek) for bookmarks; it never reads notifications. -->
+        <service
+            android:name=".MediaAccess"
+            android:exported="true"
+            android:label="stemflow bookmarks"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
         <service
             android:name=".CaptureService"
             android:exported="true"

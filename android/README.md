@@ -277,3 +277,13 @@ Not yet tested: YouTube Music; Shizuku as the way to start the helper without ad
 **Or one player:** the main screen's "From" picker lists "Whatever is playing" plus the installed apps that offer a media service (`Sources.kt`, found through the manifest's `<queries>`); the choice is read when isolation is switched on. A chosen app is captured by uid alone (`RULE_MATCH_UID`, as before), so other sounds keep playing normally. The helper takes `PORT except|only UID...`; `android/helper.sh PACKAGE` captures only that app. Checked live with Spotify chosen (criterion `RULE_MATCH_UID 10320`, audio flowing); the picker itself has not been looked at on the phone, and it is not known whether every player shows up in the list.
 
 **Stem picker (2026-11-16):** the Karaoke switch became a Stem picker (bass, vocals, other, ...; only stems with a model on the phone), as in the GNOME menu. Each stem keeps its own levels and last model. `bsrofo_sw_other_132096.tflite` (`export_bsrofo_litert.py ROOT OUT other`; LiteRT vs PyTorch max error 2e-4 on a peak of 44) is the horn remover.
+
+## Beat click (beat tracking test, 2026-11-16)
+
+`src/beats.rs` (shared with the desktop, included by path) runs Beat This! (CPJKU, MIT) on the last 30 s of input every 3 s, then the "steady" decoder from the beat shootout page (tempo HMM, bar lines every N beats where the downbeat curve agrees; a new tempo or meter must come up three times in a row before the grid follows it). On the phone the model is the LiteRT export above (`LiteRtBeatNet`, CPU/XNNPACK, 2 threads); the GPU stays the separator's. In the app, a "Beat click" switch mixes a click into the output on every beat (higher on bar lines), with a meter picker (Auto, 2–7 per bar) and a feel picker (as heard, half time, double time). The input runs ahead of the output by the separator's lookahead, so the click mostly comes from audio already analysed; between analyses it continues at the last tempo for up to 8 s.
+
+Models: `beat_this_{small0,final0}_1500.tflite` in the app's files; `small0` unless `--es beatmodel final0` picks the other (from the next start). Control over adb: `--ez click true`, `--ei meter 3` (0 = auto), `--ef feel 2`.
+
+Pixel 10a, idle, CPU (bench `--beat-ref`, 6 runs, p50): small0 1.30 s with 2 threads, 0.91 s with 4; final0 2.33 s / 1.60 s. Error vs PyTorch < 1e-4.
+
+`android/beatcheck` checks the mel spectrogram and decoder on the host (ONNX Runtime): mel vs torchaudio 1.3e-4, decoder identical to the page's beats.js on clip 1.
