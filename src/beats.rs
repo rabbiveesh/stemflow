@@ -456,8 +456,49 @@ pub struct Decoded {
     pub bpm: f32,
 }
 
+/// Times (s) of the network's own beats: logit above 0 and the highest within ±3
+/// frames (Beat This!'s minimal post-processing).
+fn peaks(curve: &[f32]) -> Vec<f64> {
+    (0..curve.len())
+        .filter(|&i| {
+            let (lo, hi) = (i.saturating_sub(3), (i + 3).min(curve.len() - 1));
+            curve[i] > 0.0
+                && (lo..=hi).all(|j| curve[j] < curve[i] || (j >= i && curve[j] <= curve[i]))
+        })
+        .map(|i| i as f64 / FPS as f64)
+        .collect()
+}
+
+/// The tempo the network's own beats imply (median gap), with enough of them.
+fn peak_bpm(beat: &[f32]) -> Option<f32> {
+    let p = peaks(beat);
+    let mut iv: Vec<f64> = p
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|&d| d > 0.15 && d < 2.0)
+        .collect();
+    if iv.len() < 8 {
+        return None;
+    }
+    iv.sort_by(|a, b| a.total_cmp(b));
+    Some((60.0 / iv[iv.len() / 2]) as f32)
+}
+
 pub fn decode(beat: &[f32], down: &[f32], s: &Settings) -> Decoded {
-    let mut beats = steady_beats(beat, s.min_bpm, s.max_bpm);
+    // The steady decoder may settle on every other beat where the accents fall that
+    // way (a jazz waltz played in one or across the bar), and every other beat can't
+    // make a bar of 3. Keep it to the tempo octave of the network's own beats; half
+    // and double time are the user's call (`feel`), below.
+    let (lo, hi) = match peak_bpm(beat) {
+        Some(b) => ((b * 0.7).max(s.min_bpm), (b * 1.4).min(s.max_bpm)),
+        None => (s.min_bpm, s.max_bpm),
+    };
+    let (lo, hi) = if lo < hi {
+        (lo, hi)
+    } else {
+        (s.min_bpm, s.max_bpm)
+    };
+    let mut beats = steady_beats(beat, lo, hi);
     if s.feel >= 1.5 && beats.len() >= 2 {
         let mut out = Vec::with_capacity(2 * beats.len());
         for i in 0..beats.len() {
@@ -505,6 +546,71 @@ pub fn decode(beat: &[f32], down: &[f32], s: &Settings) -> Decoded {
         meter,
         bpm,
     }
+}
+
+/// What the decoder saw, for debugging a meter or tempo it got wrong: the beats, the
+/// downbeat contrast for each meter, and the network's own downbeat peaks.
+pub fn explain(beat: &[f32], down: &[f32], s: &Settings) -> String {
+    use std::fmt::Write;
+    let d = decode(beat, down, s);
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "{} beats, {:.1} bpm, meter {} (first bar at beat {})",
+        d.beats.len(),
+        d.bpm,
+        d.meter,
+        d.first_bar
+    );
+    for m in 2..=7 {
+        let (k, c) = bars(&d.beats, down, m);
+        let _ = writeln!(o, "  meter {m}: contrast {c:+.3} (bar 1 = beat {k})");
+    }
+    // the network's own downbeats: local maxima of the downbeat logit above 0
+    let dpk = peaks(down);
+    let gaps: Vec<usize> = dpk
+        .windows(2)
+        .map(|w| {
+            d.beats
+                .iter()
+                .filter(|&&b| b >= w[0] - 0.03 && b < w[1] - 0.03)
+                .count()
+        })
+        .collect();
+    let mut hist = std::collections::BTreeMap::new();
+    for g in &gaps {
+        *hist.entry(*g).or_insert(0) += 1;
+    }
+    let _ = writeln!(
+        o,
+        "network downbeats: {} peaks; beats between them: {:?}",
+        dpk.len(),
+        hist
+    );
+    // beat logit peaks (the network's own beats), to compare the tempo
+    let bpk = peaks(beat);
+    let mut iv: Vec<f64> = bpk.windows(2).map(|w| w[1] - w[0]).collect();
+    iv.sort_by(|a, b| a.total_cmp(b));
+    if !iv.is_empty() {
+        let _ = writeln!(
+            o,
+            "network beats: {} peaks, median {:.1} bpm",
+            bpk.len(),
+            60.0 / iv[iv.len() / 2]
+        );
+    }
+    let _ = write!(o, "first beats (s, downbeat logit, bar line?):");
+    for (i, &b) in d.beats.iter().take(24).enumerate() {
+        let bar = i >= d.first_bar && (i - d.first_bar).is_multiple_of(d.meter);
+        let _ = write!(
+            o,
+            " {:.2}{}{:+.1}",
+            b,
+            if bar { "|" } else { " " },
+            at(down, b)
+        );
+    }
+    o
 }
 
 // ---------------------------------------------------------------- the live tracker
