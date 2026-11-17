@@ -1,0 +1,19 @@
+[package]
+name = "stemflow-beatcheck"
+version = "0.1.0"
+edition = "2021"
+description = "Parity and timing check for src/beats.rs (host, or the phone over adb)"
+license = "MIT"
+publish = false
+
+# Not part of the desktop crate; built on its own (host) or with cargo-ndk (phone).
+[workspace]
+
+[dependencies]
+anyhow = "1"
+hound = "3"
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
+realfft = "3"
+
+[profile.release]
+debug = 1

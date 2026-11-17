@@ -21,6 +21,9 @@ realfft = "3"
 clap = { version = "4", features = ["derive"] }
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
 
+[build-dependencies]
+cc = "1"
+
 [features]
 cuda = []
 # LiteRT 2.x (CompiledModel + ML Drift GPU accelerator) instead of 1.4.2; see ../README.md.

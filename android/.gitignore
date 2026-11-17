@@ -5,3 +5,4 @@ app/build/
 app/.gradle/
 app/local.properties
 app/src/main/jniLibs/
+beatcheck/target/

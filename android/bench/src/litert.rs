@@ -88,7 +88,11 @@ mod engine {
     }
 
     fn dims(t: *const c_void) -> Vec<usize> {
-        unsafe { (0..TfLiteTensorNumDims(t)).map(|d| TfLiteTensorDim(t, d) as usize).collect() }
+        unsafe {
+            (0..TfLiteTensorNumDims(t))
+                .map(|d| TfLiteTensorDim(t, d) as usize)
+                .collect()
+        }
     }
 
     /// An interpreter with everything it owns; freed on drop (about 1 GB with the GPU
@@ -105,7 +109,12 @@ mod engine {
             let cpath = CString::new(path.to_str().context("model path")?)?;
             let null = std::ptr::null_mut();
             // Filled in step by step, so that Drop frees whatever exists if a step fails.
-            let mut e = Engine { interp: null, model: null, opts: null, delegate: null };
+            let mut e = Engine {
+                interp: null,
+                model: null,
+                opts: null,
+                delegate: null,
+            };
             unsafe {
                 e.model = TfLiteModelCreateFromFile(cpath.as_ptr());
                 ensure!(!e.model.is_null(), "loading {}", path.display());
@@ -134,15 +143,24 @@ mod engine {
                     TfLiteInterpreterOptionsAddDelegate(e.opts, e.delegate);
                 }
                 e.interp = TfLiteInterpreterCreate(e.model, e.opts);
-                ensure!(!e.interp.is_null(), "creating the interpreter (GPU delegate rejected the graph?)");
-                ensure!(TfLiteInterpreterAllocateTensors(e.interp) == 0, "allocating tensors");
+                ensure!(
+                    !e.interp.is_null(),
+                    "creating the interpreter (GPU delegate rejected the graph?)"
+                );
+                ensure!(
+                    TfLiteInterpreterAllocateTensors(e.interp) == 0,
+                    "allocating tensors"
+                );
             }
             Ok(e)
         }
 
         pub fn io_counts(&self) -> (i32, i32) {
             unsafe {
-                (TfLiteInterpreterGetInputTensorCount(self.interp), TfLiteInterpreterGetOutputTensorCount(self.interp))
+                (
+                    TfLiteInterpreterGetInputTensorCount(self.interp),
+                    TfLiteInterpreterGetOutputTensorCount(self.interp),
+                )
             }
         }
 
@@ -159,7 +177,10 @@ mod engine {
             unsafe {
                 let t = TfLiteInterpreterGetInputTensor(self.interp, i);
                 ensure!(TfLiteTensorByteSize(t) == 4 * len, "input {i} size");
-                Ok(std::slice::from_raw_parts_mut(TfLiteTensorData(t).cast::<f32>(), len))
+                Ok(std::slice::from_raw_parts_mut(
+                    TfLiteTensorData(t).cast::<f32>(),
+                    len,
+                ))
             }
         }
 
@@ -168,12 +189,18 @@ mod engine {
             unsafe {
                 let t = TfLiteInterpreterGetOutputTensor(self.interp, i);
                 ensure!(TfLiteTensorByteSize(t) == 4 * len, "output {i} size");
-                Ok(std::slice::from_raw_parts(TfLiteTensorData(t).cast::<f32>(), len))
+                Ok(std::slice::from_raw_parts(
+                    TfLiteTensorData(t).cast::<f32>(),
+                    len,
+                ))
             }
         }
 
         pub fn invoke(&mut self) -> Result<()> {
-            ensure!(unsafe { TfLiteInterpreterInvoke(self.interp) } == 0, "LiteRT invoke failed");
+            ensure!(
+                unsafe { TfLiteInterpreterInvoke(self.interp) } == 0,
+                "LiteRT invoke failed"
+            );
             Ok(())
         }
     }
@@ -240,7 +267,11 @@ mod engine {
     extern "C" {
         fn LiteRtCreateEnvironment(n: i32, options: *const c_void, env: *mut *mut c_void) -> i32;
         fn LiteRtDestroyEnvironment(env: *mut c_void);
-        fn LiteRtCreateModelFromFile(env: *mut c_void, path: *const c_char, model: *mut *mut c_void) -> i32;
+        fn LiteRtCreateModelFromFile(
+            env: *mut c_void,
+            path: *const c_char,
+            model: *mut *mut c_void,
+        ) -> i32;
         fn LiteRtDestroyModel(model: *mut c_void);
         fn LiteRtCreateOptions(options: *mut *mut c_void) -> i32;
         fn LiteRtDestroyOptions(options: *mut c_void);
@@ -252,17 +283,44 @@ mod engine {
             opaque: *mut *mut c_void,
         ) -> i32;
         fn LiteRtAddOpaqueOptions(options: *mut c_void, opaque: *mut c_void) -> i32;
-        fn LiteRtCreateCompiledModel(env: *mut c_void, model: *mut c_void, options: *mut c_void, cm: *mut *mut c_void) -> i32;
+        fn LiteRtCreateCompiledModel(
+            env: *mut c_void,
+            model: *mut c_void,
+            options: *mut c_void,
+            cm: *mut *mut c_void,
+        ) -> i32;
         fn LiteRtDestroyCompiledModel(cm: *mut c_void);
         fn LiteRtCompiledModelIsFullyAccelerated(cm: *mut c_void, full: *mut bool) -> i32;
-        fn LiteRtGetModelSignature(model: *mut c_void, index: usize, signature: *mut *mut c_void) -> i32;
+        fn LiteRtGetModelSignature(
+            model: *mut c_void,
+            index: usize,
+            signature: *mut *mut c_void,
+        ) -> i32;
         fn LiteRtGetNumSignatureInputs(signature: *mut c_void, n: *mut usize) -> i32;
         fn LiteRtGetNumSignatureOutputs(signature: *mut c_void, n: *mut usize) -> i32;
-        fn LiteRtGetSignatureInputTensorByIndex(signature: *mut c_void, i: usize, tensor: *mut *mut c_void) -> i32;
-        fn LiteRtGetSignatureOutputTensorByIndex(signature: *mut c_void, i: usize, tensor: *mut *mut c_void) -> i32;
+        fn LiteRtGetSignatureInputTensorByIndex(
+            signature: *mut c_void,
+            i: usize,
+            tensor: *mut *mut c_void,
+        ) -> i32;
+        fn LiteRtGetSignatureOutputTensorByIndex(
+            signature: *mut c_void,
+            i: usize,
+            tensor: *mut *mut c_void,
+        ) -> i32;
         fn LiteRtGetRankedTensorType(tensor: *mut c_void, ty: *mut RankedTensorType) -> i32;
-        fn LiteRtGetCompiledModelInputBufferRequirements(cm: *mut c_void, sig: usize, i: usize, req: *mut *mut c_void) -> i32;
-        fn LiteRtGetCompiledModelOutputBufferRequirements(cm: *mut c_void, sig: usize, i: usize, req: *mut *mut c_void) -> i32;
+        fn LiteRtGetCompiledModelInputBufferRequirements(
+            cm: *mut c_void,
+            sig: usize,
+            i: usize,
+            req: *mut *mut c_void,
+        ) -> i32;
+        fn LiteRtGetCompiledModelOutputBufferRequirements(
+            cm: *mut c_void,
+            sig: usize,
+            i: usize,
+            req: *mut *mut c_void,
+        ) -> i32;
         fn LiteRtCreateManagedTensorBufferFromRequirements(
             env: *mut c_void,
             ty: *const RankedTensorType,
@@ -298,14 +356,29 @@ mod engine {
             let cpath = CString::new(path.to_str().context("model path")?)?;
             let null = std::ptr::null_mut();
             // Filled in step by step, so that Drop frees whatever exists if a step fails.
-            let mut e = Engine { env: null, model: null, compiled: null, inputs: Vec::new(), outputs: Vec::new() };
-            ok!(LiteRtCreateEnvironment(0, std::ptr::null(), &mut e.env), "creating the environment");
-            ok!(LiteRtCreateModelFromFile(e.env, cpath.as_ptr(), &mut e.model), format!("loading {}", path.display()));
+            let mut e = Engine {
+                env: null,
+                model: null,
+                compiled: null,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+            };
+            ok!(
+                LiteRtCreateEnvironment(0, std::ptr::null(), &mut e.env),
+                "creating the environment"
+            );
+            ok!(
+                LiteRtCreateModelFromFile(e.env, cpath.as_ptr(), &mut e.model),
+                format!("loading {}", path.display())
+            );
             let mut opts = null;
             ok!(LiteRtCreateOptions(&mut opts), "creating options");
             let built = (|| {
                 let hw = if accel == Accel::Cpu { HW_CPU } else { HW_GPU };
-                ok!(LiteRtSetOptionsHardwareAccelerators(opts, hw), "choosing the accelerator");
+                ok!(
+                    LiteRtSetOptionsHardwareAccelerators(opts, hw),
+                    "choosing the accelerator"
+                );
                 // Accelerator options travel as TOML under the accelerator's name, as
                 // litert_gpu_options.cc and litert_cpu_options.cc serialize them (the
                 // Lrt*Options helpers themselves are not exported by libLiteRt.so).
@@ -319,10 +392,18 @@ mod engine {
                 if let Some((name, toml)) = named {
                     let mut opaque = null;
                     ok!(
-                        LiteRtCreateOpaqueOptions(name.as_ptr(), CString::new(toml)?.into_raw().cast(), free_payload, &mut opaque),
+                        LiteRtCreateOpaqueOptions(
+                            name.as_ptr(),
+                            CString::new(toml)?.into_raw().cast(),
+                            free_payload,
+                            &mut opaque
+                        ),
                         "creating accelerator options"
                     );
-                    ok!(LiteRtAddOpaqueOptions(opts, opaque), "adding accelerator options");
+                    ok!(
+                        LiteRtAddOpaqueOptions(opts, opaque),
+                        "adding accelerator options"
+                    );
                 }
                 ok!(
                     LiteRtCreateCompiledModel(e.env, e.model, opts, &mut e.compiled),
@@ -333,31 +414,74 @@ mod engine {
             unsafe { LiteRtDestroyOptions(opts) };
             built?;
             let mut full = false;
-            ok!(LiteRtCompiledModelIsFullyAccelerated(e.compiled, &mut full), "querying acceleration");
-            ensure!(full || accel == Accel::Cpu, "the GPU accelerator did not take the whole graph");
+            ok!(
+                LiteRtCompiledModelIsFullyAccelerated(e.compiled, &mut full),
+                "querying acceleration"
+            );
+            ensure!(
+                full || accel == Accel::Cpu,
+                "the GPU accelerator did not take the whole graph"
+            );
 
             let mut sig = null;
-            ok!(LiteRtGetModelSignature(e.model, 0, &mut sig), "reading the signature");
+            ok!(
+                LiteRtGetModelSignature(e.model, 0, &mut sig),
+                "reading the signature"
+            );
             let (mut n_in, mut n_out) = (0, 0);
-            ok!(LiteRtGetNumSignatureInputs(sig, &mut n_in), "counting inputs");
-            ok!(LiteRtGetNumSignatureOutputs(sig, &mut n_out), "counting outputs");
+            ok!(
+                LiteRtGetNumSignatureInputs(sig, &mut n_in),
+                "counting inputs"
+            );
+            ok!(
+                LiteRtGetNumSignatureOutputs(sig, &mut n_out),
+                "counting outputs"
+            );
             for (n, output) in [(n_in, false), (n_out, true)] {
                 for i in 0..n {
                     let (mut tensor, mut req, mut handle) = (null, null, null);
                     let mut ty: RankedTensorType = unsafe { std::mem::zeroed() };
                     if output {
-                        ok!(LiteRtGetSignatureOutputTensorByIndex(sig, i, &mut tensor), "output tensor");
-                        ok!(LiteRtGetCompiledModelOutputBufferRequirements(e.compiled, 0, i, &mut req), "output buffer");
+                        ok!(
+                            LiteRtGetSignatureOutputTensorByIndex(sig, i, &mut tensor),
+                            "output tensor"
+                        );
+                        ok!(
+                            LiteRtGetCompiledModelOutputBufferRequirements(
+                                e.compiled, 0, i, &mut req
+                            ),
+                            "output buffer"
+                        );
                     } else {
-                        ok!(LiteRtGetSignatureInputTensorByIndex(sig, i, &mut tensor), "input tensor");
-                        ok!(LiteRtGetCompiledModelInputBufferRequirements(e.compiled, 0, i, &mut req), "input buffer");
+                        ok!(
+                            LiteRtGetSignatureInputTensorByIndex(sig, i, &mut tensor),
+                            "input tensor"
+                        );
+                        ok!(
+                            LiteRtGetCompiledModelInputBufferRequirements(
+                                e.compiled, 0, i, &mut req
+                            ),
+                            "input buffer"
+                        );
                     }
                     ok!(LiteRtGetRankedTensorType(tensor, &mut ty), "tensor type");
                     ensure!(ty.element_type == FLOAT32, "tensor {i} is not float32");
                     let rank = (ty.bits & 0x7f) as usize;
                     let dims = ty.dimensions[..rank].iter().map(|&d| d as usize).collect();
-                    ok!(LiteRtCreateManagedTensorBufferFromRequirements(e.env, &ty, req, &mut handle), "creating a buffer");
-                    let b = Buffer { handle, dims, locked: std::ptr::null_mut() };
+                    ok!(
+                        LiteRtCreateManagedTensorBufferFromRequirements(
+                            e.env,
+                            &ty,
+                            req,
+                            &mut handle
+                        ),
+                        "creating a buffer"
+                    );
+                    let b = Buffer {
+                        handle,
+                        dims,
+                        locked: std::ptr::null_mut(),
+                    };
                     if output {
                         e.outputs.push(b)
                     } else {
@@ -384,7 +508,10 @@ mod engine {
             ensure!(b.dims.iter().product::<usize>() == len, "tensor size");
             if b.locked.is_null() {
                 let mut p = std::ptr::null_mut();
-                ok!(LiteRtLockTensorBuffer(b.handle, &mut p, mode), "locking a buffer");
+                ok!(
+                    LiteRtLockTensorBuffer(b.handle, &mut p, mode),
+                    "locking a buffer"
+                );
                 b.locked = p.cast();
             }
             Ok(b.locked)
@@ -416,7 +543,14 @@ mod engine {
             let mut ins: Vec<_> = self.inputs.iter().map(|b| b.handle).collect();
             let mut outs: Vec<_> = self.outputs.iter().map(|b| b.handle).collect();
             ok!(
-                LiteRtRunCompiledModel(self.compiled, 0, ins.len(), ins.as_mut_ptr(), outs.len(), outs.as_mut_ptr()),
+                LiteRtRunCompiledModel(
+                    self.compiled,
+                    0,
+                    ins.len(),
+                    ins.as_mut_ptr(),
+                    outs.len(),
+                    outs.as_mut_ptr()
+                ),
                 "run failed"
             );
             Ok(())
@@ -479,7 +613,10 @@ pub struct LiteRtDemucs {
 impl LiteRtDemucs {
     pub fn load(path: &Path, accel: Accel, threads: usize) -> Result<Self> {
         let engine = Engine::load(path, accel, threads)?;
-        ensure!(engine.io_counts() == (2, 2), "expected 2 inputs and 2 outputs");
+        ensure!(
+            engine.io_counts() == (2, 2),
+            "expected 2 inputs and 2 outputs"
+        );
         let (mut in_mix, mut in_mag, mut out_wave, mut out_spec) = (-1, -1, -1, -1);
         let (mut seg, mut frames) = (0, 0);
         for i in 0..2 {
@@ -495,8 +632,14 @@ impl LiteRtDemucs {
                 n => bail!("unexpected output rank {n}"),
             }
         }
-        ensure!(in_mix >= 0 && in_mag >= 0 && out_wave >= 0 && out_spec >= 0, "model I/O");
-        ensure!(frames == frames_for(seg), "{frames} frames for a {seg}-sample segment");
+        ensure!(
+            in_mix >= 0 && in_mag >= 0 && out_wave >= 0 && out_spec >= 0,
+            "model I/O"
+        );
+        ensure!(
+            frames == frames_for(seg),
+            "{frames} frames for a {seg}-sample segment"
+        );
         let mut m = LiteRtDemucs {
             engine,
             in_mix,
@@ -522,7 +665,9 @@ impl Separator for LiteRtDemucs {
     fn separate(&mut self, mix: &[f32]) -> Result<Vec<f32>> {
         let (seg, plane) = (self.seg, BINS * self.frames);
         assert_eq!(mix.len(), 2 * seg);
-        self.engine.input(self.in_mix, 2 * seg)?.copy_from_slice(mix);
+        self.engine
+            .input(self.in_mix, 2 * seg)?
+            .copy_from_slice(mix);
         let mag = self.engine.input(self.in_mag, 4 * plane)?;
         for ch in 0..2 {
             self.stft.spec(&mix[ch * seg..(ch + 1) * seg], &mut self.z);
@@ -542,28 +687,37 @@ impl Separator for LiteRtDemucs {
     }
 }
 
-/// BS-RoFormer on LiteRT, from ../tools/export_bsrofo_litert.py: input and output are
-/// the spectrogram `[1, 4, 1025, frames]` (STFT n_fft 2048, hop 512, Hann), as in
-/// model.rs' BsRoformer. The window is fixed by the model file.
+/// BS-RoFormer on LiteRT, from ../tools/export_bsrofo_litert.py: input is the
+/// spectrogram `[1, 4, 1025, frames]` (STFT n_fft 2048, hop 512, Hann), as in model.rs'
+/// BsRoformer; output is `[1, 4 * heads, 1025, frames]`, one stem per head (bass, or
+/// bass then vocals). The window is fixed by the model file.
 pub struct LiteRtRoformer {
     engine: Engine,
     stft: HannStft,
     seg: usize,
     frames: usize,
+    heads: usize,
     z: Vec<Complex32>,
 }
 
 impl LiteRtRoformer {
     pub fn load(path: &Path, accel: Accel, threads: usize) -> Result<Self> {
         let engine = Engine::load(path, accel, threads)?;
-        ensure!(engine.io_counts() == (1, 1), "expected 1 input and 1 output");
+        ensure!(
+            engine.io_counts() == (1, 1),
+            "expected 1 input and 1 output"
+        );
         let stft = HannStft::new(2048, 512);
         let d = engine.input_dims(0);
         let frames = match d.as_slice() {
             [1, 4, b, f] if *b == stft.bins() => *f,
             _ => bail!("unexpected input shape {d:?}"),
         };
-        ensure!(engine.output_dims(0) == d, "output shape");
+        let o = engine.output_dims(0);
+        let heads = match o.as_slice() {
+            [1, c, b, f] if c % 4 == 0 && *c > 0 && *b == stft.bins() && *f == frames => c / 4,
+            _ => bail!("unexpected output shape {o:?}"),
+        };
         let seg = (frames - 1) * 512;
         let mut m = LiteRtRoformer {
             engine,
@@ -571,6 +725,7 @@ impl LiteRtRoformer {
             stft,
             seg,
             frames,
+            heads,
         };
         m.separate(&vec![0.0; 2 * seg])?; // first run compiles the GPU kernels
         Ok(m)
@@ -591,13 +746,21 @@ impl Separator for LiteRtRoformer {
             to_planes(&self.z, &mut spec_in[2 * ch * plane..(2 * ch + 2) * plane]);
         }
         self.engine.invoke()?;
-        let spec = self.engine.output(0, 4 * plane)?;
-        let mut out = vec![0f32; 2 * seg];
-        for ch in 0..2 {
-            from_planes(&spec[2 * ch * plane..(2 * ch + 2) * plane], &mut self.z);
-            self.stft.istft(&self.z, self.frames, &mut out[ch * seg..(ch + 1) * seg]);
+        let spec = self.engine.output(0, 4 * plane * self.heads)?.to_vec();
+        let mut out = vec![0f32; 2 * seg * self.heads];
+        for h in 0..self.heads {
+            let (s, o) = (&spec[4 * plane * h..], &mut out[2 * seg * h..]);
+            for ch in 0..2 {
+                from_planes(&s[2 * ch * plane..(2 * ch + 2) * plane], &mut self.z);
+                self.stft
+                    .istft(&self.z, self.frames, &mut o[ch * seg..(ch + 1) * seg]);
+            }
         }
         Ok(out)
+    }
+
+    fn stems(&self) -> usize {
+        self.heads
     }
 }
 
@@ -613,7 +776,10 @@ pub struct LiteRtBeatNet {
 impl LiteRtBeatNet {
     pub fn load(path: &Path, accel: Accel, threads: usize) -> Result<Self> {
         let engine = Engine::load(path, accel, threads)?;
-        ensure!(engine.io_counts() == (1, 2), "expected 1 input and 2 outputs");
+        ensure!(
+            engine.io_counts() == (1, 2),
+            "expected 1 input and 2 outputs"
+        );
         let d = engine.input_dims(0);
         let (frames, mels) = match d.as_slice() {
             [1, f, m] => (*f, *m),
@@ -622,7 +788,11 @@ impl LiteRtBeatNet {
         for i in 0..2 {
             ensure!(engine.output_dims(i) == [1, frames], "output {i} shape");
         }
-        Ok(LiteRtBeatNet { engine, frames, mels })
+        Ok(LiteRtBeatNet {
+            engine,
+            frames,
+            mels,
+        })
     }
 
     /// Spectrogram frames per run.
