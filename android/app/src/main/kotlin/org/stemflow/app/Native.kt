@@ -41,7 +41,7 @@ object Native {
     @JvmStatic external fun looperEdit(h: Long, op: Int, a: Int, b: Int, f: Float)
     @JvmStatic external fun looperView(h: Long, bins: Int): FloatArray
     /** Re-separate the loop with `engine`'s model (after a switch); blocks for seconds. */
-    @JvmStatic external fun looperRestem(h: Long, engine: Long): Boolean
+    @JvmStatic external fun looperRestem(h: Long, engine: Long, full: Boolean = true): Boolean
     @JvmStatic external fun looperTotal(h: Long): Long
     /** [start, end, bar 1, beats per bar, bars, feel] in buffer frames; empty without a loop */
     @JvmStatic external fun looperTimes(h: Long): DoubleArray
@@ -49,6 +49,7 @@ object Native {
     @JvmStatic external fun looperGrid(h: Long): DoubleArray
     @JvmStatic external fun looperRecent(h: Long): FloatArray
     @JvmStatic external fun looperNudge(h: Long, da: Int, db: Int): Boolean
+    @JvmStatic external fun engineReset(h: Long)
     @JvmStatic external fun looperLay(h: Long, beats: DoubleArray, a: Int, b: Int, one: Int, meter: Int, bpm: Float, feel: Float)
     @JvmStatic fun looperIsPlaying(h: Long) = looperView(h, 1).let { it.isNotEmpty() && it[0] > 0f }
 }

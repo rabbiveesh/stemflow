@@ -110,6 +110,9 @@ object Control {
     @Volatile var speed = 1f
     @Volatile var semis = 0f
     @Volatile var keepPitch = true
+    /** Capture only, and separate just the loops: the buffer fills with the plain
+     *  mix at once (no separator lag, little battery); a loop is stemmed when made. */
+    @Volatile var stemsOnLoop = false
 
     fun loadBeats(c: Context) {
         val p = c.getSharedPreferences("beats", Context.MODE_PRIVATE)
@@ -119,12 +122,14 @@ object Control {
         speed = p.getFloat("speed", 1f)
         semis = p.getFloat("semis", 0f)
         keepPitch = p.getBoolean("keep_pitch", true)
+        stemsOnLoop = p.getBoolean("stems_on_loop", false)
     }
 
     fun saveBeats(c: Context) {
         c.getSharedPreferences("beats", Context.MODE_PRIVATE).edit()
             .putBoolean("click", click).putInt("meter", meter).putFloat("feel", feel)
-            .putFloat("speed", speed).putFloat("semis", semis).putBoolean("keep_pitch", keepPitch).apply()
+            .putFloat("speed", speed).putFloat("semis", semis).putBoolean("keep_pitch", keepPitch)
+            .putBoolean("stems_on_loop", stemsOnLoop).apply()
     }
 
     fun describeBeats() = "click " + (if (click) "on" else "off") +

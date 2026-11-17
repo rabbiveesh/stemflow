@@ -378,6 +378,19 @@ class MainActivity : Activity() {
             divider,
             row(label("From", 14f, muted).apply { minWidth = dp(64) }, sourcePicker.view).apply { setPadding(dp(16), dp(4), dp(12), dp(4)) },
         ).apply { background = rounded(surface, 18) }
+        val onLoop = Switch(this).apply {
+            thumbTintList = ColorStateList.valueOf(accent)
+            isChecked = Control.stemsOnLoop
+            setOnCheckedChangeListener { _, on -> Control.stemsOnLoop = on; Control.saveBeats(this@MainActivity) }
+        }
+        val onLoopRow = row(
+            column(
+                label("Stems only when looping", 15f),
+                label("Hear the plain mix and save battery; a loop is separated when you make it", 12f, muted),
+            ).apply { layoutParams = lp(0, LayoutParams.WRAP_CONTENT, 1f) },
+            onLoop,
+            gap = 12,
+        ).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(12), dp(12), dp(12)); background = rounded(surface, 18) }
         health = label("", 12f, muted).apply { setPadding(dp(20), dp(12), dp(20), 0) }
         val extras = row(
             button("Add quick tile", chip = true, weight = 0f) { addTile() },
@@ -391,6 +404,7 @@ class MainActivity : Activity() {
             chipsScroll,
             pad(mix),
             pad(pickers),
+            pad(onLoopRow),
             health,
             extras,
         )

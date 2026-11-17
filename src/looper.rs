@@ -186,6 +186,9 @@ struct Grid {
 struct State {
     analysis: Option<Analysis>,
     clip: Option<Clip>,
+    /// The frames `restem` has separated (written into the copy and the buffer
+    /// both, so later copies have them): a longer or moved loop needs only what's new.
+    stemmed: Option<(i64, i64)>,
     settings: Settings,
     grid: Option<Grid>,
     /// the loop is beats[a]..beats[b]
@@ -295,6 +298,7 @@ impl Looper {
             state: Mutex::new(State {
                 analysis: None,
                 clip: None,
+                stemmed: None,
                 settings: Settings::default(),
                 grid: None,
                 a: 0,
@@ -1070,17 +1074,41 @@ impl Looper {
         }
     }
 
-    /// The stretch to re-separate after a model switch: the loop and a second either
-    /// side (for the wrap's crossfade and small edits), or None without a loop.
-    pub fn restem_range(&self) -> Option<(i64, i64)> {
+    /// The stretch to separate: the loop and a second either side (for the wrap's
+    /// crossfade and small edits), or None without a loop. Unless `full` (a new
+    /// model), only what isn't separated yet: after the loop grows, just the new end.
+    pub fn restem_range(&self, full: bool) -> Option<(i64, i64)> {
         let st = self.state.lock().unwrap();
         let g = st.grid.as_ref()?;
         st.clip.as_ref()?;
         let pad = RATE as f64;
-        Some((
+        let (from, to) = (
             (g.beats[st.a] - pad).round() as i64,
             (g.beats[st.b] + pad).round() as i64,
-        ))
+        );
+        match st.stemmed {
+            Some((s, e)) if !full => {
+                if s <= from && e >= to {
+                    None
+                } else if from >= s && from <= e {
+                    Some((e, to))
+                } else if to >= s && to <= e {
+                    Some((from, s))
+                } else {
+                    Some((from, to))
+                }
+            }
+            _ => Some((from, to)),
+        }
+    }
+
+    /// `restem` separated [from, to): add it to what is separated.
+    fn stemmed_too(&self, from: i64, to: i64, full: bool) {
+        let mut st = self.state.lock().unwrap();
+        st.stemmed = match st.stemmed {
+            Some((s, e)) if !full && from <= e && to >= s => Some((s.min(from), e.max(to))),
+            _ => Some((from, to)),
+        };
     }
 
     /// The original mix (target + band) of the loop's copy, `n` frames from `from`,
@@ -1112,6 +1140,18 @@ impl Looper {
             let k = CH * k as usize;
             put(&mut c.data[k..k + CH], bass, band, second, i);
         }
+        drop(st);
+        // and into the buffer, so a later copy (a longer or moved loop) has it too
+        let mut ring = self.ring.lock().unwrap();
+        let (lo, hi, cap) = (ring.oldest() as i64, ring.total as i64, ring.cap);
+        for i in 0..bass.len() / 2 {
+            let f = from + i as i64;
+            if f < lo || f >= hi {
+                continue;
+            }
+            let k = CH * (f as usize % cap);
+            put(&mut ring.data[k..k + CH], bass, band, second, i);
+        }
     }
 
     pub fn finding(&self) -> bool {
@@ -1122,8 +1162,8 @@ impl Looper {
 /// Re-separate the loop (and a second either side) with `eng`, a newly loaded model:
 /// a window of context before it, then hop by hop, as live. The streamer is reset
 /// before and after, so the live stream starts clean. False without a loop.
-pub fn restem<S: Separator>(l: &Looper, eng: &mut Streamer<S>) -> Result<bool> {
-    let Some((from, to)) = l.restem_range() else {
+pub fn restem<S: Separator>(l: &Looper, eng: &mut Streamer<S>, full: bool) -> Result<bool> {
+    let Some((from, to)) = l.restem_range(full) else {
         return Ok(false);
     };
     let (hop, delay, warm) = (eng.hop, eng.delay(), eng.window());
@@ -1156,6 +1196,7 @@ pub fn restem<S: Separator>(l: &Looper, eng: &mut Streamer<S>) -> Result<bool> {
         &[][..]
     };
     l.replace(from, &bass[2 * k0..2 * k1], &band[2 * k0..2 * k1], sec);
+    l.stemmed_too(from, to, full);
     Ok(true)
 }
 
@@ -1171,6 +1212,48 @@ mod tests {
         fn run(&mut self, _: &[f32]) -> Result<(Vec<f32>, Vec<f32>)> {
             unreachable!()
         }
+    }
+
+    /// A loop that grows only needs its new part separated; a new model needs it all.
+    #[test]
+    fn restem_only_what_is_new() {
+        let l = Looper::new(Box::new(NoNet));
+        let r = RATE as f64;
+        {
+            let mut st = l.state.lock().unwrap();
+            st.grid = Some(Grid {
+                beats: (0..40).map(|k| k as f64 * r / 2.0).collect(),
+                bar: vec![false; 40],
+                meter: 4,
+                bpm: 120.0,
+            });
+            st.clip = Some(Clip {
+                from: 0,
+                data: vec![],
+            });
+            st.a = 8;
+            st.b = 16;
+        }
+        let pad = RATE as i64;
+        let (a, b) = (4 * RATE as i64, 8 * RATE as i64);
+        assert_eq!(l.restem_range(false), Some((a - pad, b + pad)));
+        l.stemmed_too(a - pad, b + pad, false);
+        assert_eq!(l.restem_range(false), None);
+        // a bar longer at the end: just the new end
+        l.state.lock().unwrap().b = 20;
+        assert_eq!(
+            l.restem_range(false),
+            Some((b + pad, 10 * RATE as i64 + pad))
+        );
+        // a bar earlier at the start: just the new start
+        l.state.lock().unwrap().b = 16;
+        l.state.lock().unwrap().a = 4;
+        assert_eq!(
+            l.restem_range(false),
+            Some((2 * RATE as i64 - pad, a - pad))
+        );
+        // a new model: everything
+        assert_eq!(l.restem_range(true), Some((2 * RATE as i64 - pad, b + pad)));
     }
 
     /// Live after a loop: plays on from the loop, skips the pause, then the new audio.

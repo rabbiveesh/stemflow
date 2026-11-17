@@ -184,6 +184,15 @@ pub extern "system" fn Java_org_stemflow_app_Native_engineFree(_: JNIEnv, _: JCl
     }
 }
 
+/// Forget the stream so far (after a stretch of capture without separating).
+#[no_mangle]
+pub extern "system" fn Java_org_stemflow_app_Native_engineReset(_: JNIEnv, _: JClass, h: jlong) {
+    if h != 0 {
+        let eng = unsafe { &mut *(h as *mut Engine) };
+        eng.reset();
+    }
+}
+
 /// Frames per hop: `process` takes and returns exactly this many stereo frames.
 #[no_mangle]
 pub extern "system" fn Java_org_stemflow_app_Native_engineHop(
@@ -532,9 +541,10 @@ pub extern "system" fn Java_org_stemflow_app_Native_looperRestem(
     _: JClass,
     h: jlong,
     engine: jlong,
+    full: jni::sys::jboolean,
 ) -> jni::sys::jboolean {
     let eng = unsafe { &mut *(engine as *mut Engine) };
-    match looper::restem(looper(h), eng) {
+    match looper::restem(looper(h), eng, full != 0) {
         Ok(b) => b as jni::sys::jboolean,
         Err(e) => {
             throw(&mut env, e);

@@ -620,7 +620,7 @@ fn loop_test(
         (b, r)
     };
     let t = Instant::now();
-    looper::restem(&lp, &mut s)?;
+    looper::restem(&lp, &mut s, true)?;
     let (b1, _) = {
         let (mut b, mut r, mut c) = (
             vec![0f32; 2 * 44100],

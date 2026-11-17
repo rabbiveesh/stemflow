@@ -266,6 +266,7 @@ class CaptureService : Service() {
                 grid(h, a)?.let { Bookmarks.replace(c, b.withGrid(it)) }
             }
             loopAnchor = a
+            loopChanged()
             pauseAfterPhrase(c, h)
             Log.i(TAG, "recalled %s".format(b.name))
         }
@@ -309,6 +310,20 @@ class CaptureService : Service() {
          */
         @Volatile private var streamSince = 0L
         @Volatile private var streamFromMs = 0L
+        /** The loop's copy holds the plain mix (made while only capturing) until the
+         *  separator thread has stemmed it; meanwhile it plays as is. */
+        @Volatile var clipIsMix = false
+        @Volatile private var restemWanted = false
+        @Volatile private var restemBusy = false
+
+        /** A loop was made or changed: while only capturing, have it separated. */
+        private fun loopChanged() {
+            if (Control.stemsOnLoop) {
+                clipIsMix = true
+                restemWanted = true
+            }
+        }
+
         /** Bumped to call off whatever phrase work is running. */
         @Volatile private var phraseId = 0
 
@@ -329,6 +344,8 @@ class CaptureService : Service() {
         private fun stream(c: Context, h: Long, id: Int, song: NowPlaying.Song, from: Long, to: Long): Anchor? {
             covering(h, song, from, to)?.let { return it }
             val ctl = NowPlaying.controller(c) ?: throw Exception("No player found")
+            // never seek in another song (the queue may have moved on past this one)
+            if (NowPlaying.song(ctl)?.same(song) != true) throw Exception("The player has moved on from ${song.title}")
             val x = anchor
             val onTheWay = NowPlaying.playing(ctl) && x != null && x.at >= streamSince && x.song.same(song) &&
                 from >= streamFromMs && x.songMs <= to
@@ -340,10 +357,25 @@ class CaptureService : Service() {
                 ctl.transportControls.play()
             }
             val until = System.currentTimeMillis() + 60_000
+            val t0 = System.currentTimeMillis()
+            var lastLog = 0L
+            Log.i(TAG, "stream: want %d-%d ms, %s".format(from, to, if (onTheWay) "playing through" else "seeked to $from"))
             while (true) {
                 if (id != phraseId || !running || !Native.looperIsPlaying(h)) return null
                 if (System.currentTimeMillis() > until) throw Exception("Timed out waiting for the music")
-                covering(h, song, from, to)?.let { return it }
+                covering(h, song, from, to)?.let {
+                    Log.i(TAG, "stream: covered after %.1f s".format((System.currentTimeMillis() - t0) / 1e3))
+                    return it
+                }
+                anchor?.let { if (it.at >= streamSince && !it.song.same(song)) throw Exception("The song ended before that part") }
+                val now = System.currentTimeMillis()
+                if (now - lastLog > 1000) {
+                    lastLog = now
+                    val y = anchor
+                    if (y != null) Log.i(TAG, "stream: %.1f s: player %d ms, buffer %.1f s short of %d ms%s".format(
+                        (now - t0) / 1e3, y.songMs, (y.frameOf(to) - Native.looperTotal(h)) / RATE.toDouble(), to,
+                        if (y.at < streamSince) " (anchor older than the seek)" else ""))
+                }
                 Thread.sleep(200)
             }
         }
@@ -387,6 +419,7 @@ class CaptureService : Service() {
             if (h == 0L || !Native.looperIsPlaying(h) || (da == 0 && db == 0)) return
             if (Native.looperNudge(h, da, db)) {
                 loopStatus = ""
+                if (da < 0 || db > 0) loopChanged() // new audio in the loop
                 if (db > 0) pauseAfterPhrase(c, h)
                 return
             }
@@ -430,6 +463,7 @@ class CaptureService : Service() {
             val w = Native.looperView(h, 1)
             if (w.size >= 14 && beats > 0) Native.looperEdit(h, 3, w[10].toInt(), w[10].toInt() + beats, 0f)
             loopAnchor = a
+            loopChanged()
             Log.i(TAG, "loop now %s–%s".format(Bookmarks.time(newStart), Bookmarks.time(newEnd)))
             pauseAfterPhrase(c, h)
         }
@@ -455,6 +489,7 @@ class CaptureService : Service() {
             if (Native.looperIsPlaying(h)) {
                 if (loopAnchor == null) loopAnchor = anchor
                 Native.looperEdit(h, 4, bars, 0, 0f)
+                loopChanged()
                 return
             }
             val press = heardFrame()
@@ -470,6 +505,7 @@ class CaptureService : Service() {
                 loopStatus = try {
                     Native.looperFind(h, press, bars, Control.meter, Control.feel)
                     Log.i(TAG, "loop found in %.2f s".format((System.nanoTime() - t) / 1e9))
+                    loopChanged()
                     pauseAfterPhrase(c, h)
                     ""
                 } catch (e: Throwable) {
@@ -646,13 +682,13 @@ class CaptureService : Service() {
 
     /** A loop is kept: separate it again with the model just loaded, so it plays (and
      *  goes on into the tail) in the new stems. The loop keeps playing meanwhile. */
-    private fun restemLoop(m: Models.Model) {
+    private fun restemLoop(m: Models.Model, full: Boolean = true) {
         val h = looper
         if (h == 0L || engine == 0L) return
-        loopStatus = "Re-stemming the loop with ${m.name}…"
+        loopStatus = if (clipIsMix) "Separating the loop…" else "Re-stemming the loop with ${m.name}…"
         val t = System.nanoTime()
         loopStatus = try {
-            if (Native.looperRestem(h, engine)) Log.i(TAG, "loop re-stemmed in %.1f s".format((System.nanoTime() - t) / 1e9))
+            if (Native.looperRestem(h, engine, full)) Log.i(TAG, "loop ${if (full) "re-stemmed" else "separated"} in %.1f s".format((System.nanoTime() - t) / 1e9))
             ""
         } catch (e: Throwable) {
             Log.e(TAG, "re-stem failed: ${e.message}")
@@ -681,6 +717,22 @@ class CaptureService : Service() {
         }
     }
 
+    /** Buffer frame `frame` is where the player is now (if it says). */
+    private fun markAnchor(frame: Long) {
+        val ctl = NowPlaying.controller(this)
+        val song = ctl?.let { NowPlaying.song(it) }
+        val ms = ctl?.let { NowPlaying.positionMs(it) }
+        val why = when {
+            ctl == null -> "no player session"
+            song == null -> "${ctl.packageName}: no title"
+            ms == null -> "${ctl.packageName}: no position"
+            !NowPlaying.playing(ctl) -> "${ctl.packageName}: state ${ctl.playbackState?.state}"
+            else -> null
+        }
+        if (why == null) anchor = Anchor(frame, ms!!, song!!)
+        if (why != anchorWhy) { Log.i(TAG, "anchor: ${why ?: "${song?.title} @ $ms"}"); anchorWhy = why }
+    }
+
     private fun separate() {
         // About 0.16 s of each run is CPU (STFT/iSTFT): ask for a fast core.
         Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
@@ -695,15 +747,54 @@ class CaptureService : Service() {
         var buf = FloatArray(2 * hop)
         var fill = 0
         var processed = 0L // input frames given to the separator (= stem frames out)
+        var capturing = false // the last chunk went through without the model
         while (running) {
             // The model picked in the UI (or the stem) changed: swap it in. Audio that
             // arrives meanwhile is dropped by the catch-up below.
             val want = Models.current(this)
-            if (want != null && want.file.path != engineModel) {
+            if (want != null && want.file.path != engineModel && !restemBusy) {
                 model = want
                 if (!load(model)) return
                 restemLoop(model)
                 hop = Native.engineHop(engine)
+                buf = FloatArray(2 * hop)
+                fill = 0
+            }
+            // A loop to separate: while only capturing, on its own thread, so capture
+            // (and listening ahead) carries on; the engine is free meanwhile. The
+            // separator below waits for it before using the engine again.
+            if (restemWanted && !restemBusy) {
+                restemWanted = false
+                restemBusy = true
+                val m = model
+                val work = {
+                    try { restemLoop(m, full = false) } finally {
+                        if (!restemWanted) clipIsMix = false
+                        restemBusy = false
+                    }
+                }
+                if (Control.stemsOnLoop) thread(name = "stemflow-restem") {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+                    work()
+                } else work()
+            }
+            if (Control.stemsOnLoop) {
+                // Capture only: the chunk goes to the buffer and the speaker as it is
+                // (in the band's place, played at full level): no model, no lag.
+                val c = chunks.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                capturing = true
+                processed += c.size / 2
+                markAnchor(processed + chunks.size * (RATE / 10))
+                val z = FloatArray(c.size)
+                stems.put(Stems(z, c, z))
+                status = "%s · capturing\nStems only when looping\ninput %.0f dBFS".format(model.label, levelDb)
+                continue
+            }
+            if (restemBusy) { Thread.sleep(50); continue }
+            if (capturing) {
+                // back to separating: start the stream afresh
+                capturing = false
+                Native.engineReset(engine)
                 buf = FloatArray(2 * hop)
                 fill = 0
             }
@@ -729,18 +820,7 @@ class CaptureService : Service() {
                 processed += hop
                 // Where the player is now = the newest input received (this hop and any
                 // chunks queued after it), whose stems land `delay` frames later.
-                val ctl = NowPlaying.controller(this)
-                val song = ctl?.let { NowPlaying.song(it) }
-                val ms = ctl?.let { NowPlaying.positionMs(it) }
-                val why = when {
-                    ctl == null -> "no player session"
-                    song == null -> "${ctl.packageName}: no title"
-                    ms == null -> "${ctl.packageName}: no position"
-                    !NowPlaying.playing(ctl) -> "${ctl.packageName}: state ${ctl.playbackState?.state}"
-                    else -> null
-                }
-                if (why == null) anchor = Anchor(processed + chunks.size * (RATE / 10) + delayFrames, ms!!, song!!)
-                if (why != anchorWhy) { Log.i(TAG, "anchor: ${why ?: "${song?.title} @ $ms"}"); anchorWhy = why }
+                markAnchor(processed + chunks.size * (RATE / 10) + delayFrames)
                 val bass = FloatArray(2 * hop)
                 val band = FloatArray(2 * hop)
                 val second = FloatArray(2 * hop)
@@ -936,7 +1016,11 @@ class CaptureService : Service() {
                     // live block, at the same levels. Live blocks that have arrived are
                     // used up at the same pace (kept in the buffer, not played).
                     trackOffset = src - written
-                    Native.mixerMix(mixer, lb, lr, ls, 0, BLOCK, BLOCK, Control.bass, Control.band, Control.second, out)
+                    // the loop's copy is still the plain mix (or, after a loop, the
+                    // buffer is, while only capturing): play it as it is
+                    val plain = if (Native.looperIsPlaying(h)) clipIsMix else Control.stemsOnLoop
+                    if (plain) Native.mixerMix(mixer, lb, lr, ls, 0, BLOCK, BLOCK, 0f, 1f, 0f, out)
+                    else Native.mixerMix(mixer, lb, lr, ls, 0, BLOCK, BLOCK, Control.bass, Control.band, Control.second, out)
                     for (i in 0 until BLOCK) {
                         val c = CLICK_LEVEL * lc[i]
                         out[2 * i] = (out[2 * i] + c).coerceIn(-1f, 1f)
@@ -949,7 +1033,8 @@ class CaptureService : Service() {
                 } else {
                     if (avail < BLOCK) continue
                     val ahead = minOf(BLOCK, avail - BLOCK)
-                    Native.mixerMix(mixer, bass, band, sec, pos, BLOCK, ahead, Control.bass, Control.band, Control.second, out)
+                    if (Control.stemsOnLoop) Native.mixerMix(mixer, bass, band, sec, pos, BLOCK, ahead, 0f, 1f, 0f, out)
+                    else Native.mixerMix(mixer, bass, band, sec, pos, BLOCK, ahead, Control.bass, Control.band, Control.second, out)
                     trackOffset = played - written
                     pos += BLOCK
                     played += BLOCK
