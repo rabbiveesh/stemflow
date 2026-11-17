@@ -24,7 +24,7 @@ mod stream;
 mod stretch;
 
 use anyhow::{ensure, Result};
-use jni::objects::{JClass, JFloatArray, JString};
+use jni::objects::{JClass, JDoubleArray, JFloatArray, JString};
 use jni::sys::{jfloat, jfloatArray, jint, jlong};
 use jni::JNIEnv;
 use litert::{Accel, LiteRtBeatNet, LiteRtDemucs, LiteRtRoformer};
@@ -569,6 +569,64 @@ pub extern "system" fn Java_org_stemflow_app_Native_looperSetTimes(
     bar1: jni::sys::jdouble,
 ) {
     looper(h).set_times(start, end, bar1);
+}
+
+/// The beats around the loop for a bookmark: [a, b, bar line, meter, bpm, beat
+/// frames…] (indices into the beats), or empty without a loop.
+#[no_mangle]
+pub extern "system" fn Java_org_stemflow_app_Native_looperGrid<'l>(
+    env: JNIEnv<'l>,
+    _: JClass<'l>,
+    h: jlong,
+) -> jni::sys::jdoubleArray {
+    let v: Vec<f64> = looper(h)
+        .grid_around(2)
+        .map(|(beats, a, b, one, m, bpm)| {
+            let mut v = vec![a as f64, b as f64, one as f64, m as f64, bpm as f64];
+            v.extend(beats);
+            v
+        })
+        .unwrap_or_default();
+    match env.new_double_array(v.len() as i32) {
+        Ok(a) => {
+            let _ = env.set_double_array_region(&a, 0, &v);
+            a.into_raw()
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// A recalled bookmark's own grid (beat frames), looped from beat `a` to `b` with
+/// a bar line on beat `one`: no analysis.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_stemflow_app_Native_looperLay(
+    mut env: JNIEnv,
+    _: JClass,
+    h: jlong,
+    beats: JDoubleArray,
+    a: jint,
+    b: jint,
+    one: jint,
+    meter: jint,
+    bpm: jfloat,
+    feel: jfloat,
+) {
+    let n = env.get_array_length(&beats).unwrap_or(0) as usize;
+    let mut v = vec![0f64; n];
+    let _ = env.get_double_array_region(&beats, 0, &mut v);
+    let r = looper(h).lay(
+        v,
+        a.max(0) as usize,
+        b.max(0) as usize,
+        one.max(0) as usize,
+        meter.max(1) as usize,
+        bpm,
+        feel,
+    );
+    if let Err(e) = r {
+        throw(&mut env, e);
+    }
 }
 
 /// Frames pushed so far (the newest frame the buffer has).

@@ -511,6 +511,29 @@ fn loop_test(
         "found in {:.2}s: {:.1} bpm, {}/bar, {} bars, loop {:.3}s..{:.3}s ({:.3}s long), press at {at:.2}s",
         t.elapsed().as_secs_f32(), v.bpm, v.meter, v.bars, secs(v.start), secs(v.end), (v.end - v.start) / SAMPLE_RATE as f64
     );
+    // A bookmark's way back: keep the grid, lay it again without the network.
+    let (g, a, b, one, m, bpm) = lp.grid_around(2).unwrap();
+    let times = lp.times();
+    let t = Instant::now();
+    lp.lay(g, a, b, one, m, bpm, 1.0)?;
+    eprintln!(
+        "laid again in {:.3}s: times {}",
+        t.elapsed().as_secs_f32(),
+        if lp.times() == times {
+            "match"
+        } else {
+            "DIFFER"
+        }
+    );
+    let t = Instant::now();
+    lp.redecode(m, 1.0);
+    let w = lp.view(10).unwrap();
+    eprintln!(
+        "lazy redecode in {:.2}s: loop {:.3}s..{:.3}s",
+        t.elapsed().as_secs_f32(),
+        secs(w.start),
+        secs(w.end)
+    );
     // Re-stem with the same model: should give back nearly the same stems.
     let before = lp.clip_mix(v.start as i64, 44100);
     let (b0, _) = {

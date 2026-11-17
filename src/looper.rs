@@ -112,6 +112,7 @@ impl Ring {
 
 /// A copy of the analysed minute: the loop plays from it, so the ring can keep
 /// filling (or fill with the silence of a paused source) for as long as the loop plays.
+#[derive(Clone)]
 struct Clip {
     from: u64,
     data: Vec<i16>,
@@ -326,39 +327,8 @@ impl Looper {
     }
 
     fn find_inner(&self, press: u64, bars: usize, s: Settings) -> Result<()> {
-        // The newest minute: a copy to loop from, and its mono mix to analyse.
-        let clip = {
-            let ring = self.ring.lock().unwrap();
-            let to = ring.total;
-            let from = to
-                .saturating_sub((ANALYSE_S * RATE) as u64)
-                .max(ring.oldest());
-            let mut data = Vec::with_capacity(CH * (to - from) as usize);
-            for f in from..to {
-                let k = CH * (f as usize % ring.cap);
-                data.extend_from_slice(&ring.data[k..k + CH]);
-            }
-            Clip { from, data }
-        };
-        let from = clip.from;
-        let mono: Vec<f32> = (0..clip.frames())
-            .map(|i| {
-                let m = mixed(&clip.at(from as i64 + i as i64));
-                0.5 * (m[0] + m[1])
-            })
-            .collect();
-        ensure!(
-            mono.len() >= 6 * RATE,
-            "not enough audio yet ({:.0} s)",
-            mono.len() as f32 / RATE as f32
-        );
-        let mut x22 = Vec::with_capacity(mono.len() / 2 + 1);
-        Decimator::new().push(&mono, &mut x22);
-        let spect = self.mel.spect_any(&x22);
-        let (beat, down) = self.logits(&spect)?;
-        // 22.05 kHz sample k is stem frame from + 2k - delay
-        let origin = from as f64 - DECIM_DELAY as f64;
-        let an = Analysis { origin, beat, down };
+        let clip = self.snapshot();
+        let an = self.analyse(&clip)?;
         let mut st = self.state.lock().unwrap();
         st.settings = s;
         st.analysis = Some(an);
@@ -381,6 +351,110 @@ impl Looper {
         st.b = b;
         st.pos = 0;
         st.resync();
+        st.playing = true;
+        st.tail = None;
+        st.resync();
+        Ok(())
+    }
+
+    /// A copy of the newest minute of the buffer, to loop from.
+    fn snapshot(&self) -> Clip {
+        let ring = self.ring.lock().unwrap();
+        let to = ring.total;
+        let from = to
+            .saturating_sub((ANALYSE_S * RATE) as u64)
+            .max(ring.oldest());
+        let mut data = Vec::with_capacity(CH * (to - from) as usize);
+        for f in from..to {
+            let k = CH * (f as usize % ring.cap);
+            data.extend_from_slice(&ring.data[k..k + CH]);
+        }
+        Clip { from, data }
+    }
+
+    /// Beat This! over a clip's mono mix.
+    fn analyse(&self, clip: &Clip) -> Result<Analysis> {
+        let from = clip.from;
+        let mono: Vec<f32> = (0..clip.frames())
+            .map(|i| {
+                let m = mixed(&clip.at(from as i64 + i as i64));
+                0.5 * (m[0] + m[1])
+            })
+            .collect();
+        ensure!(
+            mono.len() >= 6 * RATE,
+            "not enough audio yet ({:.0} s)",
+            mono.len() as f32 / RATE as f32
+        );
+        let mut x22 = Vec::with_capacity(mono.len() / 2 + 1);
+        Decimator::new().push(&mono, &mut x22);
+        let spect = self.mel.spect_any(&x22);
+        let (beat, down) = self.logits(&spect)?;
+        // 22.05 kHz sample k is stem frame from + 2k - delay
+        let origin = from as f64 - DECIM_DELAY as f64;
+        Ok(Analysis { origin, beat, down })
+    }
+
+    /// The beats around the loop, `pad` bars either side, to keep with a bookmark:
+    /// (beat frames, the loop's ends and a bar line as indices into them, meter, bpm).
+    pub fn grid_around(&self, pad: usize) -> Option<(Vec<f64>, usize, usize, usize, usize, f32)> {
+        let st = self.state.lock().unwrap();
+        let g = st.grid.as_ref()?;
+        let lo = st.a.saturating_sub(pad * g.meter);
+        let hi = (st.b + pad * g.meter).min(g.beats.len() - 1);
+        let one = (st.a..=st.b).find(|&i| g.bar[i]).unwrap_or(st.a);
+        Some((
+            g.beats[lo..=hi].to_vec(),
+            st.a - lo,
+            st.b - lo,
+            one - lo,
+            g.meter,
+            g.bpm,
+        ))
+    }
+
+    /// Loop beats `a`..`b` of a grid kept from before (a recalled bookmark): no
+    /// analysis, only a copy of the buffer, which must hold the beats by now. The
+    /// network runs later only if the meter or feel is changed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lay(
+        &self,
+        beats: Vec<f64>,
+        a: usize,
+        b: usize,
+        one: usize,
+        meter: usize,
+        bpm: f32,
+        feel: f32,
+    ) -> Result<()> {
+        let meter = meter.max(1);
+        ensure!(a < b && b < beats.len(), "bad grid");
+        let clip = self.snapshot();
+        let (lo, hi) = (
+            clip.from as f64,
+            (clip.from as usize + clip.frames()) as f64,
+        );
+        ensure!(
+            beats[a] - XFADE as f64 >= lo && beats[b] <= hi,
+            "the loop isn't in the buffer"
+        );
+        let bar = (0..beats.len())
+            .map(|k| (k + meter - one % meter).is_multiple_of(meter))
+            .collect();
+        let mut st = self.state.lock().unwrap();
+        st.settings.meter = meter;
+        st.settings.feel = feel;
+        st.analysis = None;
+        st.clip = Some(clip);
+        st.grid = Some(Grid {
+            beats,
+            bar,
+            meter,
+            bpm,
+        });
+        st.a = a;
+        st.b = b;
+        st.pos = 0;
         st.playing = true;
         st.tail = None;
         st.resync();
@@ -443,6 +517,25 @@ impl Looper {
 
     /// Another meter or feel: re-decode, keeping the loop's end time and bar count.
     pub fn redecode(&self, meter: usize, feel: f32) {
+        // A laid grid has no analysis yet: run the network on its copy now.
+        let pending = {
+            let st = self.state.lock().unwrap();
+            if st.analysis.is_none() {
+                st.clip.clone()
+            } else {
+                None
+            }
+        };
+        if let Some(clip) = pending {
+            self.state.lock().unwrap().finding = true;
+            let an = self.analyse(&clip);
+            let mut st = self.state.lock().unwrap();
+            st.finding = false;
+            match an {
+                Ok(an) => st.analysis = Some(an),
+                Err(_) => return,
+            }
+        }
         let mut st = self.state.lock().unwrap();
         let Some(g) = &st.grid else { return };
         let (end, bars) = (
