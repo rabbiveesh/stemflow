@@ -112,6 +112,9 @@ class MainActivity : Activity() {
     private lateinit var pitchValue: TextView
     private lateinit var keepChip: Button
     private var loopBars = 4
+    /** What the loop edits step by: 0 a beat, 1 a bar, 2 a phrase (the loop's length). */
+    private var editUnit = 1
+    private val unitButtons = mutableListOf<Button>()
 
     // Bookmarks
     private lateinit var bookmarkCount: TextView
@@ -414,17 +417,33 @@ class MainActivity : Activity() {
             onEdges = { a, b -> edit(3, a, b, 0f); refreshLoop() }
             onBarOne = { i -> edit(5, i, 0, 0f); refreshLoop() }
         }
-        val nudge = row(
-            button("◀ beat") { edit(2, -1, 0, 0f) },
-            button("beat ▶") { edit(2, 1, 0, 0f) },
-            button("− bar") { loopBars = (loopBars - 1).coerceAtLeast(1); edit(4, loopBars, 0, 0f) },
-            button("+ bar") { loopBars += 1; edit(4, loopBars, 0, 0f) },
+        // Edit by a beat, a bar or a phrase (the loop's own length): the start, the
+        // whole loop, or the end, earlier or later.
+        val units = row(*listOf("Beat", "Bar", "Phrase").mapIndexed { i, s ->
+            button(s, chip = true) { editUnit = i }.also { it.setPadding(dp(4), 0, dp(4), 0); it.isSingleLine = true; unitButtons += it }
+        }.toTypedArray(), gap = 6)
+        val step = {
+            val h = CaptureService.looper
+            val v = if (h != 0L) Native.looperView(h, 1) else FloatArray(0)
+            if (v.size < 14) 0 else when (editUnit) {
+                0 -> 1
+                1 -> v[3].toInt().coerceAtLeast(1)
+                else -> (v[11] - v[10]).toInt()
+            }
+        }
+        val adj = { da: Int, db: Int -> CaptureService.adjust(this, da, db) }
+        fun pair(name: String, note: String, l: () -> Unit, r: () -> Unit) = column(
+            label(name.uppercase(), 11f, muted, bold = true).apply { gravity = Gravity.CENTER; layoutParams = lp(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT) },
+            margins(row(button("◀") { l() }, button("▶") { r() }, gap = 6), t = 6),
+            margins(label(note, 11f, muted).apply { gravity = Gravity.CENTER; layoutParams = lp(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT) }, t = 4),
+        ).apply { layoutParams = lp(0, LayoutParams.WRAP_CONTENT, 1f) }
+        val pairs = row(
+            pair("Start", "◀ longer · shorter ▶", { val u = step(); adj(-u, 0) }, { val u = step(); adj(u, 0) }),
+            pair("Move", "same length", { val u = step(); adj(-u, -u) }, { val u = step(); adj(u, u) }),
+            pair("End", "◀ shorter · longer ▶", { val u = step(); adj(0, -u) }, { val u = step(); adj(0, u) }),
+            gap = 8,
         )
-        val phrase = row(
-            button("◀ phrase") { CaptureService.previousPhrase(this) },
-            button("phrase ▶") { CaptureService.nextPhrase(this) },
-        )
-        loopEdit = column(margins(loopView, t = 12), margins(nudge, t = 12), margins(phrase, t = 8))
+        loopEdit = column(margins(loopView, t = 12), margins(units, t = 12), margins(pairs, t = 10))
         val loopCard = card(loopInfo, loopHint, loopEdit)
 
         val meters = listOf(0, 2, 3, 4, 5, 6, 7)
@@ -694,10 +713,20 @@ class MainActivity : Activity() {
             loopBars = v[4].toInt().coerceAtLeast(1)
         }
         for ((n, b) in grabButtons) style(b, has && v[0] > 0f && n == loopBars, false)
+        unitButtons.forEachIndexed { i, b -> style(b, i == editUnit, true) }
+        if (has && unitButtons.size == 3) {
+            val bars = ((v[11] - v[10]) / v[3].coerceAtLeast(1f)).let { Math.round(it) }
+            unitButtons[2].text = if (bars == 1) "1-bar phrase" else "$bars-bar phrase"
+        }
         val finding = v.size >= 2 && v[1] > 0f
         loopInfo.text = when {
-            has -> "%s · %d bar%s of %d/4".format(if (v[0] > 0f) "Looping" else "Kept", v[4].toInt(),
-                if (v[4].toInt() == 1) "" else "s", v[3].toInt())
+            has -> {
+                val m = v[3].toInt().coerceAtLeast(1)
+                val n = (v[11] - v[10]).toInt()
+                val (bars, extra) = n / m to n % m
+                "%s · %d bar%s%s of %d/4".format(if (v[0] > 0f) "Looping" else "Kept", bars, if (bars == 1) "" else "s",
+                    if (extra > 0) " + $extra beat" + (if (extra == 1) "" else "s") else "", m)
+            }
             finding -> "Finding the bars…"
             CaptureService.running -> if (h == 0L) "Loading the bar finder…" else "No loop yet"
             else -> "Switch isolation on under Stems"

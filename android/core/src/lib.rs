@@ -380,6 +380,7 @@ pub extern "system" fn Java_org_stemflow_app_Native_looperPush<'l>(
 /// Loop the `bars` bars ending at the bar line nearest stem frame `press`. Blocks for
 /// the analysis (a few seconds on the CPU); throws if no beat was found.
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_stemflow_app_Native_looperFind(
     mut env: JNIEnv,
     _: JClass,
@@ -388,11 +389,16 @@ pub extern "system" fn Java_org_stemflow_app_Native_looperFind(
     bars: jint,
     meter: jint,
     feel: jfloat,
+    bpm: jfloat,
 ) {
+    // `bpm` > 0: stay near this tempo (as decoded, before the feel), so a loop
+    // that is extended or moved keeps the beat it was found with
+    let d = beats::Settings::default();
     let s = beats::Settings {
         meter: meter.max(0) as usize,
         feel,
-        ..Default::default()
+        min_bpm: if bpm > 0.0 { bpm * 0.85 } else { d.min_bpm },
+        max_bpm: if bpm > 0.0 { bpm * 1.18 } else { d.max_bpm },
     };
     if let Err(e) = looper(h).find(press.max(0) as u64, bars.max(1) as usize, s) {
         throw(&mut env, e);
@@ -644,6 +650,19 @@ pub extern "system" fn Java_org_stemflow_app_Native_looperRecent<'l>(
         }
         Err(_) => std::ptr::null_mut(),
     }
+}
+
+/// Move the loop's start by `da` beats and its end by `db`: false if the buffer
+/// doesn't reach (see `Looper::nudge`).
+#[no_mangle]
+pub extern "system" fn Java_org_stemflow_app_Native_looperNudge(
+    _: JNIEnv,
+    _: JClass,
+    h: jlong,
+    da: jint,
+    db: jint,
+) -> jni::sys::jboolean {
+    looper(h).nudge(da as i64, db as i64) as jni::sys::jboolean
 }
 
 /// Frames pushed so far (the newest frame the buffer has).

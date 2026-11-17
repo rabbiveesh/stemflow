@@ -32,7 +32,7 @@ object Native {
     @JvmStatic external fun looperFree(h: Long)
     @JvmStatic external fun looperPush(h: Long, bass: FloatArray, band: FloatArray, second: FloatArray)
     /** Blocks for the analysis; throws if no beat was found. */
-    @JvmStatic external fun looperFind(h: Long, press: Long, bars: Int, meter: Int, feel: Float)
+    @JvmStatic external fun looperFind(h: Long, press: Long, bars: Int, meter: Int, feel: Float, bpm: Float = 0f)
     @JvmStatic external fun looperRead(
         h: Long, bass: FloatArray, band: FloatArray, second: FloatArray, click: FloatArray, n: Int, advance: Int,
     ): Long
@@ -48,6 +48,7 @@ object Native {
     @JvmStatic external fun looperSetTimes(h: Long, start: Double, end: Double, bar1: Double)
     @JvmStatic external fun looperGrid(h: Long): DoubleArray
     @JvmStatic external fun looperRecent(h: Long): FloatArray
+    @JvmStatic external fun looperNudge(h: Long, da: Int, db: Int): Boolean
     @JvmStatic external fun looperLay(h: Long, beats: DoubleArray, a: Int, b: Int, one: Int, meter: Int, bpm: Float, feel: Float)
     @JvmStatic fun looperIsPlaying(h: Long) = looperView(h, 1).let { it.isNotEmpty() && it[0] > 0f }
 }

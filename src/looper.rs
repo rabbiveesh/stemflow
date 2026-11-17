@@ -688,6 +688,28 @@ impl Looper {
         }
     }
 
+    /// Move the loop's start by `da` beats and its end by `db` (extend, trim or move
+    /// it), if the new ends are on beats the buffer has heard: false if not (an end
+    /// past the music, before the grid, or a start not before the end).
+    pub fn nudge(&self, da: i64, db: i64) -> bool {
+        let mut st = self.state.lock().unwrap();
+        let heard = st.clip.as_ref().map_or(0.0, |c| c.music_end() as f64);
+        let Some(g) = st.grid.as_ref() else {
+            return false;
+        };
+        let (a, b) = (st.a as i64 + da, st.b as i64 + db);
+        if a < 0 || b >= g.beats.len() as i64 || a >= b || g.beats[b as usize] > heard {
+            return false;
+        }
+        st.a = a as usize;
+        st.b = b as usize;
+        if da != 0 || st.pos >= self.loop_len(&st) {
+            st.pos = 0;
+        }
+        st.resync();
+        true
+    }
+
     /// `n` bars ending where the loop ends now.
     pub fn set_bars(&self, n: usize) {
         let mut st = self.state.lock().unwrap();

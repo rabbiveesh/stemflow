@@ -260,7 +260,7 @@ class CaptureService : Service() {
                 Native.looperLay(h, frames, b.a, b.b, b.one, b.meter, b.bpm, b.feel)
             } else {
                 loopStatus = "Finding the bars…"
-                Native.looperFind(h, a.frameOf(b.endMs), b.bars, b.meter, b.feel)
+                Native.looperFind(h, a.frameOf(b.endMs), b.bars, b.meter, b.feel, if (b.bpm > 0f) b.bpm / b.feel else 0f)
                 Native.looperSetTimes(h, a.frameOf(b.startMs).toDouble(), a.frameOf(b.endMs).toDouble(), a.frameOf(b.bar1Ms).toDouble())
                 // keep the beats now, so next time there's nothing to find
                 grid(h, a)?.let { Bookmarks.replace(c, b.withGrid(it)) }
@@ -376,44 +376,61 @@ class CaptureService : Service() {
             }
         }
 
-        /** Loop the phrase before this one (always still in the buffer). */
-        fun previousPhrase(c: Context) {
-            val h = looper
-            if (h == 0L) return
-            val v = Native.looperView(h, 1)
-            if (v.size < 14) return
-            Native.looperEdit(h, 2, -(v[11] - v[10]).toInt(), 0, 0f)
-            pauseAfterPhrase(c, h)
-        }
-
         /**
-         * Loop the phrase after this one: as many bars, from where the loop ends. If the
-         * buffer has it, straight away; else the player plays it (the loop keeps playing
-         * meanwhile). Placed by song time, as a recall is.
+         * Move the loop's start by `da` beats and its end by `db` (extend, trim, or
+         * move it: by a beat, a bar or a phrase). In the buffer, at once; an end past
+         * what has been heard is played first (the old loop keeps playing meanwhile)
+         * and placed by song time, keeping bar 1 where it was.
          */
-        fun nextPhrase(c: Context) {
+        fun adjust(c: Context, da: Int, db: Int) {
             val h = looper
-            if (h == 0L || !Native.looperIsPlaying(h)) return
+            if (h == 0L || !Native.looperIsPlaying(h) || (da == 0 && db == 0)) return
+            if (Native.looperNudge(h, da, db)) {
+                loopStatus = ""
+                if (db > 0) pauseAfterPhrase(c, h)
+                return
+            }
+            // trimming past the other end: nothing to fetch
+            if (da >= 0 && db <= 0) { loopStatus = "The loop can't get shorter than that"; return }
             val id = ++phraseId
-            thread(name = "stemflow-next") {
+            thread(name = "stemflow-adjust") {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
-                loopStatus = try { nextNow(c, h, id); "" } catch (e: Exception) {
-                    Log.e(TAG, "next phrase failed: ${e.message}"); e.message ?: "Couldn't get the next phrase"
+                loopStatus = try { streamTo(c, h, id, da, db); "" } catch (e: Exception) {
+                    Log.e(TAG, "adjust failed: ${e.message}"); e.message ?: "Couldn't get there"
                 }
             }
         }
 
-        private fun nextNow(c: Context, h: Long, id: Int) {
-            val (a0, r) = nextRange(h) ?: throw Exception("Next phrase needs notification access (to know where in the song this is)")
+        private fun streamTo(c: Context, h: Long, id: Int, da: Int, db: Int) {
+            val a0 = loopAnchor ?: throw Exception("Needs notification access (to know where in the song this is)")
             val t = Native.looperTimes(h)
-            Log.i(TAG, "next phrase from loop %.0f-%.0f via anchor %d@%d -> %d-%d ms".format(t[0], t[1], a0.frame, a0.songMs, r[0], r[1]))
-            loopStatus = "Next phrase: %s…".format(Bookmarks.time(r[0]))
-            val a = stream(c, h, id, a0.song, r[0] - 6_000, r[1] + 1_000) ?: return
+            val v = Native.looperView(h, 1)
+            if (t.size < 6 || v.size < 14) throw Exception("No loop")
+            val startMs = a0.msOf(t[0])
+            val endMs = a0.msOf(t[1])
+            val beatMs = (endMs - startMs).toDouble() / (v[11] - v[10]).coerceAtLeast(1f)
+            val newStart = startMs + (da * beatMs).toLong()
+            val newEnd = endMs + (db * beatMs).toLong()
+            // bar 1: where it was, moved with the start when that moves by whole bars
+            // (onto the new start itself if the loop started on bar 1)
+            val m = t[3].toInt().coerceAtLeast(1)
+            val bar1 = when {
+                da % m != 0 -> a0.msOf(t[2])
+                t[2] == t[0] -> newStart
+                else -> a0.msOf(t[2]) + (da * beatMs).toLong()
+            }
+            loopStatus = "Listening to %s–%s…".format(Bookmarks.time(newStart), Bookmarks.time(newEnd))
+            val a = stream(c, h, id, a0.song, minOf(newStart, bar1) - 6_000, newEnd + 1_000) ?: return
             loopStatus = "Finding the bars…"
-            Native.looperFind(h, a.frameOf(r[1]), t[4].toInt(), t[3].toInt(), t[5].toFloat())
-            Native.looperSetTimes(h, a.frameOf(r[0]).toDouble(), a.frameOf(r[1]).toDouble(), a.frameOf(r[0]).toDouble())
+            Native.looperFind(h, a.frameOf(newEnd), t[4].toInt(), t[3].toInt(), t[5].toFloat(), v[2] / t[5].toFloat())
+            Native.looperSetTimes(h, a.frameOf(newStart).toDouble(), a.frameOf(newEnd).toDouble(), a.frameOf(bar1).toDouble())
+            // the length in beats is what was asked for: count it from the start, so a
+            // slightly different tempo in the new analysis can't add or drop a beat
+            val beats = (v[11] - v[10]).toInt() + db - da
+            val w = Native.looperView(h, 1)
+            if (w.size >= 14 && beats > 0) Native.looperEdit(h, 3, w[10].toInt(), w[10].toInt() + beats, 0f)
             loopAnchor = a
-            Log.i(TAG, "next phrase: %s–%s".format(Bookmarks.time(r[0]), Bookmarks.time(r[1])))
+            Log.i(TAG, "loop now %s–%s".format(Bookmarks.time(newStart), Bookmarks.time(newEnd)))
             pauseAfterPhrase(c, h)
         }
 
