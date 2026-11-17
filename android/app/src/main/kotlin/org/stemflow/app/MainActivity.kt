@@ -690,7 +690,7 @@ class MainActivity : Activity() {
         val has = v.size >= 14
         loopEdit.visibility = if (has) View.VISIBLE else View.GONE
         if (has) {
-            loopView.update(v)
+            loopView.update(v, CaptureService.unheardFrames() * Control.speed)
             loopBars = v[4].toInt().coerceAtLeast(1)
         }
         for ((n, b) in grabButtons) style(b, has && v[0] > 0f && n == loopBars, false)

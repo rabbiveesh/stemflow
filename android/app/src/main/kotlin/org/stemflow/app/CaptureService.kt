@@ -79,17 +79,34 @@ class CaptureService : Service() {
         @Volatile private var track: AudioTrack? = null
         @Volatile private var trackOffset = 0L
 
-        /** The live stem frame being heard now (the AudioTrack's timestamp, so the device
-         * and Bluetooth delay are included), or -1. */
-        private fun heardFrame(): Long {
+        @Volatile private var writtenFrames = 0L
+
+        /** The track frame being heard now (its timestamp, so the device and Bluetooth
+         * delay are included), or -1. */
+        private fun heardTrackFrame(): Long {
             val t = track ?: return -1
             val ts = android.media.AudioTimestamp()
-            val f = if (t.getTimestamp(ts)) {
+            return if (t.getTimestamp(ts)) {
                 ts.framePosition + (System.nanoTime() - ts.nanoTime) * RATE / 1_000_000_000L
             } else {
                 t.playbackHeadPosition.toLong()
             }
-            return f + trackOffset
+        }
+
+        /** The live stem frame being heard now, or -1. */
+        private fun heardFrame(): Long {
+            val f = heardTrackFrame()
+            return if (f < 0) -1 else f + trackOffset
+        }
+
+        /**
+         * Frames written to the speaker but not heard yet: the track's buffer, the
+         * device, and on Bluetooth the headphones' delay. The screen draws the playhead
+         * this far behind where the loop is being read.
+         */
+        fun unheardFrames(): Long {
+            val f = heardTrackFrame()
+            return if (f < 0) 0 else (writtenFrames - f).coerceIn(0, 2L * RATE)
         }
 
         /**
@@ -713,7 +730,7 @@ class CaptureService : Service() {
                     model.label, if (source == "helper") "helper" else "screen capture",
                     computeS, hopS, latency, if (skipped > 0) " · skipped $skipped" else "", levelDb,
                 )
-                Log.i(TAG, "run %.3fs late=%d skipped=%d in=%.1fdBFS %s".format(computeS, late, skipped, levelDb, Control.describe()))
+                Log.i(TAG, "run %.3fs late=%d skipped=%d in=%.1fdBFS unheard=%d ms %s".format(computeS, late, skipped, levelDb, unheardFrames() * 1000 / RATE, Control.describe()))
             }
         }
     }
@@ -907,6 +924,7 @@ class CaptureService : Service() {
                 }
                 written += BLOCK
                 track.write(out, 0, out.size, AudioTrack.WRITE_BLOCKING)
+                writtenFrames = written
             }
         } finally {
             CaptureService.track = null

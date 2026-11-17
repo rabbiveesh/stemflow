@@ -37,8 +37,14 @@ class LoopView(c: Context) : View(c) {
     private var drag = 0
     private var dragBeat = -1
 
-    fun update(view: FloatArray) {
+    /** Loop frames between where the loop is read and what is heard (see `update`). */
+    private var lag = 0f
+
+    /** `lag`: how far (in loop frames) the sound reaching the ears trails the read
+     * position, so the playhead follows the ears, not the buffer (Bluetooth!). */
+    fun update(view: FloatArray, lag: Float = 0f) {
         v = view
+        this.lag = lag
         invalidate()
     }
 
@@ -144,7 +150,11 @@ class LoopView(c: Context) : View(c) {
             cv.drawCircle(px, h - 8 * d, 7 * d, edge)
         }
         if (v[0] > 0f) {
-            val ph = x(v[9])
+            // what's heard: `lag` back from the read position, wrapped into the loop
+            val (s0, e0) = v[7] to v[8]
+            val len = e0 - s0
+            val back = if (len > 0f) (((v[9] - lag - s0) % len) + len) % len else v[9] - s0
+            val ph = x(s0 + back)
             cv.drawLine(ph, 0f, ph, h, head)
         }
     }
