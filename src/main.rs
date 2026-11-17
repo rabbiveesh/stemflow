@@ -62,6 +62,16 @@ enum Cmd {
         #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
         semis: f32,
     },
+    /// Beat-track the last minute of a WAV file (44.1 kHz stereo) as the looper does,
+    /// and print what the decoder saw: tempo, meter scores, bar lines.
+    Beats {
+        #[command(flatten)]
+        opts: Opts,
+        input: PathBuf,
+        /// Beats per bar (0 = choose)
+        #[arg(long, default_value_t = 0)]
+        meter: usize,
+    },
     /// List the models in the models folder (* = the one live mode last used).
     Models {
         #[arg(long, default_value = "models")]
@@ -383,6 +393,41 @@ fn main() -> Result<()> {
                     Ok((wrap(&opts, load_model(&opts, &m)?)?, m.target, m.second))
                 };
             audio::live(st, ctl, tracker, &grab, output, slack, load)
+        }
+        Cmd::Beats { opts, input, meter } => {
+            let r = hound::WavReader::open(&input)?;
+            let spec = r.spec();
+            anyhow::ensure!(
+                spec.sample_rate == SAMPLE_RATE && spec.channels == 2,
+                "need 44.1 kHz stereo"
+            );
+            let x: Vec<f32> = match spec.sample_format {
+                hound::SampleFormat::Float => r.into_samples::<f32>().collect::<Result<_, _>>()?,
+                hound::SampleFormat::Int => {
+                    let k = 1.0 / (1u64 << (spec.bits_per_sample - 1)) as f32;
+                    r.into_samples::<i32>()
+                        .map(|v| v.map(|v| v as f32 * k))
+                        .collect::<Result<_, _>>()?
+                }
+            };
+            let net = beats::BeatNet::load(
+                model::runtime(opts.device)?,
+                &opts.models.join(&opts.beats),
+                opts.beat_threads,
+                opts.device == Device::Cuda,
+            )?;
+            let lp = looper::Looper::new(Box::new(net));
+            let zeros = vec![0f32; 2 * 4096];
+            for c in x.chunks(2 * 4096) {
+                lp.push(c, &zeros[..c.len()], &[]);
+            }
+            let s = beats::Settings {
+                meter,
+                ..Default::default()
+            };
+            lp.find(lp.total(), 4, s)?;
+            println!("{}", lp.explain());
+            Ok(())
         }
         Cmd::Models { models } => {
             let cur = control::load_model();

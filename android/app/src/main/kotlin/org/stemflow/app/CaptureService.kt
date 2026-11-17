@@ -499,6 +499,21 @@ class CaptureService : Service() {
             if (i.hasExtra("karaoke")) Control.setTarget(c, if (i.getBooleanExtra("karaoke", false)) "vocals" else "bass")
             i.getStringExtra("stem")?.let { if (it in Models.STEMS) Control.setTarget(c, it) }
             i.getStringExtra("snap")?.let { Control.snap(it) }
+            // debugging: the player to this song position (ms), playing
+            i.getStringExtra("seek")?.toLongOrNull()?.let { ms ->
+                NowPlaying.controller(c)?.transportControls?.run { seekTo(ms); play() }
+            }
+            // debugging: the looper's newest minute as raw f32 stereo, 44.1 kHz
+            i.getStringExtra("dump")?.let {
+                val h = looper
+                if (h != 0L) thread {
+                    val v = Native.looperRecent(h)
+                    val b = java.nio.ByteBuffer.allocate(4 * v.size).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                    b.asFloatBuffer().put(v)
+                    java.io.File(c.filesDir, "recent.f32").writeBytes(b.array())
+                    Log.i(TAG, "dumped %.1f s".format(v.size / 2.0 / RATE))
+                }
+            }
             if (i.hasExtra("balance")) Control.setBalance(i.getFloatExtra("balance", 0f))
             if (i.hasExtra("bass") || i.hasExtra("band")) {
                 Control.setLevels(i.getFloatExtra("bass", Control.bass), i.getFloatExtra("band", Control.band))

@@ -405,6 +405,26 @@ impl Looper {
         Ok(Analysis { origin, beat, down })
     }
 
+    /// The newest minute as heard (the stems mixed back), interleaved stereo: for
+    /// debugging the beat tracker on what the phone captured.
+    pub fn recent_mix(&self) -> Vec<f32> {
+        let clip = self.snapshot();
+        let mut out = Vec::with_capacity(2 * clip.frames());
+        for i in 0..clip.frames() {
+            let m = mixed(&clip.at(clip.from as i64 + i as i64));
+            out.extend_from_slice(&m);
+        }
+        out
+    }
+
+    /// The decoder's view of the last analysis (see `beats::explain`).
+    pub fn explain(&self) -> String {
+        let st = self.state.lock().unwrap();
+        st.analysis.as_ref().map_or_else(String::new, |an| {
+            beats::explain(&an.beat, &an.down, &st.settings)
+        })
+    }
+
     /// The beats around the loop, `pad` bars either side, to keep with a bookmark:
     /// (beat frames, the loop's ends and a bar line as indices into them, meter, bpm).
     pub fn grid_around(&self, pad: usize) -> Option<(Vec<f64>, usize, usize, usize, usize, f32)> {

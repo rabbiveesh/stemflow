@@ -629,6 +629,23 @@ pub extern "system" fn Java_org_stemflow_app_Native_looperLay(
     }
 }
 
+/// The newest minute, mixed back to stereo (debugging: `--es dump 1`).
+#[no_mangle]
+pub extern "system" fn Java_org_stemflow_app_Native_looperRecent<'l>(
+    env: JNIEnv<'l>,
+    _: JClass<'l>,
+    h: jlong,
+) -> jfloatArray {
+    let v = looper(h).recent_mix();
+    match env.new_float_array(v.len() as i32) {
+        Ok(a) => {
+            let _ = env.set_float_array_region(&a, 0, &v);
+            a.into_raw()
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Frames pushed so far (the newest frame the buffer has).
 #[no_mangle]
 pub extern "system" fn Java_org_stemflow_app_Native_looperTotal(
