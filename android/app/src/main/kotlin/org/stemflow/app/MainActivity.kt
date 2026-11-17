@@ -420,7 +420,11 @@ class MainActivity : Activity() {
             button("− bar") { loopBars = (loopBars - 1).coerceAtLeast(1); edit(4, loopBars, 0, 0f) },
             button("+ bar") { loopBars += 1; edit(4, loopBars, 0, 0f) },
         )
-        loopEdit = column(margins(loopView, t = 12), margins(nudge, t = 12))
+        val phrase = row(
+            button("◀ phrase") { CaptureService.previousPhrase(this) },
+            button("phrase ▶") { CaptureService.nextPhrase(this) },
+        )
+        loopEdit = column(margins(loopView, t = 12), margins(nudge, t = 12), margins(phrase, t = 8))
         val loopCard = card(loopInfo, loopHint, loopEdit)
 
         val meters = listOf(0, 2, 3, 4, 5, 6, 7)

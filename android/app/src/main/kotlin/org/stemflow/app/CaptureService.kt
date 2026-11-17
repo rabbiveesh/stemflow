@@ -212,9 +212,12 @@ class CaptureService : Service() {
             val last = if (own) b.beats.last().toLong() else b.endMs
             val runUp = if (own) 4_000L else 12_000L
             val seekTo = (first - runUp).coerceAtLeast(0)
+            phraseId++
             ctl.transportControls.seekTo(seekTo)
             ctl.transportControls.play()
             val since = System.nanoTime()
+            streamSince = since
+            streamFromMs = seekTo
             // an anchor after the seek that has passed the end of what's needed
             val until = System.currentTimeMillis() + 60_000
             var a: Anchor
@@ -246,7 +249,7 @@ class CaptureService : Service() {
                 grid(h, a)?.let { Bookmarks.replace(c, b.withGrid(it)) }
             }
             loopAnchor = a
-            mediaKey(c, KeyEvent.KEYCODE_MEDIA_PAUSE)
+            pauseAfterPhrase(c, h)
             Log.i(TAG, "recalled %s".format(b.name))
         }
 
@@ -281,8 +284,125 @@ class CaptureService : Service() {
             for (a in intArrayOf(KeyEvent.ACTION_DOWN, KeyEvent.ACTION_UP)) am.dispatchMediaKeyEvent(KeyEvent(a, code))
         }
 
+        /**
+         * The buffer holds the song unbroken since our last seek or play (`streamSince`,
+         * nanoTime) from `streamFromMs`: frames there map to song time by the anchor.
+         * A pause breaks it (silence goes into the buffer meanwhile), so phrases are
+         * found by song time, never by buffer position.
+         */
+        @Volatile private var streamSince = 0L
+        @Volatile private var streamFromMs = 0L
+        /** Bumped to call off whatever phrase work is running. */
+        @Volatile private var phraseId = 0
+
+        /** The anchor mapping song ms [from, to] into the buffer, if it's all there. */
+        private fun covering(h: Long, song: NowPlaying.Song, from: Long, to: Long): Anchor? {
+            val x = anchor ?: return null
+            if (x.at < streamSince || !x.song.same(song) || from < streamFromMs || x.songMs < to) return null
+            val total = Native.looperTotal(h)
+            // inside the newest minute, which is what gets analysed
+            if (total < x.frameOf(to) || x.frameOf(from) < total - 55L * RATE) return null
+            return x
+        }
+
+        /**
+         * Have the buffer hold song ms [from, to]: wait if the player is already playing
+         * through it, else seek there and play. Null if called off (or the loop stopped).
+         */
+        private fun stream(c: Context, h: Long, id: Int, song: NowPlaying.Song, from: Long, to: Long): Anchor? {
+            covering(h, song, from, to)?.let { return it }
+            val ctl = NowPlaying.controller(c) ?: throw Exception("No player found")
+            val x = anchor
+            val onTheWay = NowPlaying.playing(ctl) && x != null && x.at >= streamSince && x.song.same(song) &&
+                from >= streamFromMs && x.songMs <= to
+            if (!onTheWay) {
+                val seekTo = from.coerceAtLeast(0)
+                streamSince = System.nanoTime()
+                streamFromMs = seekTo
+                ctl.transportControls.seekTo(seekTo)
+                ctl.transportControls.play()
+            }
+            val until = System.currentTimeMillis() + 60_000
+            while (true) {
+                if (id != phraseId || !running || !Native.looperIsPlaying(h)) return null
+                if (System.currentTimeMillis() > until) throw Exception("Timed out waiting for the music")
+                covering(h, song, from, to)?.let { return it }
+                Thread.sleep(200)
+            }
+        }
+
+        /** The next phrase in song ms: [the loop's end, + its length], or null. */
+        private fun nextRange(h: Long): Pair<Anchor, LongArray>? {
+            val a0 = loopAnchor ?: return null
+            val t = Native.looperTimes(h)
+            if (t.size < 6) return null
+            val end = a0.msOf(t[1])
+            return a0 to longArrayOf(end, end + (end - a0.msOf(t[0])))
+        }
+
+        /**
+         * With a loop set: let the source play on (unheard: the loop is what plays)
+         * until the buffer has the next phrase, then pause it, so "Next phrase" finds
+         * it there. The source is paused straight away without song positions.
+         */
+        private fun pauseAfterPhrase(c: Context, h: Long) {
+            val id = ++phraseId
+            val (a0, r) = nextRange(h) ?: run { mediaKey(c, KeyEvent.KEYCODE_MEDIA_PAUSE); return }
+            thread(name = "stemflow-prefetch") {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
+                try {
+                    if (stream(c, h, id, a0.song, r[0] - 6_000, r[1] + 1_000) != null) Log.i(TAG, "next phrase buffered")
+                } catch (e: Exception) {
+                    Log.i(TAG, "prefetch: ${e.message}")
+                }
+                if (id == phraseId && Native.looperIsPlaying(h)) mediaKey(c, KeyEvent.KEYCODE_MEDIA_PAUSE)
+            }
+        }
+
+        /** Loop the phrase before this one (always still in the buffer). */
+        fun previousPhrase(c: Context) {
+            val h = looper
+            if (h == 0L) return
+            val v = Native.looperView(h, 1)
+            if (v.size < 14) return
+            Native.looperEdit(h, 2, -(v[11] - v[10]).toInt(), 0, 0f)
+            pauseAfterPhrase(c, h)
+        }
+
+        /**
+         * Loop the phrase after this one: as many bars, from where the loop ends. If the
+         * buffer has it, straight away; else the player plays it (the loop keeps playing
+         * meanwhile). Placed by song time, as a recall is.
+         */
+        fun nextPhrase(c: Context) {
+            val h = looper
+            if (h == 0L || !Native.looperIsPlaying(h)) return
+            val id = ++phraseId
+            thread(name = "stemflow-next") {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
+                loopStatus = try { nextNow(c, h, id); "" } catch (e: Exception) {
+                    Log.e(TAG, "next phrase failed: ${e.message}"); e.message ?: "Couldn't get the next phrase"
+                }
+            }
+        }
+
+        private fun nextNow(c: Context, h: Long, id: Int) {
+            val (a0, r) = nextRange(h) ?: throw Exception("Next phrase needs notification access (to know where in the song this is)")
+            val t = Native.looperTimes(h)
+            Log.i(TAG, "next phrase from loop %.0f-%.0f via anchor %d@%d -> %d-%d ms".format(t[0], t[1], a0.frame, a0.songMs, r[0], r[1]))
+            loopStatus = "Next phrase: %s…".format(Bookmarks.time(r[0]))
+            val a = stream(c, h, id, a0.song, r[0] - 6_000, r[1] + 1_000) ?: return
+            loopStatus = "Finding the bars…"
+            Native.looperFind(h, a.frameOf(r[1]), t[4].toInt(), t[3].toInt(), t[5].toFloat())
+            Native.looperSetTimes(h, a.frameOf(r[0]).toDouble(), a.frameOf(r[1]).toDouble(), a.frameOf(r[0]).toDouble())
+            loopAnchor = a
+            Log.i(TAG, "next phrase: %s–%s".format(Bookmarks.time(r[0]), Bookmarks.time(r[1])))
+            pauseAfterPhrase(c, h)
+        }
+
         /** Back from a loop to the live stream: stop the loop and un-pause the source. */
         fun goLive(c: Context) {
+            phraseId++
             val h = looper
             if (h != 0L && Native.looperIsPlaying(h)) {
                 Native.looperEdit(h, 0, 0, 0, 0f)
@@ -306,6 +426,8 @@ class CaptureService : Service() {
             val press = heardFrame()
             if (press < 0) return
             loopAnchor = anchor
+            streamSince = 0L // live up to now: unbroken, as far as we know
+            streamFromMs = 0L
             Log.i(TAG, "loop pressed: anchor %s".format(anchor?.let { "${it.song.title} @ ${it.songMs}" }))
             loopStatus = "Finding the bars…"
             thread(name = "stemflow-find") {
@@ -314,7 +436,7 @@ class CaptureService : Service() {
                 loopStatus = try {
                     Native.looperFind(h, press, bars, Control.meter, Control.feel)
                     Log.i(TAG, "loop found in %.2f s".format((System.nanoTime() - t) / 1e9))
-                    mediaKey(c, KeyEvent.KEYCODE_MEDIA_PAUSE)
+                    pauseAfterPhrase(c, h)
                     ""
                 } catch (e: Throwable) {
                     Log.e(TAG, "loop failed: ${e.message}")

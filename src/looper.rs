@@ -123,6 +123,16 @@ impl Clip {
         self.data.len() / CH
     }
 
+    /// The frame after the last one with any sound: a paused source leaves exact
+    /// zeros at the end of the buffer.
+    fn music_end(&self) -> u64 {
+        let n = self.frames();
+        let last = (0..n)
+            .rev()
+            .find(|&i| self.data[CH * i..CH * (i + 1)].iter().any(|&x| x != 0));
+        self.from + last.map_or(0, |i| i as u64 + 1)
+    }
+
     fn at(&self, f: i64) -> Frame {
         let i = f - self.from as i64;
         if i < 0 || i as usize >= self.frames() {
@@ -459,6 +469,63 @@ impl Looper {
         st.tail = None;
         st.resync();
         Ok(())
+    }
+
+    /// The phrase after the loop: as many beats, starting where the loop ends, with a
+    /// bar line there. The buffer must have heard all of it (it can, if the source
+    /// played on after the loop was made); then the newest minute is analysed again
+    /// and the loop moves. Ok(false) if the buffer doesn't reach far enough yet.
+    pub fn next_phrase(&self) -> Result<bool> {
+        let (end, span, len, meter) = {
+            let st = self.state.lock().unwrap();
+            let Some(g) = st.grid.as_ref() else {
+                return Ok(false);
+            };
+            (
+                g.beats[st.b],
+                g.beats[st.b] - g.beats[st.a],
+                st.b - st.a,
+                g.meter,
+            )
+        };
+        let clip = self.snapshot();
+        let heard = clip.music_end() as f64;
+        if end + span + 0.3 * RATE as f64 > heard {
+            return Ok(false);
+        }
+        self.state.lock().unwrap().finding = true;
+        let an = self.analyse(&clip);
+        let mut st = self.state.lock().unwrap();
+        st.finding = false;
+        let an = an?;
+        st.settings.meter = meter;
+        st.analysis = Some(an);
+        st.clip = Some(clip);
+        self.decode(&mut st);
+        let g = st.grid.as_mut().unwrap();
+        let a = (0..g.beats.len())
+            .min_by(|&i, &j| {
+                (g.beats[i] - end)
+                    .abs()
+                    .total_cmp(&(g.beats[j] - end).abs())
+            })
+            .unwrap_or(0);
+        let b = a + len;
+        ensure!(
+            b < g.beats.len() && g.beats[b] <= heard,
+            "the next phrase isn't in the buffer"
+        );
+        let m = g.meter;
+        for (k, f) in g.bar.iter_mut().enumerate() {
+            *f = (k + m - a % m).is_multiple_of(m);
+        }
+        st.a = a;
+        st.b = b;
+        st.pos = 0;
+        st.playing = true;
+        st.tail = None;
+        st.resync();
+        Ok(true)
     }
 
     /// Network over a spectrogram of any length: 1500-frame chunks overlapping by the

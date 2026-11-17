@@ -534,6 +534,35 @@ fn loop_test(
         secs(w.start),
         secs(w.end)
     );
+    // Next phrase: not heard yet, so no move; then play on (as the source does
+    // after a loop is made) and move.
+    let (t0, t1) = lp.times().map(|t| (t.0, t.1)).unwrap();
+    eprintln!(
+        "next phrase before hearing it: moved = {}",
+        lp.next_phrase()?
+    );
+    let more = (t1 + (t1 - t0)) as u64 + SAMPLE_RATE as u64;
+    for chunk in x[2 * played as usize..].chunks_exact(2 * hop) {
+        if played >= more {
+            break;
+        }
+        let st = s.process(chunk)?;
+        lp.push(
+            &st.bass,
+            &st.band,
+            st.extra.first().map_or(&[][..], |v| &v[..]),
+        );
+        played += hop as u64;
+    }
+    let t = Instant::now();
+    let moved = lp.next_phrase()?;
+    let (n0, n1) = lp.times().map(|t| (t.0, t.1)).unwrap();
+    eprintln!(
+        "next phrase in {:.2}s: moved = {moved}, {:.3}s..{:.3}s (was {:.3}s..{:.3}s; starts {:+.0} ms from the old end, length {:+.0} ms)",
+        t.elapsed().as_secs_f32(), secs(n0), secs(n1), secs(t0), secs(t1),
+        (n0 - t1) * 1000.0 / SAMPLE_RATE as f64,
+        ((n1 - n0) - (t1 - t0)) * 1000.0 / SAMPLE_RATE as f64
+    );
     // Re-stem with the same model: should give back nearly the same stems.
     let before = lp.clip_mix(v.start as i64, 44100);
     let (b0, _) = {
