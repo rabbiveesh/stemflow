@@ -12,10 +12,15 @@
 //! so the useful quiet range isn't crammed into the bottom of the slider.
 //! The target can also be boosted past full, up to `MAX_BASS` (200% = twice as loud,
 //! +10 dB); the player's limiter keeps the louder mix from clipping.
+//!
+//! A model with a second stem (`bsrofo_sw_bass+vocals`) adds a third level of its own
+//! (D-Bus `Second` names the stem, `SecondLevel` sets it, 0..1): bass, vocals and the
+//! band (everything else) are then three plain levels, and "Band" no longer includes
+//! the vocals. The one-line balance still moves bass against band only.
 
 use anyhow::Result;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Highest target level: 2.0 sounds twice as loud as the original (+10 dB).
@@ -48,9 +53,18 @@ pub struct Control {
     generation: AtomicU64,
     bass: AtomicU32,
     band: AtomicU32,
+    /// A two-stem model's second stem ("vocals") and its loudness (0..1).
+    second: Mutex<Option<&'static str>>,
+    second_level: AtomicU32,
     /// Latest model run time in microseconds, and how many runs overran the hop.
     pub compute_us: AtomicU64,
     pub overruns: AtomicU64,
+    /// Beat click (src/beats.rs): on/off, beats per bar (0 = auto), feel (0.5 half
+    /// time, 1, 2 double time), and what the tracker last found ("" = nothing yet).
+    click: AtomicBool,
+    meter: AtomicU32,
+    feel: AtomicU32,
+    beats: Mutex<String>,
 }
 
 fn level(v: f32, max: f32) -> f32 {
@@ -68,10 +82,66 @@ impl Control {
             ..Default::default()
         };
         c.set_levels(bass, band);
+        c.set_second_level(1.0);
         Arc::new(c)
     }
     pub fn target(&self) -> &'static str {
         *self.target.lock().unwrap()
+    }
+    pub fn second(&self) -> Option<&'static str> {
+        *self.second.lock().unwrap()
+    }
+    pub fn set_second(&self, second: Option<&'static str>) {
+        *self.second.lock().unwrap() = second;
+    }
+    pub fn second_level(&self) -> f32 {
+        f32::from_bits(self.second_level.load(Ordering::Relaxed))
+    }
+    pub fn set_second_level(&self, v: f32) {
+        self.second_level
+            .store(level(v, 1.0).to_bits(), Ordering::Relaxed);
+    }
+    /// What the remembered levels are filed under: the target, or "bass+vocals".
+    pub fn levels_key(&self) -> String {
+        match self.second() {
+            Some(s) => format!("{}+{s}", self.target()),
+            None => self.target().to_string(),
+        }
+    }
+    pub fn click(&self) -> bool {
+        self.click.load(Ordering::Relaxed)
+    }
+    pub fn meter(&self) -> u32 {
+        self.meter.load(Ordering::Relaxed)
+    }
+    pub fn feel(&self) -> f32 {
+        match f32::from_bits(self.feel.load(Ordering::Relaxed)) {
+            f if f == 0.5 || f == 2.0 => f,
+            _ => 1.0,
+        }
+    }
+    pub fn set_beat_options(&self, click: bool, meter: u32, feel: f32) {
+        self.click.store(click, Ordering::Relaxed);
+        self.meter.store(meter.min(12), Ordering::Relaxed);
+        let feel = if feel == 0.5 || feel == 2.0 {
+            feel
+        } else {
+            1.0
+        };
+        self.feel.store(feel.to_bits(), Ordering::Relaxed);
+        save_beat_options(self);
+    }
+    pub fn beats(&self) -> String {
+        self.beats.lock().unwrap().clone()
+    }
+    /// For the beat thread: tempo and meter found, announced over D-Bus when it changes.
+    pub fn set_beats(&self, s: String) {
+        let mut b = self.beats.lock().unwrap();
+        if *b != s {
+            *b = s;
+            drop(b);
+            self.generation.fetch_add(1, Ordering::Relaxed);
+        }
     }
     pub fn model(&self) -> String {
         self.model.lock().unwrap().clone()
@@ -95,18 +165,25 @@ impl Control {
     pub fn take_request(&self) -> Option<String> {
         self.want.lock().unwrap().take()
     }
-    /// For the audio thread: the switch to `id` worked. A new target brings back the
-    /// levels last used with it.
-    pub fn switched(&self, id: &str, target: &'static str) {
+    /// For the audio thread: the switch to `id` worked. A new target (or second
+    /// stem) brings back the levels last used with it.
+    pub fn switched(&self, id: &str, target: &'static str, second: Option<&'static str>) {
         self.set_model(id);
         save_model(id);
-        let old = std::mem::replace(&mut *self.target.lock().unwrap(), target);
-        if old != target {
-            match load_levels(target) {
-                Some((a, b)) => self.set_levels(a, b),
+        let old = self.levels_key();
+        *self.target.lock().unwrap() = target;
+        self.set_second(second);
+        let key = self.levels_key();
+        if old != key {
+            // a two-stem model the first time: start from the target's own levels
+            match load_levels(&key).or_else(|| load_levels(target)) {
+                Some((a, b, c)) => {
+                    self.set_levels(a, b);
+                    self.set_second_level(c.unwrap_or(1.0));
+                }
                 // first time with vocals, horns, ...: start with them out (play-along)
                 None if target != "bass" => self.set_balance(1.0),
-                None => {}
+                None => self.set_second_level(1.0),
             }
         }
         self.set_status(String::new());
@@ -132,6 +209,37 @@ impl Control {
     pub fn gains(&self) -> (f32, f32) {
         let (a, b) = self.levels();
         (loudness_to_gain(a), loudness_to_gain(b))
+    }
+    /// (bass, band, second stem) gains. Without a second stem the third is unused.
+    pub fn gains3(&self) -> (f32, f32, f32) {
+        let (a, b) = self.gains();
+        (a, b, loudness_to_gain(self.second_level()))
+    }
+    /// Jump to a named mix ("solo", "full", "nobass", "novocals"); `None` if unknown.
+    /// One stem: "nobass" and "novocals" both mean "remove the target", so existing
+    /// hotkeys keep working in karaoke. Two stems: each names exactly what it says.
+    pub fn snap(&self, name: &str) -> Option<()> {
+        let boost = self.levels().0.max(1.0);
+        if self.second().is_none() {
+            let b = match name {
+                "solo" => -1.0,
+                "full" => 0.0,
+                "nobass" | "remove" | "novocals" => 1.0,
+                _ => return None,
+            };
+            self.set_balance(b);
+            return Some(());
+        }
+        let (bass, band, second) = match name {
+            "solo" => (boost, 0.0, 0.0),
+            "full" => (boost, 1.0, 1.0),
+            "nobass" => (0.0, 1.0, 1.0),
+            "novocals" | "remove" => (boost, 1.0, 0.0),
+            _ => return None,
+        };
+        self.set_levels(bass, band);
+        self.set_second_level(second);
+        Some(())
     }
     /// Balance in [-1, 1]. When both are below full (advanced mode), the quieter one
     /// decides which half of the slider it shows on.
@@ -161,7 +269,7 @@ impl Control {
         let pct = |p: f32| (p * 100.0).round() as i32;
         let t = self.target();
         let tc = format!("{}{}", t[..1].to_uppercase(), &t[1..]);
-        match (pct(bass), pct(band)) {
+        let main = match (pct(bass), pct(band)) {
             (100, 0) => format!("{tc} solo"),
             (a, 0) if a > 100 => format!("{tc} solo · {a}%"),
             (100, 100) => "Full mix".into(),
@@ -169,6 +277,36 @@ impl Control {
             (100, b) => format!("Band {b}%"),
             (a, 100) => format!("{tc} {a}%"),
             (a, b) => format!("{tc} {a}% · Band {b}%"),
+        };
+        let Some(v) = self.second() else {
+            return main;
+        };
+        // Three plain levels: name the solo, else whatever isn't at 100%.
+        let cap = |s: &str| format!("{}{}", s[..1].to_uppercase(), &s[1..]);
+        let parts = [
+            (t.to_string(), pct(bass)),
+            (v.to_string(), pct(self.second_level())),
+            ("band".to_string(), pct(band)),
+        ];
+        let playing: Vec<_> = parts.iter().filter(|(_, p)| *p > 0).collect();
+        if let [(name, p)] = playing.as_slice() {
+            return match *p {
+                100 => format!("{} solo", cap(name)),
+                p => format!("{} solo · {p}%", cap(name)),
+            };
+        }
+        let rest: Vec<String> = parts
+            .iter()
+            .filter(|(_, p)| *p != 100)
+            .map(|(name, p)| match p {
+                0 => format!("no {name}"),
+                p => format!("{name} {p}%"),
+            })
+            .collect();
+        if rest.is_empty() {
+            "Full mix".into()
+        } else {
+            cap(&rest.join(" · "))
         }
     }
 }
@@ -182,6 +320,38 @@ fn state_file(target: &str) -> Option<PathBuf> {
         "bass" => "stemflow/levels".to_string(),
         t => format!("stemflow/levels-{t}"),
     }))
+}
+
+fn beats_file() -> Option<PathBuf> {
+    Some(state_file("bass")?.with_file_name("beats"))
+}
+
+/// Click on/off, meter and feel, as "click meter feel" (e.g. "1 0 1").
+pub fn load_beat_options(ctl: &Control) {
+    let Some(s) = beats_file().and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return;
+    };
+    let v: Vec<&str> = s.split_whitespace().collect();
+    if v.len() == 3 {
+        ctl.click.store(v[0] == "1", Ordering::Relaxed);
+        ctl.meter
+            .store(v[1].parse().unwrap_or(0), Ordering::Relaxed);
+        ctl.feel.store(
+            v[2].parse::<f32>().unwrap_or(1.0).to_bits(),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+fn save_beat_options(ctl: &Control) {
+    let Some(p) = beats_file() else { return };
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(
+        p,
+        format!("{} {} {}\n", ctl.click() as u8, ctl.meter(), ctl.feel()),
+    );
 }
 
 fn model_file() -> Option<PathBuf> {
@@ -201,29 +371,23 @@ fn save_model(id: &str) {
     }
 }
 
-/// Last (target, band) loudness, if remembered.
-pub fn load_levels(target: &str) -> Option<(f32, f32)> {
-    let s = std::fs::read_to_string(state_file(target)?).ok()?;
+/// Last (target, band, second stem) loudness, if remembered. `key` is
+/// `Control::levels_key`.
+pub fn load_levels(key: &str) -> Option<(f32, f32, Option<f32>)> {
+    let s = std::fs::read_to_string(state_file(key)?).ok()?;
     let mut it = s.split_whitespace().map(|v| v.parse::<f32>().ok());
-    Some((it.next()??, it.next()??))
+    Some((it.next()??, it.next()??, it.next().flatten()))
 }
 
 pub fn save_levels(ctl: &Control) {
     let (a, b) = ctl.levels();
-    if let Some(p) = state_file(ctl.target()) {
+    if let Some(p) = state_file(&ctl.levels_key()) {
         let _ = std::fs::create_dir_all(p.parent().unwrap());
-        let _ = std::fs::write(p, format!("{a} {b}\n"));
-    }
-}
-
-/// Snap points the hotkeys and menu buttons use. "nobass" means "remove the
-/// target" whatever it is, so existing hotkeys keep working in karaoke mode.
-fn snap(name: &str) -> Option<f32> {
-    match name {
-        "solo" => Some(-1.0),
-        "full" => Some(0.0),
-        "nobass" | "remove" | "novocals" => Some(1.0),
-        _ => None,
+        let line = match ctl.second() {
+            Some(_) => format!("{a} {b} {}\n", ctl.second_level()),
+            None => format!("{a} {b}\n"),
+        };
+        let _ = std::fs::write(p, line);
     }
 }
 
@@ -247,7 +411,13 @@ impl Service {
         let _ = self.balance_changed(em).await;
         let _ = self.bass_changed(em).await;
         let _ = self.band_changed(em).await;
+        let _ = self.second_changed(em).await;
+        let _ = self.second_level_changed(em).await;
         let _ = self.description_changed(em).await;
+        let _ = self.click_changed(em).await;
+        let _ = self.meter_changed(em).await;
+        let _ = self.feel_changed(em).await;
+        let _ = self.beats_changed(em).await;
     }
 }
 
@@ -295,6 +465,25 @@ impl Service {
     ) {
         let (bass, _) = self.ctl.levels();
         self.ctl.set_levels(bass, v as f32);
+        self.changed(&em).await;
+    }
+    /// A two-stem model's second stem ("vocals"), or "" for a one-stem model.
+    #[zbus(property)]
+    fn second(&self) -> String {
+        self.ctl.second().unwrap_or("").to_string()
+    }
+    /// The second stem's loudness, 0..1 (0 = taken out).
+    #[zbus(property)]
+    fn second_level(&self) -> f64 {
+        self.ctl.second_level() as f64
+    }
+    #[zbus(property)]
+    async fn set_second_level(
+        &mut self,
+        v: f64,
+        #[zbus(signal_emitter)] em: zbus::object_server::SignalEmitter<'_>,
+    ) {
+        self.ctl.set_second_level(v as f32);
         self.changed(&em).await;
     }
     /// Human-readable state, e.g. "Band 15%".
@@ -359,6 +548,60 @@ impl Service {
         self.ctl.overruns.load(Ordering::Relaxed)
     }
 
+    /// Beat click: a click on every beat mixed into the output, higher on bar lines.
+    #[zbus(property)]
+    fn click(&self) -> bool {
+        self.ctl.click()
+    }
+    #[zbus(property)]
+    async fn set_click(
+        &mut self,
+        on: bool,
+        #[zbus(signal_emitter)] em: zbus::object_server::SignalEmitter<'_>,
+    ) {
+        self.ctl
+            .set_beat_options(on, self.ctl.meter(), self.ctl.feel());
+        if !on {
+            self.ctl.set_beats(String::new());
+        }
+        self.announce(&em).await;
+    }
+    /// Beats per bar for the bar lines; 0 = let the tracker choose (3-7).
+    #[zbus(property)]
+    fn meter(&self) -> u32 {
+        self.ctl.meter()
+    }
+    #[zbus(property)]
+    async fn set_meter(
+        &mut self,
+        m: u32,
+        #[zbus(signal_emitter)] em: zbus::object_server::SignalEmitter<'_>,
+    ) {
+        self.ctl
+            .set_beat_options(self.ctl.click(), m, self.ctl.feel());
+        self.announce(&em).await;
+    }
+    /// 1 = the beat as decoded, 0.5 = half time, 2 = double time.
+    #[zbus(property)]
+    fn feel(&self) -> f64 {
+        self.ctl.feel() as f64
+    }
+    #[zbus(property)]
+    async fn set_feel(
+        &mut self,
+        f: f64,
+        #[zbus(signal_emitter)] em: zbus::object_server::SignalEmitter<'_>,
+    ) {
+        self.ctl
+            .set_beat_options(self.ctl.click(), self.ctl.meter(), f as f32);
+        self.announce(&em).await;
+    }
+    /// What the tracker last found, e.g. "158 bpm · 4/bar"; "" while there's nothing.
+    #[zbus(property)]
+    fn beats(&self) -> String {
+        self.ctl.beats()
+    }
+
     /// Move the one-slider balance by `step` (e.g. ±0.1); returns the new balance.
     async fn nudge(
         &mut self,
@@ -370,17 +613,18 @@ impl Service {
         self.ctl.balance() as f64
     }
 
-    /// Jump to "solo", "full" or "nobass"; returns the new balance.
+    /// Jump to "solo", "full", "nobass" or "novocals" (`Control::snap`); returns the
+    /// new balance.
     async fn snap(
         &mut self,
         name: String,
         #[zbus(signal_emitter)] em: zbus::object_server::SignalEmitter<'_>,
     ) -> zbus::fdo::Result<f64> {
-        let b = snap(&name)
+        self.ctl
+            .snap(&name)
             .ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("unknown snap `{name}`")))?;
-        self.ctl.set_balance(b);
         self.changed(&em).await;
-        Ok(b as f64)
+        Ok(self.ctl.balance() as f64)
     }
 }
 
@@ -463,5 +707,38 @@ mod tests {
         assert_eq!(c.describe(), "Bass solo · 200%");
         c.set_levels(5.0, 1.0);
         assert_eq!(c.levels().0, MAX_BASS);
+    }
+
+    #[test]
+    fn second_stem() {
+        let c = Control::new("bass", 1.0, 1.0);
+        c.set_second(Some("vocals"));
+        assert_eq!(c.levels_key(), "bass+vocals");
+        assert_eq!(
+            (c.gains3(), c.describe().as_str()),
+            ((1.0, 1.0, 1.0), "Full mix")
+        );
+        for (snap, gains, text) in [
+            ("novocals", (1.0, 1.0, 0.0), "No vocals"),
+            ("solo", (1.0, 0.0, 0.0), "Bass solo"),
+            ("nobass", (0.0, 1.0, 1.0), "No bass"),
+            ("full", (1.0, 1.0, 1.0), "Full mix"),
+        ] {
+            c.snap(snap).unwrap();
+            assert_eq!((c.gains3(), c.describe().as_str()), (gains, text), "{snap}");
+        }
+        // three independent levels
+        c.set_levels(0.4, 1.0);
+        c.set_second_level(0.0);
+        assert_eq!(c.describe(), "Bass 40% · no vocals");
+        c.set_levels(0.0, 0.0);
+        c.set_second_level(1.0);
+        assert_eq!(c.describe(), "Vocals solo");
+        c.set_levels(2.0, 0.5);
+        assert_eq!(c.describe(), "Bass 200% · band 50%");
+        // one stem: "novocals" is the old remove-the-target hotkey
+        let k = Control::new("vocals", 1.0, 1.0);
+        k.snap("novocals").unwrap();
+        assert_eq!(k.describe(), "No vocals");
     }
 }

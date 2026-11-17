@@ -24,12 +24,22 @@ pub struct Model {
     pub arch: Arch,
     /// The stem it isolates: one of `STEMS`.
     pub target: &'static str,
+    /// A second stem the same run separates (`bsrofo_sw_bass+vocals`), if any.
+    pub second: Option<&'static str>,
     pub path: PathBuf,
 }
 
 /// The stems a model can target, in menu order. "other" is what's left once the
 /// rest are taken out: in a jazz combo, the horns.
 pub const STEMS: [&str; 6] = ["bass", "vocals", "other", "piano", "guitar", "drums"];
+
+/// `name` without a `+<stem>` suffix, and that stem.
+fn split_second(name: &str) -> (&str, Option<&'static str>) {
+    STEMS
+        .into_iter()
+        .find_map(|t| Some((name.strip_suffix(t)?.strip_suffix('+')?, Some(t))))
+        .unwrap_or((name, None))
+}
 
 fn classify(stem: &str) -> Option<(Arch, &'static str, &'static str)> {
     let (arch, name) = if stem.starts_with("bsrofo_sw") {
@@ -54,7 +64,7 @@ fn model(dir: &Path, rel: &Path) -> Option<Model> {
     if rel.extension()? != "onnx" {
         return None;
     }
-    let stem = rel.file_stem()?.to_str()?;
+    let (stem, second) = split_second(rel.file_stem()?.to_str()?);
     let (arch, target, name) = classify(stem)?;
     let id = rel.with_extension("").to_str()?.to_string();
     let label = match rel
@@ -65,16 +75,17 @@ fn model(dir: &Path, rel: &Path) -> Option<Model> {
         Some(exp) => format!("{exp}: {name}"),
         None => name.to_string(),
     };
-    let label = if target == "bass" {
-        label
-    } else {
-        format!("{label} ({target})")
+    let label = match (target, second) {
+        (t, Some(s)) => format!("{label} ({t} + {s})"),
+        ("bass", None) => label,
+        (t, None) => format!("{label} ({t})"),
     };
     Some(Model {
         id,
         label,
         arch,
         target,
+        second,
         path: dir.join(rel),
     })
 }
@@ -140,7 +151,20 @@ mod tests {
             ("BS-RoFormer SW (other)", "other")
         );
         // not a stem suffix: "another" ends in "other" but not "_other"
-        assert_eq!(model(d, Path::new("scnet_another.onnx")).unwrap().target, "bass");
+        assert_eq!(
+            model(d, Path::new("scnet_another.onnx")).unwrap().target,
+            "bass"
+        );
+        let m = model(d, Path::new("bsrofo_sw_bass+vocals.onnx")).unwrap();
+        assert_eq!(
+            (m.id.as_str(), m.label.as_str(), m.target, m.second),
+            (
+                "bsrofo_sw_bass+vocals",
+                "BS-RoFormer SW (bass + vocals)",
+                "bass",
+                Some("vocals")
+            )
+        );
         assert!(model(d, Path::new("scnet_xl_ihf.ckpt")).is_none());
         assert!(model(d, Path::new("other.onnx")).is_none());
     }

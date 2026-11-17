@@ -1,9 +1,12 @@
 mod audio;
+mod beats;
 mod control;
+mod looper;
 mod model;
 mod models;
 mod spec;
 mod stream;
+mod stretch;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -42,6 +45,22 @@ enum Cmd {
         opts: Opts,
         input: PathBuf,
         output: PathBuf,
+        /// Mix in the beat click as live mode would (analysis every 3 s of input, from
+        /// the audio that has arrived so far). Prints the beats it clicked.
+        #[arg(long)]
+        click: bool,
+        /// Test looping: at this second, ask for the last --bars bars, then write the
+        /// loop three times (with the click) instead of the rest of the file.
+        #[arg(long)]
+        loop_at: Option<f32>,
+        #[arg(long, default_value_t = 4)]
+        bars: usize,
+        /// With --loop-at: play the loop at this speed (0.5 = half)
+        #[arg(long, default_value_t = 1.0)]
+        speed: f32,
+        /// With --loop-at: transpose by this many semitones
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        semis: f32,
     },
     /// List the models in the models folder (* = the one live mode last used).
     Models {
@@ -152,9 +171,20 @@ struct Opts {
     /// Band (everything but the target) loudness in percent of full. Overrides --balance.
     #[arg(long)]
     band: Option<f32>,
+    /// With a two-stem model (bass+vocals): how much of the second stem stays in the
+    /// band, in percent (0 = take it out).
+    #[arg(long)]
+    second: Option<f32>,
     /// CPU threads for inference (0 = ONNX Runtime default).
     #[arg(long, default_value_t = 0)]
     threads: usize,
+    /// Beat tracker for the beat click (a Beat This! export, tools/export_beat_this.py),
+    /// relative to --models. Runs every few seconds while the click is on, on --device.
+    #[arg(long, default_value = "beats/beat_this_final0_1500.onnx")]
+    beats: PathBuf,
+    /// CPU threads for the beat tracker (when it runs on the CPU).
+    #[arg(long, default_value_t = 4)]
+    beat_threads: usize,
 }
 
 impl Opts {
@@ -305,8 +335,31 @@ fn main() -> Result<()> {
                 None => streamer(&opts)?, // the ensemble
             };
             let target = m.as_ref().map_or(opts.target().name(), |m| m.target);
-            let ctl = levels(&opts, target, true);
+            let second = m.as_ref().and_then(|m| m.second);
+            let ctl = levels(&opts, target, second, true);
             ctl.set_model(m.as_ref().map_or("ensemble", |m| &m.id));
+            control::load_beat_options(&ctl);
+            // The separator's runtime is loaded by now; the tracker shares it.
+            let bpath = opts.models.join(&opts.beats);
+            let tracker = if bpath.exists() {
+                match model::runtime(opts.device).and_then(|env| {
+                    beats::BeatNet::load(
+                        env,
+                        &bpath,
+                        opts.beat_threads,
+                        opts.device == Device::Cuda,
+                    )
+                }) {
+                    Ok(net) => Some(std::sync::Arc::new(beats::Tracker::new(Box::new(net)))),
+                    Err(e) => {
+                        eprintln!("stemflow: no beat click ({e:#})");
+                        None
+                    }
+                }
+            } else {
+                eprintln!("stemflow: no beat click ({} not found)", bpath.display());
+                None
+            };
             let (lat, hop) = (
                 st.latency() as f64 / SAMPLE_RATE as f64,
                 st.hop as f64 / SAMPLE_RATE as f64,
@@ -324,12 +377,12 @@ fn main() -> Result<()> {
             // Switching models from the menu: drop the running one (frees the GPU),
             // then load the new one with the same settings.
             let load =
-                move |id: &str| -> Result<(Streamer<Box<dyn Separator + Send>>, &'static str)> {
+                move |id: &str| -> Result<(audio::Live, &'static str, Option<&'static str>)> {
                     let m = models::find(&opts.models, id)
                         .with_context(|| format!("no model `{id}`"))?;
-                    Ok((wrap(&opts, load_model(&opts, &m)?)?, m.target))
+                    Ok((wrap(&opts, load_model(&opts, &m)?)?, m.target, m.second))
                 };
-            audio::live(st, ctl, &grab, output, slack, load)
+            audio::live(st, ctl, tracker, &grab, output, slack, load)
         }
         Cmd::Models { models } => {
             let cur = control::load_model();
@@ -347,7 +400,15 @@ fn main() -> Result<()> {
             opts,
             input,
             output,
-        } => file(&opts, &input, &output),
+            click,
+            loop_at,
+            bars,
+            speed,
+            semis,
+        } => match loop_at {
+            Some(t) => loop_test(&opts, &input, &output, t, bars, speed, semis),
+            None => file(&opts, &input, &output, click),
+        },
         Cmd::Verify {
             sep,
             models,
@@ -365,10 +426,23 @@ fn main() -> Result<()> {
 }
 
 /// Starting levels: explicit flags, else the remembered ones, else bass solo.
-fn levels(o: &Opts, target: &'static str, remember: bool) -> std::sync::Arc<control::Control> {
+fn levels(
+    o: &Opts,
+    target: &'static str,
+    second: Option<&'static str>,
+    remember: bool,
+) -> std::sync::Arc<control::Control> {
     let ctl = control::Control::new(target, 1.0, 0.0);
-    if let Some((a, b)) = remember.then(|| control::load_levels(target)).flatten() {
+    ctl.set_second(second);
+    if let Some((a, b, c)) = remember
+        .then(|| control::load_levels(&ctl.levels_key()).or_else(|| control::load_levels(target)))
+        .flatten()
+    {
         ctl.set_levels(a, b);
+        ctl.set_second_level(c.unwrap_or(1.0));
+    }
+    if let Some(v) = o.second {
+        ctl.set_second_level(v / 100.0);
     }
     if let Some(b) = o.balance {
         ctl.set_balance(b);
@@ -381,7 +455,132 @@ fn levels(o: &Opts, target: &'static str, remember: bool) -> std::sync::Arc<cont
     ctl
 }
 
-fn file(o: &Opts, input: &Path, output: &Path) -> Result<()> {
+/// `stemflow file --loop-at`: the looper on a file, to check bar finding and the wrap.
+fn loop_test(
+    o: &Opts,
+    input: &Path,
+    output: &Path,
+    at: f32,
+    bars: usize,
+    speed: f32,
+    semis: f32,
+) -> Result<()> {
+    let r = hound::WavReader::open(input)?;
+    let spec = r.spec();
+    anyhow::ensure!(
+        spec.sample_rate == SAMPLE_RATE && spec.channels == 2,
+        "need 44.1 kHz stereo"
+    );
+    let x: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => r.into_samples::<f32>().collect::<Result<_, _>>()?,
+        hound::SampleFormat::Int => {
+            let k = 1.0 / (1u64 << (spec.bits_per_sample - 1)) as f32;
+            r.into_samples::<i32>()
+                .map(|v| v.map(|v| v as f32 * k))
+                .collect::<Result<_, _>>()?
+        }
+    };
+    let mut s = streamer(o)?;
+    let net = beats::BeatNet::load(
+        model::runtime(o.device)?,
+        &o.models.join(&o.beats),
+        o.beat_threads,
+        o.device == Device::Cuda,
+    )?;
+    let lp = looper::Looper::new(Box::new(net));
+    let (hop, lat) = (s.hop, s.delay());
+    let press = (at * SAMPLE_RATE as f32) as u64 + lat as u64; // stem frames trail input by lat
+    let mut played = 0u64;
+    for chunk in x.chunks_exact(2 * hop) {
+        let st = s.process(chunk)?;
+        lp.push(
+            &st.bass,
+            &st.band,
+            st.extra.first().map_or(&[][..], |v| &v[..]),
+        );
+        played += hop as u64;
+        if played >= press + 2 * SAMPLE_RATE as u64 {
+            break;
+        }
+    }
+    let t = Instant::now();
+    lp.find(press, bars, beats::Settings::default())?;
+    let v = lp.view(10).unwrap();
+    let secs = |f: f64| (f - lat as f64) / SAMPLE_RATE as f64; // back to input time
+    eprintln!(
+        "found in {:.2}s: {:.1} bpm, {}/bar, {} bars, loop {:.3}s..{:.3}s ({:.3}s long), press at {at:.2}s",
+        t.elapsed().as_secs_f32(), v.bpm, v.meter, v.bars, secs(v.start), secs(v.end), (v.end - v.start) / SAMPLE_RATE as f64
+    );
+    // Re-stem with the same model: should give back nearly the same stems.
+    let before = lp.clip_mix(v.start as i64, 44100);
+    let (b0, _) = {
+        let (mut b, mut r, mut c) = (
+            vec![0f32; 2 * 44100],
+            vec![0f32; 2 * 44100],
+            vec![0f32; 44100],
+        );
+        lp.read(&mut b, &mut r, &mut [], &mut c, 44100, 0);
+        (b, r)
+    };
+    let t = Instant::now();
+    looper::restem(&lp, &mut s)?;
+    let (b1, _) = {
+        let (mut b, mut r, mut c) = (
+            vec![0f32; 2 * 44100],
+            vec![0f32; 2 * 44100],
+            vec![0f32; 44100],
+        );
+        lp.read(&mut b, &mut r, &mut [], &mut c, 44100, 0);
+        (b, r)
+    };
+    let after = lp.clip_mix(v.start as i64, 44100);
+    let e = |a: &[f32], b: &[f32]| {
+        let n: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+        let d: f32 = a.iter().map(|x| x * x).sum();
+        10.0 * (d / n.max(1e-12)).log10()
+    };
+    eprintln!(
+        "re-stem in {:.2}s: target vs before {:.1} dB SNR, mix kept {:.1} dB",
+        t.elapsed().as_secs_f32(),
+        e(&b0, &b1),
+        e(&before, &after)
+    );
+    lp.set_click(true);
+    lp.set_speed(speed, semis, true);
+    // three times round the loop at the practice speed
+    let len = ((v.end - v.start) / speed as f64).round() as usize;
+    let t_out = Instant::now();
+    let (mut b, mut r, mut c) = (vec![0f32; 2 * 1024], vec![0f32; 2 * 1024], vec![0f32; 1024]);
+    let mut w = hound::WavWriter::create(
+        output,
+        hound::WavSpec {
+            channels: 2,
+            sample_rate: SAMPLE_RATE,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        },
+    )?;
+    let mut n = 0;
+    while n < 3 * len {
+        let k = 1024.min(3 * len - n);
+        lp.read(&mut b, &mut r, &mut [], &mut c, k, k);
+        for i in 0..k {
+            for ch in 0..2 {
+                w.write_sample(b[2 * i + ch] + r[2 * i + ch] + 0.35 * c[i])?;
+            }
+        }
+        n += k;
+    }
+    w.finalize()?;
+    eprintln!(
+        "wrote {:.2}s at {speed}x {semis:+} st in {:.3}s of compute",
+        3.0 * len as f64 / SAMPLE_RATE as f64,
+        t_out.elapsed().as_secs_f32()
+    );
+    Ok(())
+}
+
+fn file(o: &Opts, input: &Path, output: &Path, click: bool) -> Result<()> {
     let mut r =
         hound::WavReader::open(input).with_context(|| format!("opening {}", input.display()))?;
     let spec = r.spec();
@@ -408,19 +607,58 @@ fn file(o: &Opts, input: &Path, output: &Path) -> Result<()> {
     };
 
     let mut s = streamer(o)?;
-    let ctl = levels(o, o.target().name(), false);
+    let second = o
+        .model
+        .as_ref()
+        .and_then(|id| models::find(&o.models, id))
+        .and_then(|m| m.second);
+    let ctl = levels(o, o.target().name(), second, false);
     let (hop, lat) = (s.hop, s.delay());
     let frames = stereo.len() / 2;
     let mut padded = stereo;
     padded.resize(2 * (frames + lat).div_ceil(hop) * hop, 0.0);
 
+    let tracker = if click {
+        let net = beats::BeatNet::load(
+            model::runtime(o.device)?,
+            &o.models.join(&o.beats),
+            o.beat_threads,
+            o.device == Device::Cuda,
+        )?;
+        Some(beats::Tracker::new(Box::new(net)))
+    } else {
+        None
+    };
     let mut out = Vec::with_capacity(padded.len());
     let mut times = Vec::new();
+    let mut since = 0;
     for chunk in padded.chunks(2 * hop) {
         let t = Instant::now();
-        let (bg, rg) = ctl.gains();
-        out.extend(s.process(chunk)?.mix(bg, rg));
+        let (bg, rg, sg) = ctl.gains3();
+        let mut m = s.process(chunk)?.mix(bg, rg, sg);
         times.push(t.elapsed().as_secs_f32());
+        if let Some(tr) = &tracker {
+            // As live: the output of this hop trails the input by the delay.
+            let start = (out.len() / 2) as i64 - lat as i64;
+            tr.push(chunk);
+            since += hop;
+            if since >= 3 * SAMPLE_RATE as usize {
+                since = 0;
+                if tr.analyze()? {
+                    let i = tr.info();
+                    eprintln!(
+                        "beats at {:.1}s: {:.1} bpm, {}/bar, drift {:.0} ms",
+                        (start + hop as i64) as f32 / SAMPLE_RATE as f32
+                            + lat as f32 / SAMPLE_RATE as f32,
+                        i.bpm,
+                        i.meter,
+                        i.drift_s * 1e3
+                    );
+                }
+            }
+            tr.click(&mut m, start, 0.35);
+        }
+        out.extend(m);
     }
     let hop_s = hop as f32 / SAMPLE_RATE as f32;
     times.sort_by(f32::total_cmp);

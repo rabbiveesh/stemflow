@@ -82,10 +82,11 @@ pub type Live = Streamer<Box<dyn Separator + Send>>;
 pub fn live(
     st: Live,
     ctl: Arc<Control>,
+    beats: Option<Arc<crate::beats::Tracker>>,
     grab: &str,
     output: Option<String>,
     slack: f32,
-    load: impl Fn(&str) -> Result<(Live, &'static str)>,
+    load: impl Fn(&str) -> Result<(Live, &'static str, Option<&'static str>)>,
 ) -> Result<()> {
     let mut st = Some(st);
     let output = match output {
@@ -187,15 +188,28 @@ pub fn live(
             }
         }
     });
+    // The output trails the input by the separator's delay; the player maps what it
+    // plays onto the tracker's timeline (input frames) with it.
+    let delay = Arc::new(std::sync::atomic::AtomicUsize::new(
+        st.as_ref().unwrap().delay(),
+    ));
+    if let Some(tr) = beats.clone() {
+        let (c, r) = (ctl.clone(), running.clone());
+        std::thread::spawn(move || beat_loop(&tr, &c, &r));
+    }
+    let (pbeats, pdelay) = (beats.clone(), delay.clone());
     let pctl = ctl.clone();
     let refill = hop + (slack * SAMPLE_RATE as f32) as usize;
     let player = std::thread::spawn(move || -> Result<()> {
-        let (mut bass, mut band) = (Vec::<f32>::new(), Vec::<f32>::new());
-        let mut pos = 0; // frames already played from the front of bass/band
+        // bass, band and a second stem (all zero for one-stem models)
+        let (mut bass, mut band, mut sec) =
+            (Vec::<f32>::new(), Vec::<f32>::new(), Vec::<f32>::new());
+        let mut pos = 0; // frames already played from the front of the buffers
         let mut buffering = true;
-        let mut g = pctl.gains();
+        let mut g = pctl.gains3();
         let mut out = vec![0f32; 2 * block];
         let mut lim = Limiter::new();
+        let mut played = 0i64; // stem frames played: input frame (played - delay)
         loop {
             // Take whatever the worker has finished; block only when starved.
             let avail = bass.len() / 2 - pos;
@@ -207,7 +221,12 @@ pub fn live(
             if let Some(st) = next {
                 bass.drain(..2 * pos);
                 band.drain(..2 * pos);
+                sec.drain(..2 * pos);
                 pos = 0;
+                match st.extra.into_iter().next() {
+                    Some(v) => sec.extend(v),
+                    None => sec.resize(sec.len() + st.bass.len(), 0.0),
+                }
                 bass.extend(st.bass);
                 band.extend(st.band);
             } else if buffering || avail < block {
@@ -221,21 +240,27 @@ pub fn live(
                 buffering = false;
             }
             while bass.len() / 2 - pos >= block {
-                let target = pctl.gains();
+                let target = pctl.gains3();
                 for i in 0..block {
                     let a = (i as f32 + 1.0) / block as f32; // ramp: no zipper noise
                     let gb = g.0 + (target.0 - g.0) * a;
                     let gr = g.1 + (target.1 - g.1) * a;
+                    let gs = g.2 + (target.2 - g.2) * a;
                     for ch in 0..2 {
                         let k = 2 * (pos + i) + ch;
-                        out[2 * i + ch] = gb * bass[k] + gr * band[k];
+                        out[2 * i + ch] = gb * bass[k] + gr * band[k] + gs * sec[k];
                     }
                 }
                 // Look one block ahead (it's already buffered) so the limiter is down
                 // before a peak arrives rather than clipping it.
                 let ahead = (bass.len() / 2 - pos - block).min(block);
-                let next = mix_peak(&bass, &band, pos + block, ahead, target);
+                let next = mix_peak([&bass, &band, &sec], pos + block, ahead, target);
                 lim.apply(&mut out, next);
+                if let Some(tr) = pbeats.as_ref().filter(|_| pctl.click()) {
+                    let d = pdelay.load(Ordering::Relaxed) as i64;
+                    tr.click(&mut out, played - d, CLICK_LEVEL);
+                }
+                played += block as i64;
                 g = target;
                 pos += block;
                 play.write(&f32_to_bytes(&out))
@@ -261,8 +286,9 @@ pub fn live(
             eprintln!("stemflow: switching to {id}");
             drop(st.take()); // free the GPU before loading the next one
             st = Some(match load(&id) {
-                Ok((s, target)) => {
-                    ctl.switched(&id, target);
+                Ok((s, target, second)) => {
+                    ctl.switched(&id, target, second);
+                    delay.store(s.delay(), Ordering::Relaxed);
                     s
                 }
                 Err(e) => {
@@ -287,6 +313,10 @@ pub fn live(
                 );
             }
             let chunk: Vec<f32> = pending.drain(..2 * hop).collect();
+            // Every hop the separator gets: the tracker's frame count is the timeline.
+            if let Some(tr) = &beats {
+                tr.push(&chunk);
+            }
             let t = Instant::now();
             let out = st.process(&chunk)?;
             let dt = t.elapsed().as_secs_f32();
@@ -312,18 +342,53 @@ pub fn live(
     Ok(())
 }
 
+const CLICK_LEVEL: f32 = 0.35;
+const BEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// While the click is on, re-analyse the last 30 s every few seconds.
+fn beat_loop(tr: &crate::beats::Tracker, ctl: &Control, running: &AtomicBool) {
+    let mut last = Instant::now();
+    while running.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if !ctl.click() || last.elapsed() < BEAT_EVERY {
+            continue;
+        }
+        last = Instant::now();
+        *tr.settings.lock().unwrap() = crate::beats::Settings {
+            meter: ctl.meter() as usize,
+            feel: ctl.feel(),
+            ..Default::default()
+        };
+        match tr.analyze() {
+            Ok(true) => {
+                let i = tr.info();
+                ctl.set_beats(format!("{:.0} bpm · {}/bar", i.bpm, i.meter));
+                eprintln!(
+                    "beats: {:.1} bpm, {}/bar, {} beats, analysis {:.2}s, drift {:.0} ms",
+                    i.bpm,
+                    i.meter,
+                    i.beats,
+                    i.analysis_s,
+                    i.drift_s * 1e3
+                );
+            }
+            Ok(false) => ctl.set_beats(String::new()),
+            Err(e) => eprintln!("beats: analysis failed: {e:#}"),
+        }
+    }
+}
+
 /// The player drains its queue a block at a time and goes back for more input
 /// when only one block is left.
 fn running_low(bass: &[f32], pos: usize, block: usize) -> bool {
     bass.len() / 2 - pos < 2 * block
 }
 
-/// Peak of `gains.0 * bass + gains.1 * band` over `n` frames from `start`.
-fn mix_peak(bass: &[f32], band: &[f32], start: usize, n: usize, gains: (f32, f32)) -> f32 {
-    bass[2 * start..2 * (start + n)]
-        .iter()
-        .zip(&band[2 * start..2 * (start + n)])
-        .fold(0f32, |m, (b, r)| m.max((gains.0 * b + gains.1 * r).abs()))
+/// Peak of the mix (bass, band, second stem at `gains`) over `n` frames from `start`.
+fn mix_peak(s: [&[f32]; 3], start: usize, n: usize, gains: (f32, f32, f32)) -> f32 {
+    (2 * start..2 * (start + n)).fold(0f32, |m, k| {
+        m.max((gains.0 * s[0][k] + gains.1 * s[1][k] + gains.2 * s[2][k]).abs())
+    })
 }
 
 /// Block peak limiter with one block of lookahead: the gain ramps down across a
