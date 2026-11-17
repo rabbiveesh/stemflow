@@ -85,6 +85,25 @@ impl<S: Separator> Streamer<S> {
         }
     }
 
+    /// Forget the stream so far, as if just created (before and after separating
+    /// something else with the same model, e.g. a loop).
+    pub fn reset(&mut self) {
+        self.win.fill(0.0);
+        self.tail.fill(0.0);
+        self.have_tail = false;
+    }
+
+    /// Stems the model gives per run (the target, then any extra).
+    #[allow(dead_code)] // the Android core asks; the desktop reads Stems.extra
+    pub fn stems(&self) -> usize {
+        self.stems
+    }
+
+    /// The model's window in frames: the context a sample needs before it.
+    pub fn window(&self) -> usize {
+        self.seg
+    }
+
     /// Sample offset between input and output streams.
     pub fn delay(&self) -> usize {
         self.lookahead

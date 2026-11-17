@@ -52,6 +52,63 @@ struct Args {
     /// Write the isolated stem here.
     #[arg(long)]
     out: Option<PathBuf>,
+    /// For a Beat This! model (file name beat_this*): a folder with spect.f32, beat.f32
+    /// and downbeat.f32 (raw f32) to run and compare against. Without it, noise.
+    /// In this mode --hop is the time from one run's start to the next (try 3).
+    #[arg(long)]
+    beat_ref: Option<PathBuf>,
+}
+
+fn read_f32(p: &Path) -> Result<Vec<f32>> {
+    let b = std::fs::read(p).with_context(|| format!("reading {}", p.display()))?;
+    Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+
+/// Times Beat This! as the app would run it: one run every `hop` seconds, idle between.
+fn beat_bench(a: &Args, accel: litert::Accel) -> Result<()> {
+    let t = Instant::now();
+    let mut net = litert::LiteRtBeatNet::load(&a.model, accel, a.threads)?;
+    let n = net.frames() * 128;
+    let (spect, want) = match &a.beat_ref {
+        Some(d) => (read_f32(&d.join("spect.f32"))?, Some((read_f32(&d.join("beat.f32"))?, read_f32(&d.join("downbeat.f32"))?))),
+        None => ((0..n).map(|i| (i * 2654435761 % 1000) as f32 / 250.0).collect(), None),
+    };
+    net.run(&spect)?;
+    eprintln!("loaded {} + first run in {:.2}s", a.model.display(), t.elapsed().as_secs_f32());
+    let mut times = Vec::new();
+    let mut err = [0f32; 2];
+    for i in 0..a.runs.max(1) {
+        let t = Instant::now();
+        let (beat, down) = net.run(&spect)?;
+        let dt = t.elapsed().as_secs_f32();
+        eprintln!("run {:3}: {:.3}s", i + 1, dt);
+        times.push(dt);
+        if let Some((b, d)) = &want {
+            for (e, (got, want)) in err.iter_mut().zip([(&beat, b), (&down, d)]) {
+                *e = got.iter().zip(want.iter()).fold(*e, |m, (x, y)| m.max((x - y).abs()));
+            }
+        }
+        if i + 1 < a.runs {
+            std::thread::sleep(std::time::Duration::from_secs_f32((a.hop - dt).max(0.0)));
+        }
+    }
+    times.sort_by(f32::total_cmp);
+    println!(
+        "model={} gpu={} threads={} every {:.1}s runs={}: min {:.3}s p50 {:.3}s max {:.3}s; max error beat {:.1e} downbeat {:.1e}{}; peak RSS {:.0} MB",
+        a.model.file_name().unwrap_or_default().to_string_lossy(),
+        a.gpu.as_deref().unwrap_or("no"),
+        a.threads,
+        a.hop,
+        times.len(),
+        times[0],
+        times[times.len() / 2],
+        times[times.len() - 1],
+        err[0],
+        err[1],
+        if want.is_some() { "" } else { " (no reference)" },
+        peak_rss_mb().unwrap_or(f32::NAN),
+    );
+    Ok(())
 }
 
 fn read_wav(p: &Path) -> Result<Vec<f32>> {
@@ -85,6 +142,15 @@ fn peak_rss_mb() -> Option<f32> {
 
 fn main() -> Result<()> {
     let a = Args::parse();
+    if a.model.file_name().is_some_and(|n| n.to_string_lossy().starts_with("beat_this")) {
+        let accel = match a.gpu.as_deref() {
+            None => litert::Accel::Cpu,
+            Some("fp32") => litert::Accel::Gpu,
+            Some("fp16") => litert::Accel::GpuFp16,
+            Some(o) => bail!("--gpu {o}: expected fp32 or fp16"),
+        };
+        return beat_bench(&a, accel);
+    }
     let sr = SAMPLE_RATE as f32;
     let secs = |s: f32| (s * sr).round() as usize;
 

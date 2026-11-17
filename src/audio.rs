@@ -82,6 +82,7 @@ pub type Live = Streamer<Box<dyn Separator + Send>>;
 pub fn live(
     st: Live,
     ctl: Arc<Control>,
+    beats: Option<Arc<crate::beats::Tracker>>,
     grab: &str,
     output: Option<String>,
     slack: f32,
@@ -187,6 +188,16 @@ pub fn live(
             }
         }
     });
+    // The output trails the input by the separator's delay; the player maps what it
+    // plays onto the tracker's timeline (input frames) with it.
+    let delay = Arc::new(std::sync::atomic::AtomicUsize::new(
+        st.as_ref().unwrap().delay(),
+    ));
+    if let Some(tr) = beats.clone() {
+        let (c, r) = (ctl.clone(), running.clone());
+        std::thread::spawn(move || beat_loop(&tr, &c, &r));
+    }
+    let (pbeats, pdelay) = (beats.clone(), delay.clone());
     let pctl = ctl.clone();
     let refill = hop + (slack * SAMPLE_RATE as f32) as usize;
     let player = std::thread::spawn(move || -> Result<()> {
@@ -198,6 +209,7 @@ pub fn live(
         let mut g = pctl.gains3();
         let mut out = vec![0f32; 2 * block];
         let mut lim = Limiter::new();
+        let mut played = 0i64; // stem frames played: input frame (played - delay)
         loop {
             // Take whatever the worker has finished; block only when starved.
             let avail = bass.len() / 2 - pos;
@@ -244,6 +256,11 @@ pub fn live(
                 let ahead = (bass.len() / 2 - pos - block).min(block);
                 let next = mix_peak([&bass, &band, &sec], pos + block, ahead, target);
                 lim.apply(&mut out, next);
+                if let Some(tr) = pbeats.as_ref().filter(|_| pctl.click()) {
+                    let d = pdelay.load(Ordering::Relaxed) as i64;
+                    tr.click(&mut out, played - d, CLICK_LEVEL);
+                }
+                played += block as i64;
                 g = target;
                 pos += block;
                 play.write(&f32_to_bytes(&out))
@@ -271,6 +288,7 @@ pub fn live(
             st = Some(match load(&id) {
                 Ok((s, target, second)) => {
                     ctl.switched(&id, target, second);
+                    delay.store(s.delay(), Ordering::Relaxed);
                     s
                 }
                 Err(e) => {
@@ -295,6 +313,10 @@ pub fn live(
                 );
             }
             let chunk: Vec<f32> = pending.drain(..2 * hop).collect();
+            // Every hop the separator gets: the tracker's frame count is the timeline.
+            if let Some(tr) = &beats {
+                tr.push(&chunk);
+            }
             let t = Instant::now();
             let out = st.process(&chunk)?;
             let dt = t.elapsed().as_secs_f32();
@@ -318,6 +340,42 @@ pub fn live(
         }
     }
     Ok(())
+}
+
+const CLICK_LEVEL: f32 = 0.35;
+const BEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// While the click is on, re-analyse the last 30 s every few seconds.
+fn beat_loop(tr: &crate::beats::Tracker, ctl: &Control, running: &AtomicBool) {
+    let mut last = Instant::now();
+    while running.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if !ctl.click() || last.elapsed() < BEAT_EVERY {
+            continue;
+        }
+        last = Instant::now();
+        *tr.settings.lock().unwrap() = crate::beats::Settings {
+            meter: ctl.meter() as usize,
+            feel: ctl.feel(),
+            ..Default::default()
+        };
+        match tr.analyze() {
+            Ok(true) => {
+                let i = tr.info();
+                ctl.set_beats(format!("{:.0} bpm · {}/bar", i.bpm, i.meter));
+                eprintln!(
+                    "beats: {:.1} bpm, {}/bar, {} beats, analysis {:.2}s, drift {:.0} ms",
+                    i.bpm,
+                    i.meter,
+                    i.beats,
+                    i.analysis_s,
+                    i.drift_s * 1e3
+                );
+            }
+            Ok(false) => ctl.set_beats(String::new()),
+            Err(e) => eprintln!("beats: analysis failed: {e:#}"),
+        }
+    }
 }
 
 /// The player drains its queue a block at a time and goes back for more input

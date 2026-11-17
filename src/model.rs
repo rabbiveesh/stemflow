@@ -72,7 +72,7 @@ pub enum Device {
 }
 
 /// Load libonnxruntime: $ORT_DYLIB_PATH, else vendor/ort-{cpu,cuda} (tools/fetch-ort.sh).
-fn runtime(device: Device) -> Result<&'static ort::environment::Environment> {
+pub(crate) fn runtime(device: Device) -> Result<&'static ort::environment::Environment> {
     static ENV: std::sync::OnceLock<ort::environment::Environment> = std::sync::OnceLock::new();
     if let Some(env) = ENV.get() {
         return Ok(env);

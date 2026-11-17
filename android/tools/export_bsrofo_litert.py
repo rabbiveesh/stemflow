@@ -1,4 +1,8 @@
-"""Export one head of BS-RoFormer SW to LiteRT (.tflite) for the phone GPU.
+"""Export heads of BS-RoFormer SW to LiteRT (.tflite) for the phone GPU.
+
+One head (`bass`) or several (`bass,vocals`): the trunk runs once and each head's
+masked spectrogram is stacked on the channel axis, [1, 4 * heads, 1025, T], as
+tools/export_bsrofo.py does for the desktop (a second head costs ~1% more).
 
 Same split as tools/export_bsrofo.py (STFT/iSTFT stay outside, in Rust): the graph
 takes the complex-as-channels spectrogram [1, 4 (L re, L im, R re, R im), 1025, T]
@@ -20,7 +24,7 @@ re-written so that the TFLite GPU delegate runs all of it, in fp16:
 
 Needs the MSST checkout (tools/third_party/msst) and models/ext/bsrofo/{config.yaml,
 model.ckpt}, both in the main checkout.
-Usage:  python -I export_bsrofo_litert.py REPO_ROOT OUT_DIR [stem] [window_seconds]
+Usage:  python -I export_bsrofo_litert.py REPO_ROOT OUT_DIR [stem[,stem...]] [window_seconds]
 """
 import sys
 from pathlib import Path
@@ -64,7 +68,8 @@ m = BSRoformer(**mcfg).eval()
 m.requires_grad_(False)
 state = torch.load(src_dir / "model.ckpt", map_location="cpu", weights_only=False)
 m.load_state_dict(state.get("state_dict", state))
-head_idx = cfg["training"]["instruments"].index(STEM)
+STEMS = STEM.split(",")
+heads = [cfg["training"]["instruments"].index(s) for s in STEMS]
 assert not m.skip_connection and m.zero_dc and m.audio_channels == 2
 BANDS = [d // 4 for d in m.band_split.dim_inputs]  # bins per band
 H, DH = mcfg["heads"], mcfg["dim_head"]
@@ -217,9 +222,9 @@ def perm4(pairs):
 
 
 class Core(torch.nn.Module):
-    """BSRoformer.forward between the STFT and the iSTFT, one head only."""
+    """BSRoformer.forward between the STFT and the iSTFT, for the given heads."""
 
-    def __init__(self, m, head):
+    def __init__(self, m, heads):
         super().__init__()
         nb = len(BANDS)
         self.layers = []
@@ -227,10 +232,15 @@ class Core(torch.nn.Module):
             time_t, freq_t = block
             self.layers.append((prep_transformer(time_t, T, True), prep_transformer(freq_t, nb, False)))
         fg = m.final_norm.gamma.detach()
-        est, f0, self.bands = m.mask_estimators[head], 0, []
-        for n, split, mlp in zip(BANDS, m.band_split.to_features, est.to_freqs):
-            self.bands.append(Band(f0, n, split, mlp, fg))
-            f0 += n
+        # one set of bands per head; the split (shared by all) runs from the first set
+        self.heads = []
+        for head in heads:
+            est, f0, bands = m.mask_estimators[head], 0, []
+            for n, split, mlp in zip(BANDS, m.band_split.to_features, est.to_freqs):
+                bands.append(Band(f0, n, split, mlp, fg))
+                f0 += n
+            self.heads.append(bands)
+        self.bands = self.heads[0]
         # Complex product z * mask on (re, im) planes: re = zr mr - zi mi, im = zr mi + zi mr
         self.m_re = perm4([(0, 1), (0, 1), (2, 1), (2, 1)])
         self.m_im = perm4([(1, -1), (1, 1), (3, -1), (3, 1)])
@@ -243,10 +253,14 @@ class Core(torch.nn.Module):
         for time_p, freq_p in self.layers:
             x = transformer(freq_p, transformer(time_p, x))
         x = rms(x)
-        mask = torch.cat([b.mask(x[:, :, i : i + 1]) for i, b in enumerate(self.bands)], dim=1)
-        mask = mask.reshape(1, -1, 4, mask.shape[-1]).permute(0, 2, 1, 3)  # [1, 4, bins, T]
-        y = z * F.conv2d(mask, self.m_re) + F.conv2d(z, self.z_swap) * F.conv2d(mask, self.m_im)
-        return y * self.dc
+        zs = F.conv2d(z, self.z_swap)
+        out = []
+        for bands in self.heads:
+            mask = torch.cat([b.mask(x[:, :, i : i + 1]) for i, b in enumerate(bands)], dim=1)
+            mask = mask.reshape(1, -1, 4, mask.shape[-1]).permute(0, 2, 1, 3)  # [1, 4, bins, T]
+            y = z * F.conv2d(mask, self.m_re) + zs * F.conv2d(mask, self.m_im)
+            out.append(y * self.dc)
+        return out[0] if len(out) == 1 else torch.cat(out, dim=1)
 
 
 def stft(mix):
@@ -272,21 +286,22 @@ def test_mix(n, seed=0):
     return torch.from_numpy(np.stack([bass + chords + hats, 0.8 * bass + chords - hats]).astype(np.float32))[None]
 
 
-core = Core(m, head_idx).eval()
+core = Core(m, heads).eval()
 with torch.no_grad():
     mix = test_mix(SEG)
     z = stft(mix)
     assert z.shape[-1] == T
     spec = core(z)
-    full = m(mix)[0, head_idx]
-    err = float((istft(spec, SEG) - full).abs().max())
-    print(f"torch split vs stock forward, max abs err: {err:.2e} (peak {float(full.abs().max()):.2f})")
+    stock = m(mix)[0]
+    for k, (s, h) in enumerate(zip(STEMS, heads)):
+        err = float((istft(spec[:, 4 * k : 4 * k + 4], SEG) - stock[h]).abs().max())
+        print(f"{s}: torch split vs stock forward, max abs err: {err:.2e} (peak {float(stock[h].abs().max()):.2f})")
 print("spec", tuple(z.shape), "window", SEG, "samples")
 
 import litert_torch  # noqa: E402
 
 edge = litert_torch.convert(core, (z,))
-name = f"bsrofo_sw_{STEM}_{SEG}.tflite"
+name = f"bsrofo_sw_{'+'.join(STEMS)}_{SEG}.tflite"
 edge.export(str(out_dir / name))
 # The converter makes every matmul rank 3, which the GPU delegate runs with three
 # extra copies of the attention scores; make them [1, rows, N, N] again.

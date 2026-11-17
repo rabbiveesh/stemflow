@@ -20,7 +20,7 @@
 
 use anyhow::Result;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Highest target level: 2.0 sounds twice as loud as the original (+10 dB).
@@ -59,6 +59,12 @@ pub struct Control {
     /// Latest model run time in microseconds, and how many runs overran the hop.
     pub compute_us: AtomicU64,
     pub overruns: AtomicU64,
+    /// Beat click (src/beats.rs): on/off, beats per bar (0 = auto), feel (0.5 half
+    /// time, 1, 2 double time), and what the tracker last found ("" = nothing yet).
+    click: AtomicBool,
+    meter: AtomicU32,
+    feel: AtomicU32,
+    beats: Mutex<String>,
 }
 
 fn level(v: f32, max: f32) -> f32 {
@@ -100,6 +106,41 @@ impl Control {
         match self.second() {
             Some(s) => format!("{}+{s}", self.target()),
             None => self.target().to_string(),
+        }
+    }
+    pub fn click(&self) -> bool {
+        self.click.load(Ordering::Relaxed)
+    }
+    pub fn meter(&self) -> u32 {
+        self.meter.load(Ordering::Relaxed)
+    }
+    pub fn feel(&self) -> f32 {
+        match f32::from_bits(self.feel.load(Ordering::Relaxed)) {
+            f if f == 0.5 || f == 2.0 => f,
+            _ => 1.0,
+        }
+    }
+    pub fn set_beat_options(&self, click: bool, meter: u32, feel: f32) {
+        self.click.store(click, Ordering::Relaxed);
+        self.meter.store(meter.min(12), Ordering::Relaxed);
+        let feel = if feel == 0.5 || feel == 2.0 {
+            feel
+        } else {
+            1.0
+        };
+        self.feel.store(feel.to_bits(), Ordering::Relaxed);
+        save_beat_options(self);
+    }
+    pub fn beats(&self) -> String {
+        self.beats.lock().unwrap().clone()
+    }
+    /// For the beat thread: tempo and meter found, announced over D-Bus when it changes.
+    pub fn set_beats(&self, s: String) {
+        let mut b = self.beats.lock().unwrap();
+        if *b != s {
+            *b = s;
+            drop(b);
+            self.generation.fetch_add(1, Ordering::Relaxed);
         }
     }
     pub fn model(&self) -> String {
@@ -281,6 +322,38 @@ fn state_file(target: &str) -> Option<PathBuf> {
     }))
 }
 
+fn beats_file() -> Option<PathBuf> {
+    Some(state_file("bass")?.with_file_name("beats"))
+}
+
+/// Click on/off, meter and feel, as "click meter feel" (e.g. "1 0 1").
+pub fn load_beat_options(ctl: &Control) {
+    let Some(s) = beats_file().and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return;
+    };
+    let v: Vec<&str> = s.split_whitespace().collect();
+    if v.len() == 3 {
+        ctl.click.store(v[0] == "1", Ordering::Relaxed);
+        ctl.meter
+            .store(v[1].parse().unwrap_or(0), Ordering::Relaxed);
+        ctl.feel.store(
+            v[2].parse::<f32>().unwrap_or(1.0).to_bits(),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+fn save_beat_options(ctl: &Control) {
+    let Some(p) = beats_file() else { return };
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(
+        p,
+        format!("{} {} {}\n", ctl.click() as u8, ctl.meter(), ctl.feel()),
+    );
+}
+
 fn model_file() -> Option<PathBuf> {
     Some(state_file("bass")?.with_file_name("model"))
 }
@@ -341,6 +414,10 @@ impl Service {
         let _ = self.second_changed(em).await;
         let _ = self.second_level_changed(em).await;
         let _ = self.description_changed(em).await;
+        let _ = self.click_changed(em).await;
+        let _ = self.meter_changed(em).await;
+        let _ = self.feel_changed(em).await;
+        let _ = self.beats_changed(em).await;
     }
 }
 
@@ -469,6 +546,60 @@ impl Service {
     #[zbus(property(emits_changed_signal = "false"))]
     fn overruns(&self) -> u64 {
         self.ctl.overruns.load(Ordering::Relaxed)
+    }
+
+    /// Beat click: a click on every beat mixed into the output, higher on bar lines.
+    #[zbus(property)]
+    fn click(&self) -> bool {
+        self.ctl.click()
+    }
+    #[zbus(property)]
+    async fn set_click(
+        &mut self,
+        on: bool,
+        #[zbus(signal_emitter)] em: zbus::object_server::SignalEmitter<'_>,
+    ) {
+        self.ctl
+            .set_beat_options(on, self.ctl.meter(), self.ctl.feel());
+        if !on {
+            self.ctl.set_beats(String::new());
+        }
+        self.announce(&em).await;
+    }
+    /// Beats per bar for the bar lines; 0 = let the tracker choose (3-7).
+    #[zbus(property)]
+    fn meter(&self) -> u32 {
+        self.ctl.meter()
+    }
+    #[zbus(property)]
+    async fn set_meter(
+        &mut self,
+        m: u32,
+        #[zbus(signal_emitter)] em: zbus::object_server::SignalEmitter<'_>,
+    ) {
+        self.ctl
+            .set_beat_options(self.ctl.click(), m, self.ctl.feel());
+        self.announce(&em).await;
+    }
+    /// 1 = the beat as decoded, 0.5 = half time, 2 = double time.
+    #[zbus(property)]
+    fn feel(&self) -> f64 {
+        self.ctl.feel() as f64
+    }
+    #[zbus(property)]
+    async fn set_feel(
+        &mut self,
+        f: f64,
+        #[zbus(signal_emitter)] em: zbus::object_server::SignalEmitter<'_>,
+    ) {
+        self.ctl
+            .set_beat_options(self.ctl.click(), self.ctl.meter(), f as f32);
+        self.announce(&em).await;
+    }
+    /// What the tracker last found, e.g. "158 bpm · 4/bar"; "" while there's nothing.
+    #[zbus(property)]
+    fn beats(&self) -> String {
+        self.ctl.beats()
     }
 
     /// Move the one-slider balance by `step` (e.g. ±0.1); returns the new balance.

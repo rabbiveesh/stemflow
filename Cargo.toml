@@ -26,3 +26,7 @@ cuda = ["ort/cuda"]
 
 [profile.release]
 debug = 1
+
+[build-dependencies]
+# Compiles the vendored Signalsmith Stretch (third_party/signalsmith) for src/stretch.rs.
+cc = "1"

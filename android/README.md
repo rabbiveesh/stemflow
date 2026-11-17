@@ -177,6 +177,32 @@ Notes:
 
 The system service (`vendor.google.edgetpu_vendor_service`) logs "DarwiNN compiler virtual memory limit set to 4096MB" and exits a few seconds into each compile, with no reason visible to the shell. Google's supported route is compiling ahead of time on a Linux desktop (`ai_edge_litert.aot` with the pip package `ai-edge-litert-sdk-google-tensor`, which downloads the Tensor ML SDK and its compiler from Google under their licence agreements). Tried on 2026-11-15 with the owner's go-ahead: the install fails, because the compiler archive it downloads (`tensor-ml-sdk/sdk/releases/6.1.0/litert_plugin_compiler.tar.gz`) returns 404, and earlier package versions only accept a tarball you already have. Google's page says the SDK is a beta you sign up for, so the NPU waits on that access.
 
+### Beat This! (beat tracker) on LiteRT
+
+`tools/export_beat_this_litert.py` converts Beat This! (CPJKU, MIT) so the beat click needs no ONNX Runtime in the APK. Same contract as the desktop's ONNX files (`tools/export_beat_this.py`): input log-mel `[1, 1500, 128]` (30 s at 50 fps), outputs beat and downbeat logits `[1, 1500]`, in that order. Same env as the other exports; `beat_this` itself is taken from the main checkout's `tools/.venv-gpu`:
+
+```sh
+cd android/tools && ~/Android/litert-env/.venv/bin/python -I export_beat_this_litert.py ~/Android/litert-models ../../tools/.venv-gpu/lib/python3.10/site-packages ../../models/beats
+```
+
+| model | file | LiteRT vs PyTorch, max abs logit error (reference clip, logits peak 11–13) | laptop CPU, 4 threads |
+|---|---|---|---|
+| small0 | `beat_this_small0_1500.tflite`, 9.0 MB | beat 2.5e-5, downbeat 2.5e-5 | 0.39 s |
+| final0 | `beat_this_final0_1500.tflite`, 81.6 MB | beat 8.7e-5, downbeat 5.7e-5 | 0.64 s |
+
+The one change to the model: the attention is written out in the export script, because `rotary_embedding_torch` and Beat This!'s `SumHead` wrap their maths in `torch.autocast`, which `torch.export`'s decompositions refuse ("expected compiled_fn to be GraphModule"). The rotary angles become constants per sequence length. The rewrite gives bit-identical output to the stock forward in PyTorch.
+
+It is meant for the CPU (XNNPACK): the GPU belongs to the separator. The graph was not reshaped for the GPU delegate (3-D tensors, time folded into the batch), so the GPU is untried.
+
+`LiteRtBeatNet` in `bench/src/litert.rs` loads it: `load(path, Accel::Cpu, threads)`, `run(&spect) -> (beat, downbeat)`. On LiteRT 2 the CPU thread count now reaches XNNPACK (opaque options named `xnnpack`, TOML `num_threads = N`; it was ignored before). The bench times it and checks it against a reference folder (`spect.f32`, `beat.f32`, `downbeat.f32`, raw f32), one run every `--hop` seconds as the app would:
+
+```sh
+adb push ~/Android/litert-models/beat_this_small0_1500.tflite ../../models/beats/ref_beat_this_small0 /data/local/tmp/stemflow/
+adb shell "cd /data/local/tmp/stemflow && LD_LIBRARY_PATH=. ./stemflow-bench beat_this_small0_1500.tflite --beat-ref ref_beat_this_small0 --threads 2 --hop 3 --runs 10"
+```
+
+**Phone timing: not measured yet** (the phone was off Wi-Fi on 2026-11-16).
+
 ## app/ and core/ — the live app
 
 `core/` is a Rust `cdylib` (JNI) holding the separator on LiteRT/GPU (`bench/src/litert.rs`), the desktop's STFT and sliding-window streaming (`src/spec.rs`, `src/stream.rs`, by path), and a mixer with the desktop's loudness curve and limiter. `app/` is a Kotlin app (no AndroidX):
@@ -251,3 +277,13 @@ Not yet tested: YouTube Music; Shizuku as the way to start the helper without ad
 **Or one player:** the main screen's "From" picker lists "Whatever is playing" plus the installed apps that offer a media service (`Sources.kt`, found through the manifest's `<queries>`); the choice is read when isolation is switched on. A chosen app is captured by uid alone (`RULE_MATCH_UID`, as before), so other sounds keep playing normally. The helper takes `PORT except|only UID...`; `android/helper.sh PACKAGE` captures only that app. Checked live with Spotify chosen (criterion `RULE_MATCH_UID 10320`, audio flowing); the picker itself has not been looked at on the phone, and it is not known whether every player shows up in the list.
 
 **Stem picker (2026-11-16):** the Karaoke switch became a Stem picker (bass, vocals, other, ...; only stems with a model on the phone), as in the GNOME menu. Each stem keeps its own levels and last model. `bsrofo_sw_other_132096.tflite` (`export_bsrofo_litert.py ROOT OUT other`; LiteRT vs PyTorch max error 2e-4 on a peak of 44) is the horn remover.
+
+## Beat click (beat tracking test, 2026-11-16)
+
+`src/beats.rs` (shared with the desktop, included by path) runs Beat This! (CPJKU, MIT) on the last 30 s of input every 3 s, then the "steady" decoder from the beat shootout page (tempo HMM, bar lines every N beats where the downbeat curve agrees; a new tempo or meter must come up three times in a row before the grid follows it). On the phone the model is the LiteRT export above (`LiteRtBeatNet`, CPU/XNNPACK, 2 threads); the GPU stays the separator's. In the app, a "Beat click" switch mixes a click into the output on every beat (higher on bar lines), with a meter picker (Auto, 2–7 per bar) and a feel picker (as heard, half time, double time). The input runs ahead of the output by the separator's lookahead, so the click mostly comes from audio already analysed; between analyses it continues at the last tempo for up to 8 s.
+
+Models: `beat_this_{small0,final0}_1500.tflite` in the app's files; `small0` unless `--es beatmodel final0` picks the other (from the next start). Control over adb: `--ez click true`, `--ei meter 3` (0 = auto), `--ef feel 2`.
+
+Pixel 10a, idle, CPU (bench `--beat-ref`, 6 runs, p50): small0 1.30 s with 2 threads, 0.91 s with 4; final0 2.33 s / 1.60 s. Error vs PyTorch < 1e-4.
+
+`android/beatcheck` checks the mel spectrogram and decoder on the host (ONNX Runtime): mel vs torchaudio 1.3e-4, decoder identical to the page's beats.js on clip 1.

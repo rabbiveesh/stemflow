@@ -27,14 +27,15 @@ object Models {
     }
 
     /** The stems a model can isolate, in menu order (as src/models.rs). */
-    val STEMS = listOf("bass", "vocals", "other", "piano", "guitar", "drums")
+    /** "bass+vocals": one run of a two-head model gives both, each with its own level. */
+    val STEMS = listOf("bass", "bass+vocals", "vocals", "other", "piano", "guitar", "drums")
     private val LABELS = mapOf(
-        "bass" to "Bass", "vocals" to "Vocals (karaoke)", "other" to "Other (horns, strings…)",
+        "bass" to "Bass", "bass+vocals" to "Bass + vocals", "vocals" to "Vocals (karaoke)", "other" to "Other (horns, strings…)",
         "piano" to "Piano", "guitar" to "Guitar", "drums" to "Drums",
     )
     fun stemLabel(stem: String) = LABELS[stem] ?: stem
 
-    private val pattern = Regex("""(.+)_(${STEMS.joinToString("|")})_(\d+)\.tflite""")
+    private val pattern = Regex("""(.+)_(${STEMS.joinToString("|") { Regex.escape(it) }})_(\d+)\.tflite""")
 
     fun all(c: Context): List<Model> =
         listOfNotNull(c.filesDir, c.getExternalFilesDir(null))
@@ -73,6 +74,21 @@ object Models {
         // Default: the newest file, i.e. the one pushed last.
         return list.firstOrNull { it.id == saved } ?: list.maxByOrNull { it.file.lastModified() }
     }
+
+    /**
+     * The beat tracker: a Beat This! LiteRT export (tools/export_beat_this_litert.py),
+     * e.g. `beat_this_small0_1500.tflite`, pushed next to the separators. The small one
+     * unless another is picked (`--es beatmodel final0`).
+     */
+    fun beatModel(c: Context): File? {
+        val all = listOfNotNull(c.filesDir, c.getExternalFilesDir(null))
+            .flatMap { it.listFiles()?.toList() ?: emptyList() }
+            .filter { it.name.startsWith("beat_this_") && it.name.endsWith(".tflite") }
+        val want = prefs(c).getString("beat_model", "small0")!!
+        return all.firstOrNull { it.name.startsWith("beat_this_${want}_") } ?: all.firstOrNull()
+    }
+
+    fun selectBeatModel(c: Context, name: String) = prefs(c).edit().putString("beat_model", name).apply()
 
     fun select(c: Context, m: Model) = prefs(c).edit().putString("model_" + m.stem, m.id).apply()
 }
