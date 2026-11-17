@@ -22,6 +22,7 @@ import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.util.Log
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -35,6 +36,7 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
+import android.widget.Toast
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -813,8 +815,14 @@ class MainActivity : Activity() {
             .setTitle("Save this loop")
             .setView(input)
             .setPositiveButton("Save") { _, _ ->
-                val err = CaptureService.saveBookmark(this, input.text.toString().ifBlank { "Loop" })
-                if (err != null) CaptureService.loopStatus = err
+                val name = input.text.toString().ifBlank { "Loop" }
+                val err = try {
+                    CaptureService.saveBookmark(this, name)
+                } catch (e: Exception) {
+                    Log.e("stemflow", "bookmark save failed", e)
+                    "Not saved: ${e.message}"
+                }
+                Toast.makeText(this, err ?: "Saved \u201c$name\u201d", Toast.LENGTH_LONG).show()
                 refreshBookmarks(force = true)
             }
             .setNegativeButton("Cancel", null)

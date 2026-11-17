@@ -12,6 +12,9 @@ import android.os.Parcel;
  */
 public class HelperService extends Binder {
     static final int START = 1;
+    /** Bring the app back to the front (the shell may start activities; we, from the
+     * background, may not): after recall opened the player to switch tracks. */
+    static final int FRONT = 2;
     /** Shizuku's own "destroy" transaction (IBinder.LAST_CALL_TRANSACTION - 100). */
     private static final int DESTROY = 16777115;
 
@@ -23,6 +26,17 @@ public class HelperService extends Binder {
     protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) {
         if (code == DESTROY) {
             System.exit(0);
+            return true;
+        }
+        if (code == FRONT) {
+            final String component = data.readString();
+            try {
+                new ProcessBuilder("am", "start", "-n", component, "--activity-reorder-to-front")
+                    .redirectErrorStream(true).start().waitFor();
+                if (reply != null) reply.writeNoException();
+            } catch (Exception e) {
+                if (reply != null) reply.writeException(new IllegalStateException(e.toString()));
+            }
             return true;
         }
         if (code == START) {

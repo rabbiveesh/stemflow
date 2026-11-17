@@ -17,6 +17,7 @@ import rikka.shizuku.Shizuku
 object Shizu {
     private var conn: ServiceConnection? = null
     private var args: Shizuku.UserServiceArgs? = null
+    @Volatile private var binder: IBinder? = null
 
     /** Shizuku is installed and its service is running. */
     fun available() = try { Shizuku.pingBinder() } catch (_: Throwable) { false }
@@ -52,9 +53,10 @@ object Shizu {
             .daemon(false)
             .processNameSuffix("helper")
             .debuggable(true)
-            .version(2)
+            .version(3)
         val sc = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+                this@Shizu.binder = binder
                 val data = Parcel.obtain()
                 val reply = Parcel.obtain()
                 try {
@@ -71,7 +73,7 @@ object Shizu {
                     reply.recycle()
                 }
             }
-            override fun onServiceDisconnected(name: ComponentName) {}
+            override fun onServiceDisconnected(name: ComponentName) { this@Shizu.binder = null }
         }
         args = a
         conn = sc
@@ -83,5 +85,25 @@ object Shizu {
         try { Shizuku.unbindUserService(a, conn, true) } catch (_: Throwable) {}
         args = null
         conn = null
+        binder = null
+    }
+
+    /** Bring stemflow to the front through the helper; false if it isn't running. */
+    fun front(c: Context): Boolean {
+        val b = binder ?: return false
+        val data = Parcel.obtain()
+        val reply = Parcel.obtain()
+        return try {
+            data.writeString("${c.packageName}/${MainActivity::class.java.name}")
+            b.transact(2, data, reply, 0) // HelperService.FRONT
+            reply.readException()
+            true
+        } catch (e: Throwable) {
+            Log.e(CaptureService.TAG, "bringing stemflow back failed", e)
+            false
+        } finally {
+            data.recycle()
+            reply.recycle()
+        }
     }
 }

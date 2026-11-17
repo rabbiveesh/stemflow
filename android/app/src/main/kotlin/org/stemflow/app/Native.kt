@@ -46,5 +46,7 @@ object Native {
     /** [start, end, bar 1, beats per bar, bars, feel] in buffer frames; empty without a loop */
     @JvmStatic external fun looperTimes(h: Long): DoubleArray
     @JvmStatic external fun looperSetTimes(h: Long, start: Double, end: Double, bar1: Double)
+    @JvmStatic external fun looperGrid(h: Long): DoubleArray
+    @JvmStatic external fun looperLay(h: Long, beats: DoubleArray, a: Int, b: Int, one: Int, meter: Int, bpm: Float, feel: Float)
     @JvmStatic fun looperIsPlaying(h: Long) = looperView(h, 1).let { it.isNotEmpty() && it[0] > 0f }
 }

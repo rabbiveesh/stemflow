@@ -21,6 +21,7 @@ import android.media.projection.MediaProjectionManager
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.media.session.PlaybackState
 import android.os.Process
 import android.service.quicksettings.TileService
 import android.content.ComponentName
@@ -103,6 +104,7 @@ class CaptureService : Service() {
         @Volatile var anchor: Anchor? = null
         /** The anchor when the current loop was asked for, for saving it. */
         @Volatile private var loopAnchor: Anchor? = null
+        private var anchorWhy: String? = "start"
 
         /** The current loop's [start, end] in song ms, if the player said what was playing. */
         fun loopSongRange(): LongArray? {
@@ -120,14 +122,29 @@ class CaptureService : Service() {
             if (h == 0L) return "No loop"
             val t = Native.looperTimes(h)
             if (t.size < 6) return "No loop"
-            val a = loopAnchor ?: return if (NowPlaying.granted(c)) "The player didn't say what was playing" else "Allow notification access first"
+            if (!NowPlaying.granted(c)) return "Allow notification access first"
+            // A loop made before the player was readable has no anchor of its own; the
+            // last one taken while the song played (after the loop was pressed) still
+            // maps the buffer to the song, as long as nothing was seeked in between.
+            val a = loopAnchor ?: anchor
+                ?: return "Not saved: stemflow didn't know the song when this loop was made. Press Live, then loop again."
             val s = a.song
-            Bookmarks.add(c, Bookmarks.Bookmark(
+            var bm = Bookmarks.Bookmark(
                 name, s.pkg, s.title, s.artist, s.album, s.mediaId,
                 a.msOf(t[0]), a.msOf(t[1]), a.msOf(t[2]), t[3].toInt(), t[4].toInt(), t[5].toFloat(),
-            ))
+            )
+            grid(h, a)?.let { bm = bm.withGrid(it) }
+            Bookmarks.add(c, bm)
             Log.i(TAG, "bookmark %s: %s %d-%d ms".format(name, s.title, a.msOf(t[0]), a.msOf(t[1])))
             return null
+        }
+
+        /** The looper's beats around the loop, in song ms by `a`. */
+        private fun grid(h: Long, a: Anchor): Bookmarks.Grid? {
+            val g = Native.looperGrid(h)
+            if (g.size < 7) return null
+            val beats = DoubleArray(g.size - 5) { a.msOf(g[5 + it]).toDouble() }
+            return Bookmarks.Grid(beats, g[0].toInt(), g[1].toInt(), g[2].toInt(), g[4].toFloat())
         }
 
         /**
@@ -153,20 +170,52 @@ class CaptureService : Service() {
             Native.looperEdit(h, 8, 0, 0, 0f) // straight to live: we listen to the run-up
             val now = NowPlaying.song(ctl)
             if (now == null || !now.same(b.song)) {
-                if (b.mediaId.isEmpty()) throw Exception("Play ${b.title} in the player, then try again")
-                ctl.transportControls.playFromMediaId(b.mediaId, null)
-                val until = System.currentTimeMillis() + 8000
+                // Ask the player's session first: no app switch. Spotify ignores these
+                // from apps it doesn't know, so after a few seconds open its link
+                // instead (spotify:track:…), which comes to the front; come back after.
+                val can = ctl.playbackState?.actions ?: 0L
+                val tc = ctl.transportControls
+                Log.i(TAG, "recall: open ${b.mediaId} (actions $can) from ${NowPlaying.song(ctl)?.mediaId}")
+                when {
+                    b.mediaId.contains(':') && can and PlaybackState.ACTION_PLAY_FROM_URI != 0L ->
+                        tc.playFromUri(android.net.Uri.parse(b.mediaId), null)
+                    b.mediaId.isNotEmpty() && can and PlaybackState.ACTION_PLAY_FROM_MEDIA_ID != 0L ->
+                        tc.playFromMediaId(b.mediaId, null)
+                    can and PlaybackState.ACTION_PLAY_FROM_SEARCH != 0L ->
+                        tc.playFromSearch("${b.title} ${b.artist}".trim(), null)
+                }
+                loopStatus = "Opening ${b.title} in the player…"
+                var linked = false
+                val t0 = System.currentTimeMillis()
+                var seen = ""
                 while (NowPlaying.song(ctl)?.same(b.song) != true) {
-                    if (System.currentTimeMillis() > until) throw Exception("The player didn't open ${b.title}")
+                    val cur = NowPlaying.song(ctl)?.let { "${it.title} / ${it.artist} state ${ctl.playbackState?.state}" } ?: "none"
+                    if (cur != seen) { Log.i(TAG, "recall: player has $cur"); seen = cur }
+                    val waited = System.currentTimeMillis() - t0
+                    if (!linked && waited > 3000) {
+                        linked = true
+                        if (!openLink(c, b)) throw Exception("Play ${b.title} in the player, then try again")
+                    }
+                    if (waited > 30_000) throw Exception("The player didn't open ${b.title}")
                     Thread.sleep(200)
                 }
+                if (linked) {
+                    Thread.sleep(500)
+                    comeBack(c)
+                }
             }
-            val runUp = 12_000L
-            val seekTo = (b.startMs - runUp).coerceAtLeast(0)
+            // With its own beats, only the stems are needed: a short run-up for the
+            // separator to settle, then up to the last kept beat. Without, enough
+            // before the loop for Beat This! to find the tempo.
+            val own = b.hasGrid
+            val first = if (own) b.beats.first().toLong() else b.startMs
+            val last = if (own) b.beats.last().toLong() else b.endMs
+            val runUp = if (own) 4_000L else 12_000L
+            val seekTo = (first - runUp).coerceAtLeast(0)
             ctl.transportControls.seekTo(seekTo)
             ctl.transportControls.play()
             val since = System.nanoTime()
-            // an anchor after the seek that has passed the loop's end
+            // an anchor after the seek that has passed the end of what's needed
             val until = System.currentTimeMillis() + 60_000
             var a: Anchor
             while (true) {
@@ -176,22 +225,54 @@ class CaptureService : Service() {
                 val x = anchor ?: continue
                 if (x.at < since || !x.song.same(b.song) || x.songMs < seekTo) continue
                 loopStatus = "Listening up to the loop… %s".format(Bookmarks.time(x.songMs))
-                if (x.songMs < b.endMs + 1500) continue
+                if (x.songMs < last + if (own) 500 else 1500) continue
                 a = x
                 break
             }
-            // the stems for the loop's end (and a second more) are in the buffer
-            val need = a.frameOf(b.endMs + 1000)
+            // the stems up to there are in the buffer
+            val need = a.frameOf(last + if (own) 300 else 1000)
             while (Native.looperTotal(h) < need) {
                 if (!running || System.currentTimeMillis() > until) throw Exception("Timed out")
                 Thread.sleep(100)
             }
-            loopStatus = "Finding the bars…"
-            Native.looperFind(h, a.frameOf(b.endMs), b.bars, b.meter, b.feel)
-            Native.looperSetTimes(h, a.frameOf(b.startMs).toDouble(), a.frameOf(b.endMs).toDouble(), a.frameOf(b.bar1Ms).toDouble())
+            if (own) {
+                val frames = DoubleArray(b.beats.size) { a.frame + (b.beats[it] - a.songMs) * RATE / 1000 }
+                Native.looperLay(h, frames, b.a, b.b, b.one, b.meter, b.bpm, b.feel)
+            } else {
+                loopStatus = "Finding the bars…"
+                Native.looperFind(h, a.frameOf(b.endMs), b.bars, b.meter, b.feel)
+                Native.looperSetTimes(h, a.frameOf(b.startMs).toDouble(), a.frameOf(b.endMs).toDouble(), a.frameOf(b.bar1Ms).toDouble())
+                // keep the beats now, so next time there's nothing to find
+                grid(h, a)?.let { Bookmarks.replace(c, b.withGrid(it)) }
+            }
             loopAnchor = a
             mediaKey(c, KeyEvent.KEYCODE_MEDIA_PAUSE)
             Log.i(TAG, "recalled %s".format(b.name))
+        }
+
+        /** Open the bookmark's recording through its link (the player comes to the front). */
+        private fun openLink(c: Context, b: Bookmarks.Bookmark): Boolean {
+            if (!b.mediaId.contains(':')) return false
+            val i = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(b.mediaId))
+                .setPackage(b.pkg).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            return try {
+                c.startActivity(i)
+                Log.i(TAG, "recall: opened link ${b.mediaId}")
+                true
+            } catch (e: Exception) {
+                Log.e(TAG, "recall: link failed: ${e.message}")
+                false
+            }
+        }
+
+        /**
+         * Back to stemflow after the player came to the front. Android won't let an
+         * app in the background start its own activity, but the Shizuku helper (the
+         * shell) may; without it, say so and let the user switch back.
+         */
+        private fun comeBack(c: Context) {
+            if (Shizu.front(c)) Log.i(TAG, "recall: back to stemflow")
+            else loopStatus = "Switch back to stemflow: the loop is on its way"
         }
 
         /** A media key to whatever is playing (Spotify): we have no media session of our own. */
@@ -217,10 +298,15 @@ class CaptureService : Service() {
         fun loopLast(c: Context, bars: Int) {
             val h = looper
             if (h == 0L) { loopStatus = "Looping isn't ready yet"; return }
-            if (Native.looperIsPlaying(h)) { Native.looperEdit(h, 4, bars, 0, 0f); return }
+            if (Native.looperIsPlaying(h)) {
+                if (loopAnchor == null) loopAnchor = anchor
+                Native.looperEdit(h, 4, bars, 0, 0f)
+                return
+            }
             val press = heardFrame()
             if (press < 0) return
             loopAnchor = anchor
+            Log.i(TAG, "loop pressed: anchor %s".format(anchor?.let { "${it.song.title} @ ${it.songMs}" }))
             loopStatus = "Finding the bars…"
             thread(name = "stemflow-find") {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
@@ -472,13 +558,18 @@ class CaptureService : Service() {
                 processed += hop
                 // Where the player is now = the newest input received (this hop and any
                 // chunks queued after it), whose stems land `delay` frames later.
-                NowPlaying.controller(this)?.let { ctl ->
-                    val song = NowPlaying.song(ctl)
-                    val ms = NowPlaying.positionMs(ctl)
-                    if (song != null && ms != null && NowPlaying.playing(ctl)) {
-                        anchor = Anchor(processed + chunks.size * (RATE / 10) + delayFrames, ms, song)
-                    }
+                val ctl = NowPlaying.controller(this)
+                val song = ctl?.let { NowPlaying.song(it) }
+                val ms = ctl?.let { NowPlaying.positionMs(it) }
+                val why = when {
+                    ctl == null -> "no player session"
+                    song == null -> "${ctl.packageName}: no title"
+                    ms == null -> "${ctl.packageName}: no position"
+                    !NowPlaying.playing(ctl) -> "${ctl.packageName}: state ${ctl.playbackState?.state}"
+                    else -> null
                 }
+                if (why == null) anchor = Anchor(processed + chunks.size * (RATE / 10) + delayFrames, ms!!, song!!)
+                if (why != anchorWhy) { Log.i(TAG, "anchor: ${why ?: "${song?.title} @ $ms"}"); anchorWhy = why }
                 val bass = FloatArray(2 * hop)
                 val band = FloatArray(2 * hop)
                 val second = FloatArray(2 * hop)
