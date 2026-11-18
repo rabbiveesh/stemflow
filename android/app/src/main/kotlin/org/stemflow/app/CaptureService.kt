@@ -676,6 +676,7 @@ class CaptureService : Service() {
 
     /** Load `m` if it isn't the loaded model; false if that failed. */
     private fun load(m: Models.Model): Boolean {
+        Models.applyMono(this, m)
         if (engine != 0L && engineModel == m.file.path) return true
         status = "Loading ${m.label}…"
         loading = true

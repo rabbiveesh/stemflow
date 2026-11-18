@@ -28,11 +28,43 @@ use jni::objects::{JClass, JDoubleArray, JFloatArray, JString};
 use jni::sys::{jfloat, jfloatArray, jint, jlong};
 use jni::JNIEnv;
 use litert::{Accel, LiteRtBeatNet, LiteRtDemucs, LiteRtRoformer};
-use model::{MonoFold, Separator, SAMPLE_RATE};
+use model::{Separator, SAMPLE_RATE};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use stream::Streamer;
 
 type Engine = Streamer<Box<dyn Separator>>;
+
+/// Fold the separator's input to mono, and the mix played to mono. Set per model by
+/// the app; both can change while running.
+static MONO_IN: AtomicBool = AtomicBool::new(false);
+static MONO_OUT: AtomicBool = AtomicBool::new(false);
+
+/// A separator whose input follows `MONO_IN`.
+struct Input(Box<dyn Separator>);
+
+impl Separator for Input {
+    fn window_len(&self) -> usize {
+        self.0.window_len()
+    }
+
+    fn stems(&self) -> usize {
+        self.0.stems()
+    }
+
+    fn valid_len(&self) -> usize {
+        self.0.valid_len()
+    }
+
+    fn separate(&mut self, mix: &[f32]) -> Result<Vec<f32>> {
+        if !MONO_IN.load(Ordering::Relaxed) {
+            return self.0.separate(mix);
+        }
+        let (l, r) = mix.split_at(mix.len() / 2);
+        let m: Vec<f32> = l.iter().zip(r).map(|(a, b)| 0.5 * (a + b)).collect();
+        self.0.separate(&[&m[..], &m[..]].concat())
+    }
+}
 
 /// Highest target level: 2.0 sounds twice as loud as the original (+10 dB).
 const MAX_BASS: f32 = 2.0;
@@ -115,6 +147,13 @@ impl Mixer {
                 out[k] = gb * bass[k] + gr * band[k] + gs * sec(k);
             }
         }
+        if MONO_OUT.load(Ordering::Relaxed) {
+            for f in out.chunks_exact_mut(2) {
+                let m = 0.5 * (f[0] + f[1]);
+                f[0] = m;
+                f[1] = m;
+            }
+        }
         let next_peak = (2 * block..bass.len()).fold(0f32, |m, k| {
             m.max((target.0 * bass[k] + target.1 * band[k] + target.2 * sec(k)).abs())
         });
@@ -158,14 +197,7 @@ pub extern "system" fn Java_org_stemflow_app_Native_engineNew<'l>(
         } else {
             Box::new(LiteRtDemucs::load(path, accel, 0)?)
         };
-        // True stereo, or a stem's wide part (a voice's reverb) can't be in the stem,
-        // stays in the band, and is heard as an echo of what was removed. Except
-        // htdemucs bass: on stereo it finds almost no bass in wide mixes.
-        let sep: Box<dyn Separator> = if !roformer && name.contains("bass") {
-            Box::new(MonoFold(sep))
-        } else {
-            sep
-        };
+        let sep: Box<dyn Separator> = Box::new(Input(sep));
         let secs = |s: f32| (s * SAMPLE_RATE as f32).round() as usize;
         let (hop, la, xf) = (secs(hop), secs(lookahead), secs(xfade));
         ensure!(
@@ -182,6 +214,18 @@ pub extern "system" fn Java_org_stemflow_app_Native_engineNew<'l>(
         throw(&mut env, e);
         0
     })
+}
+
+/// Mono input to the separator, and mono output to the speaker.
+#[no_mangle]
+pub extern "system" fn Java_org_stemflow_app_Native_setMono(
+    _: JNIEnv,
+    _: JClass,
+    input: jni::sys::jboolean,
+    output: jni::sys::jboolean,
+) {
+    MONO_IN.store(input != 0, Ordering::Relaxed);
+    MONO_OUT.store(output != 0, Ordering::Relaxed);
 }
 
 /// Release an engine (model, GPU delegate and their ~1 GB). `h` is dead afterwards.

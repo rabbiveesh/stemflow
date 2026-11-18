@@ -91,4 +91,24 @@ object Models {
     fun selectBeatModel(c: Context, name: String) = prefs(c).edit().putString("beat_model", name).apply()
 
     fun select(c: Context, m: Model) = prefs(c).edit().putString("model_" + m.stem, m.id).apply()
+
+    /**
+     * Each model remembers whether it hears a mono fold and whether what's played is
+     * folded to mono. Plain bass models start on mono input: bass tends to come through
+     * clearer, and htdemucs can miss it altogether when it's panned. The rest start on
+     * stereo, or a voice's wide reverb stays in the band and is heard as an echo.
+     */
+    fun monoIn(c: Context, m: Model) = prefs(c).getBoolean("mono_in_" + m.id, m.stem == "bass")
+    fun monoOut(c: Context, m: Model) = prefs(c).getBoolean("mono_out_" + m.id, false)
+
+    fun setMono(c: Context, m: Model, input: Boolean, output: Boolean) {
+        prefs(c).edit().putBoolean("mono_in_" + m.id, input).putBoolean("mono_out_" + m.id, output).apply()
+        applyMono(c, m)
+    }
+
+    fun applyMono(c: Context, m: Model) {
+        val (input, output) = monoIn(c, m) to monoOut(c, m)
+        Native.setMono(input, output)
+        android.util.Log.i(CaptureService.TAG, "${m.id}: mono in $input, mono out $output")
+    }
 }

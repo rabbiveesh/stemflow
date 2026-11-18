@@ -91,6 +91,8 @@ class MainActivity : Activity() {
     private lateinit var vocalsValue: TextView
     private lateinit var bandValue: TextView
     private lateinit var modelPicker: Picker
+    private lateinit var monoIn: Button
+    private lateinit var monoOut: Button
     private var modelIds = listOf<String>()
     private lateinit var sourcePicker: Picker
     private var sourcePkgs = listOf<String?>()
@@ -372,10 +374,21 @@ class MainActivity : Activity() {
             val pkg = sourcePkgs.getOrNull(pos)
             if (pkg != Sources.current(this)?.pkg) Sources.select(this, Sources.apps(this).firstOrNull { it.pkg == pkg })
         }
-        val divider = View(this).apply { setBackgroundColor(raised); layoutParams = lp(LayoutParams.MATCH_PARENT, dp(1)) }
+        fun divider() = View(this).apply { setBackgroundColor(raised); layoutParams = lp(LayoutParams.MATCH_PARENT, dp(1)) }
+        monoIn = button("Input", chip = true, weight = 0f) {
+            Models.current(this)?.let { Models.setMono(this, it, !Models.monoIn(this, it), Models.monoOut(this, it)) }
+        }
+        monoOut = button("Output", chip = true, weight = 0f) {
+            Models.current(this)?.let { Models.setMono(this, it, Models.monoIn(this, it), !Models.monoOut(this, it)) }
+        }
         val pickers = column(
             row(label("Model", 14f, muted).apply { minWidth = dp(64) }, modelPicker.view).apply { setPadding(dp(16), dp(4), dp(12), dp(4)) },
-            divider,
+            divider(),
+            row(label("Mono", 14f, muted).apply { minWidth = dp(64) }, monoIn, monoOut).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(16), dp(10), dp(12), dp(10))
+            },
+            divider(),
             row(label("From", 14f, muted).apply { minWidth = dp(64) }, sourcePicker.view).apply { setPadding(dp(16), dp(4), dp(12), dp(4)) },
         ).apply { background = rounded(surface, 18) }
         val onLoop = Switch(this).apply {
@@ -623,6 +636,8 @@ class MainActivity : Activity() {
         val running = CaptureService.running
         power.isChecked = running
         val wanted = Models.current(this)
+        style(monoIn, wanted != null && Models.monoIn(this, wanted), true)
+        style(monoOut, wanted != null && Models.monoOut(this, wanted), true)
         val loading = running &&
             (CaptureService.loading || (wanted != null && wanted.file.path != CaptureService.loadedModel))
         spinner.visibility = if (loading) View.VISIBLE else View.GONE
