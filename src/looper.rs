@@ -815,6 +815,18 @@ impl Looper {
         st.tail = here;
         st.tail_wait = false;
         st.scanned = here.unwrap_or(0);
+        Self::forget_loop(&mut st);
+    }
+
+    /// No loop any more: the tail plays from the buffer and needs none of this.
+    fn forget_loop(st: &mut State) {
+        st.grid = None;
+        st.analysis = None;
+        st.clip = None;
+        st.a = 0;
+        st.b = 0;
+        st.pos = 0;
+        st.resync();
     }
 
     /// Straight to the live stream, dropping the buffered tail.
@@ -822,6 +834,7 @@ impl Looper {
         let mut st = self.state.lock().unwrap();
         st.playing = false;
         st.tail = None;
+        Self::forget_loop(&mut st);
     }
 
     /// Start the loop again from the top (or resume after `stop`).
@@ -1453,6 +1466,21 @@ mod tests {
             "first {:?}",
             &b[..4]
         );
+    }
+
+    /// Back to live leaves no loop behind, while the music plays on from the buffer.
+    #[test]
+    fn going_live_forgets_the_loop() {
+        let l = loop_on_a_grid();
+        l.push(&vec![0.5; 2 * 8 * RATE], &vec![0.5; 2 * 8 * RATE], &[]);
+        l.go_live();
+        assert!(l.view(10).is_none() && l.times().is_none() && !l.playing());
+        let (mut b, mut r, mut c) = (vec![0f32; 2048], vec![0f32; 2048], vec![0f32; 1024]);
+        assert_eq!(
+            l.read(&mut b, &mut r, &mut [], &mut c, 1024, 1024),
+            Some(4 * RATE as i64)
+        );
+        assert!(b[0] > 0.0);
     }
 
     /// Going live and catching up with the newest audio: one wait for a margin, then

@@ -91,6 +91,7 @@ class MainActivity : Activity() {
     private lateinit var vocalsValue: TextView
     private lateinit var bandValue: TextView
     private lateinit var modelPicker: Picker
+    private lateinit var loopActions: View
     private lateinit var monoIn: Button
     private lateinit var monoOut: Button
     private var modelIds = listOf<String>()
@@ -516,6 +517,7 @@ class MainActivity : Activity() {
         val top = button("From the top", weight = 0f) { edit(1, 0, 0, 0f) }.apply { layoutParams = lp(LayoutParams.MATCH_PARENT, dp(46)) }
         val repair = button("Repair", weight = 0f) { CaptureService.repair(this) }.apply { layoutParams = lp(LayoutParams.MATCH_PARENT, dp(46)) }
         val actions = column(top, margins(repair, t = 8)).apply { setPadding(dp(16), dp(14), dp(16), 0) }
+        loopActions = actions
 
         return page(
             header("Loops", loopDesc),
@@ -739,6 +741,7 @@ class MainActivity : Activity() {
         val v = if (h != 0L && CaptureService.running) Native.looperView(h, bins) else FloatArray(0)
         val has = v.size >= 14
         loopEdit.visibility = if (has) View.VISIBLE else View.GONE
+        loopActions.visibility = if (has) View.VISIBLE else View.GONE
         if (has) {
             loopView.update(v, CaptureService.unheardFrames() * Control.speed)
             loopBars = v[4].toInt().coerceAtLeast(1)
