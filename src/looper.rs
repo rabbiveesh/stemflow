@@ -193,6 +193,8 @@ struct State {
     /// Buffer frames that aren't continuous song audio (a seek, a pause, skipped
     /// input, another track): a loop may not span one.
     gaps: Vec<(i64, i64)>,
+    /// counts writes of separated audio (see `with_fresh_clip`)
+    stem_gen: u64,
     /// Buffer frames holding the plain mix (in the band's place), not separated yet.
     plain: Vec<(i64, i64)>,
     settings: Settings,
@@ -310,6 +312,7 @@ impl Looper {
                 analysis: None,
                 clip: None,
                 gaps: Vec::new(),
+                stem_gen: 0,
                 plain: Vec::new(),
                 settings: Settings::default(),
                 grid: None,
@@ -356,10 +359,9 @@ impl Looper {
     fn find_inner(&self, press: u64, bars: usize, s: Settings) -> Result<()> {
         let clip = self.snapshot();
         let an = self.analyse(&clip)?;
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.with_fresh_clip();
         st.settings = s;
         st.analysis = Some(an);
-        st.clip = Some(clip);
         self.decode(&mut st);
         let g = st.grid.as_ref().unwrap();
         ensure!(g.beats.len() > 2, "no beat found");
@@ -382,6 +384,21 @@ impl Looper {
         st.tail = None;
         st.resync();
         Ok(())
+    }
+
+    /// The state, with a copy of the buffer newer than any separated audio written
+    /// so far. A copy taken before an analysis can't be used after it: what was
+    /// separated meanwhile wouldn't be in it, though it's marked as done.
+    fn with_fresh_clip(&self) -> std::sync::MutexGuard<'_, State> {
+        loop {
+            let gen = self.state.lock().unwrap().stem_gen;
+            let clip = self.snapshot();
+            let mut st = self.state.lock().unwrap();
+            if st.stem_gen == gen {
+                st.clip = Some(clip);
+                return st;
+            }
+        }
     }
 
     /// A copy of the newest minute of the buffer, to loop from.
@@ -488,11 +505,10 @@ impl Looper {
         let bar = (0..beats.len())
             .map(|k| (k + meter - one % meter).is_multiple_of(meter))
             .collect();
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.with_fresh_clip();
         st.settings.meter = meter;
         st.settings.feel = feel;
         st.analysis = None;
-        st.clip = Some(clip);
         st.grid = Some(Grid {
             beats,
             bar,
@@ -527,7 +543,7 @@ impl Looper {
             return Ok(false);
         }
         let an = self.analyse(&clip)?;
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.with_fresh_clip();
         if st.grid.is_none() {
             return Ok(false); // the loop went meanwhile
         }
@@ -535,7 +551,6 @@ impl Looper {
         st.settings.min_bpm = bpm * 0.85;
         st.settings.max_bpm = bpm * 1.18;
         st.analysis = Some(an);
-        st.clip = Some(clip);
         self.decode(&mut st);
         st.settings.min_bpm = old.min_bpm;
         st.settings.max_bpm = old.max_bpm;
@@ -583,12 +598,11 @@ impl Looper {
         }
         self.state.lock().unwrap().finding = true;
         let an = self.analyse(&clip);
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.with_fresh_clip();
         st.finding = false;
         let an = an?;
         st.settings.meter = meter;
         st.analysis = Some(an);
-        st.clip = Some(clip);
         self.decode(&mut st);
         let g = st.grid.as_mut().unwrap();
         let a = (0..g.beats.len())
@@ -1277,7 +1291,22 @@ impl Looper {
     /// Put re-separated stems into the loop's copy from frame `from` (what is outside
     /// the copy is dropped; `second` empty for a one-stem model).
     pub fn replace(&self, from: i64, bass: &[f32], band: &[f32], second: &[f32]) {
+        // The buffer first: a copy taken from here on has it, and one taken before is
+        // caught by `stem_gen`, or is already in place and gets written below.
+        {
+            let mut ring = self.ring.lock().unwrap();
+            let (lo, hi, cap) = (ring.oldest() as i64, ring.total as i64, ring.cap);
+            for i in 0..bass.len() / 2 {
+                let f = from + i as i64;
+                if f < lo || f >= hi {
+                    continue;
+                }
+                let k = CH * (f as usize % cap);
+                put(&mut ring.data[k..k + CH], bass, band, second, i);
+            }
+        }
         let mut st = self.state.lock().unwrap();
+        st.stem_gen += 1;
         let Some(c) = st.clip.as_mut() else { return };
         for i in 0..bass.len() / 2 {
             let k = from + i as i64 - c.from as i64;
@@ -1286,18 +1315,6 @@ impl Looper {
             }
             let k = CH * k as usize;
             put(&mut c.data[k..k + CH], bass, band, second, i);
-        }
-        drop(st);
-        // and into the buffer, so a later copy (a longer or moved loop) has it too
-        let mut ring = self.ring.lock().unwrap();
-        let (lo, hi, cap) = (ring.oldest() as i64, ring.total as i64, ring.cap);
-        for i in 0..bass.len() / 2 {
-            let f = from + i as i64;
-            if f < lo || f >= hi {
-                continue;
-            }
-            let k = CH * (f as usize % cap);
-            put(&mut ring.data[k..k + CH], bass, band, second, i);
         }
     }
 
@@ -1466,6 +1483,20 @@ mod tests {
             "first {:?}",
             &b[..4]
         );
+    }
+
+    /// Separated audio written while a copy was being analysed isn't lost.
+    #[test]
+    fn a_new_copy_has_what_was_separated_meanwhile() {
+        let l = loop_on_a_grid();
+        let n = RATE;
+        l.push(&vec![0.0; 2 * n], &vec![0.5; 2 * n], &[]);
+        let stale = l.snapshot();
+        l.replace(100, &vec![0.25; 200], &vec![0.25; 200], &[]);
+        assert_eq!(stale.at(150)[0], 0.0, "the old copy doesn't have it");
+        let st = l.with_fresh_clip();
+        let v = st.clip.as_ref().unwrap().at(150);
+        assert!((v[0] - 0.25).abs() < 1e-3 && (v[2] - 0.25).abs() < 1e-3);
     }
 
     /// Back to live leaves no loop behind, while the music plays on from the buffer.
