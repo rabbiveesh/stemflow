@@ -32,7 +32,7 @@ use model::{MonoFold, Separator, SAMPLE_RATE};
 use std::time::Instant;
 use stream::Streamer;
 
-type Engine = Streamer<MonoFold<Box<dyn Separator>>>;
+type Engine = Streamer<Box<dyn Separator>>;
 
 /// Highest target level: 2.0 sounds twice as loud as the original (+10 dB).
 const MAX_BASS: f32 = 2.0;
@@ -149,15 +149,23 @@ pub extern "system" fn Java_org_stemflow_app_Native_engineNew<'l>(
             _ => Accel::GpuFp16,
         };
         let path = std::path::Path::new(&path);
-        let roformer = path
+        let name = path
             .file_name()
-            .is_some_and(|n| n.to_string_lossy().starts_with("bsrofo"));
+            .map_or(String::new(), |n| n.to_string_lossy().into_owned());
+        let roformer = name.starts_with("bsrofo");
         let sep: Box<dyn Separator> = if roformer {
             Box::new(LiteRtRoformer::load(path, accel, 0)?)
         } else {
             Box::new(LiteRtDemucs::load(path, accel, 0)?)
         };
-        let sep = MonoFold(sep);
+        // True stereo, or a stem's wide part (a voice's reverb) can't be in the stem,
+        // stays in the band, and is heard as an echo of what was removed. Except
+        // htdemucs bass: on stereo it finds almost no bass in wide mixes.
+        let sep: Box<dyn Separator> = if !roformer && name.contains("bass") {
+            Box::new(MonoFold(sep))
+        } else {
+            sep
+        };
         let secs = |s: f32| (s * SAMPLE_RATE as f32).round() as usize;
         let (hop, la, xf) = (secs(hop), secs(lookahead), secs(xfade));
         ensure!(
