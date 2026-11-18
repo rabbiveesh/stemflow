@@ -186,9 +186,11 @@ struct Grid {
 struct State {
     analysis: Option<Analysis>,
     clip: Option<Clip>,
-    /// The frames `restem` has separated (written into the copy and the buffer
-    /// both, so later copies have them): a longer or moved loop needs only what's new.
-    stemmed: Option<(i64, i64)>,
+    /// Buffer frames that aren't continuous song audio (a seek, a pause, skipped
+    /// input, another track): a loop may not span one.
+    gaps: Vec<(i64, i64)>,
+    /// Buffer frames holding the plain mix (in the band's place), not separated yet.
+    plain: Vec<(i64, i64)>,
     settings: Settings,
     grid: Option<Grid>,
     /// the loop is beats[a]..beats[b]
@@ -298,7 +300,8 @@ impl Looper {
             state: Mutex::new(State {
                 analysis: None,
                 clip: None,
-                stemmed: None,
+                gaps: Vec::new(),
+                plain: Vec::new(),
                 settings: Settings::default(),
                 grid: None,
                 a: 0,
@@ -733,7 +736,7 @@ impl Looper {
         let Some(n) = st.grid.as_ref().map(|g| g.beats.len()) else {
             return;
         };
-        if a < b && b < n {
+        if a < b && b < n && self.spans_music(&st, a, b) {
             st.a = a;
             st.b = b;
             if st.pos >= self.loop_len(&st) {
@@ -756,6 +759,9 @@ impl Looper {
         if a < 0 || b >= g.beats.len() as i64 || a >= b || g.beats[b as usize] > heard {
             return false;
         }
+        if !self.spans_music(&st, a as usize, b as usize) {
+            return false;
+        }
         st.a = a as usize;
         st.b = b as usize;
         if da != 0 || st.pos >= self.loop_len(&st) {
@@ -771,7 +777,11 @@ impl Looper {
         let Some(m) = st.grid.as_ref().map(|g| g.meter) else {
             return;
         };
-        st.a = st.b.saturating_sub(n.max(1) * m);
+        let a = st.b.saturating_sub(n.max(1) * m);
+        if !self.spans_music(&st, a, st.b) {
+            return;
+        }
+        st.a = a;
         st.resync();
     }
 
@@ -1125,9 +1135,57 @@ impl Looper {
         }
     }
 
+    fn spans_music(&self, st: &State, a: usize, b: usize) -> bool {
+        let Some(g) = st.grid.as_ref() else {
+            return false;
+        };
+        let (from, to) = (g.beats[a].round() as i64, g.beats[b].round() as i64);
+        !st.gaps.iter().any(|&(s, e)| s < to && e > from)
+    }
+
+    /// Frames [from, to) aren't continuous song audio.
+    pub fn mark_gap(&self, from: i64, to: i64) {
+        let oldest = self.ring.lock().unwrap().oldest() as i64;
+        let mut st = self.state.lock().unwrap();
+        st.gaps.retain(|&(_, e)| e >= oldest);
+        st.gaps.push((from, to.max(from + 1)));
+    }
+
+    /// Is [from, to) free of gaps?
+    pub fn continuous(&self, from: i64, to: i64) -> bool {
+        let st = self.state.lock().unwrap();
+        !st.gaps.iter().any(|&(s, e)| s < to && e > from)
+    }
+
+    /// The last `n` frames pushed are the plain mix, not stems.
+    pub fn mark_plain(&self, n: usize) {
+        let (total, oldest) = {
+            let r = self.ring.lock().unwrap();
+            (r.total as i64, r.oldest() as i64)
+        };
+        let from = total - n as i64;
+        let mut st = self.state.lock().unwrap();
+        st.plain.retain(|&(_, e)| e >= oldest);
+        match st.plain.last_mut() {
+            Some(l) if l.1 >= from => l.1 = total,
+            _ => st.plain.push((from, total)),
+        }
+    }
+
+    /// Is what's playing now still the plain mix? (Then it plays as it is.)
+    pub fn plain_now(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        let f = match (st.playing, st.grid.as_ref(), st.tail) {
+            (true, Some(g), _) => g.beats[st.a].round() as i64 + st.pos as i64,
+            (false, _, Some(t)) => t,
+            _ => return false,
+        };
+        st.plain.iter().any(|&(s, e)| s <= f && f < e)
+    }
+
     /// The stretch to separate: the loop and a second either side (for the wrap's
     /// crossfade and small edits), or None without a loop. Unless `full` (a new
-    /// model), only what isn't separated yet: after the loop grows, just the new end.
+    /// model), only the next part of it that is still the plain mix.
     pub fn restem_range(&self, full: bool) -> Option<(i64, i64)> {
         let st = self.state.lock().unwrap();
         let g = st.grid.as_ref()?;
@@ -1137,29 +1195,28 @@ impl Looper {
             (g.beats[st.a] - pad).round() as i64,
             (g.beats[st.b] + pad).round() as i64,
         );
-        match st.stemmed {
-            Some((s, e)) if !full => {
-                if s <= from && e >= to {
-                    None
-                } else if from >= s && from <= e {
-                    Some((e, to))
-                } else if to >= s && to <= e {
-                    Some((from, s))
-                } else {
-                    Some((from, to))
-                }
-            }
-            _ => Some((from, to)),
+        if full {
+            return Some((from, to));
         }
+        st.plain
+            .iter()
+            .filter(|&&(s, e)| s < to && e > from)
+            .map(|&(s, e)| (s.max(from), e.min(to)))
+            .next()
     }
 
-    /// `restem` separated [from, to): add it to what is separated.
-    fn stemmed_too(&self, from: i64, to: i64, full: bool) {
+    /// `restem` separated [from, to): no longer plain.
+    fn stems_done(&self, from: i64, to: i64) {
         let mut st = self.state.lock().unwrap();
-        st.stemmed = match st.stemmed {
-            Some((s, e)) if !full && from <= e && to >= s => Some((s.min(from), e.max(to))),
-            _ => Some((from, to)),
-        };
+        let old = std::mem::take(&mut st.plain);
+        for (s, e) in old {
+            if s < from {
+                st.plain.push((s, e.min(from)));
+            }
+            if e > to {
+                st.plain.push((s.max(to), e));
+            }
+        }
     }
 
     /// The original mix (target + band) of the loop's copy, `n` frames from `from`,
@@ -1247,7 +1304,7 @@ pub fn restem<S: Separator>(l: &Looper, eng: &mut Streamer<S>, full: bool) -> Re
         &[][..]
     };
     l.replace(from, &bass[2 * k0..2 * k1], &band[2 * k0..2 * k1], sec);
-    l.stemmed_too(from, to, full);
+    l.stems_done(from, to);
     Ok(true)
 }
 
@@ -1265,15 +1322,12 @@ mod tests {
         }
     }
 
-    /// A loop that grows only needs its new part separated; a new model needs it all.
-    #[test]
-    fn restem_only_what_is_new() {
+    fn loop_on_a_grid() -> Looper {
         let l = Looper::new(Box::new(NoNet));
-        let r = RATE as f64;
         {
             let mut st = l.state.lock().unwrap();
             st.grid = Some(Grid {
-                beats: (0..40).map(|k| k as f64 * r / 2.0).collect(),
+                beats: (0..40).map(|k| k as f64 * RATE as f64 / 2.0).collect(),
                 bar: vec![false; 40],
                 meter: 4,
                 bpm: 120.0,
@@ -1284,27 +1338,47 @@ mod tests {
             });
             st.a = 8;
             st.b = 16;
+            st.playing = true;
         }
-        let pad = RATE as i64;
-        let (a, b) = (4 * RATE as i64, 8 * RATE as i64);
-        assert_eq!(l.restem_range(false), Some((a - pad, b + pad)));
-        l.stemmed_too(a - pad, b + pad, false);
+        l
+    }
+
+    /// Only what is still the plain mix is separated; a new model redoes it all.
+    #[test]
+    fn restem_only_what_is_plain() {
+        let l = loop_on_a_grid();
+        let s = RATE as i64;
         assert_eq!(l.restem_range(false), None);
-        // a bar longer at the end: just the new end
-        l.state.lock().unwrap().b = 20;
+        assert_eq!(l.restem_range(true), Some((3 * s, 9 * s)));
+        l.state.lock().unwrap().plain = vec![(0, 5 * s), (8 * s, 20 * s)];
+        assert!(l.plain_now(), "the loop starts at 4 s, in the plain part");
+        assert_eq!(l.restem_range(false), Some((3 * s, 5 * s)));
+        l.stems_done(3 * s, 5 * s);
+        assert!(!l.plain_now());
+        assert_eq!(l.restem_range(false), Some((8 * s, 9 * s)));
+        l.stems_done(8 * s, 9 * s);
+        assert_eq!(l.restem_range(false), None);
         assert_eq!(
-            l.restem_range(false),
-            Some((b + pad, 10 * RATE as i64 + pad))
+            l.state.lock().unwrap().plain,
+            vec![(0, 3 * s), (9 * s, 20 * s)]
         );
-        // a bar earlier at the start: just the new start
-        l.state.lock().unwrap().b = 16;
-        l.state.lock().unwrap().a = 4;
-        assert_eq!(
-            l.restem_range(false),
-            Some((2 * RATE as i64 - pad, a - pad))
-        );
-        // a new model: everything
-        assert_eq!(l.restem_range(true), Some((2 * RATE as i64 - pad, b + pad)));
+    }
+
+    /// A loop can't be stretched or moved across audio that isn't continuous.
+    #[test]
+    fn edits_stop_at_gaps() {
+        let l = loop_on_a_grid();
+        let s = RATE as i64;
+        l.state.lock().unwrap().clip = Some(Clip {
+            from: 0,
+            data: vec![1; CH * 20 * RATE],
+        });
+        l.mark_gap(2 * s, 3 * s);
+        assert!(!l.continuous(0, 4 * s));
+        assert!(l.continuous(3 * s, 8 * s));
+        assert!(l.nudge(-2, 0), "4 s back to 3 s: clear of the gap");
+        assert!(!l.nudge(-2, 0), "back to 2 s would touch it");
+        assert!(l.nudge(0, 2));
     }
 
     /// Live after a loop: plays on from the loop, skips the pause, then the new audio.

@@ -49,6 +49,11 @@ object Native {
     @JvmStatic external fun looperGrid(h: Long): DoubleArray
     @JvmStatic external fun looperRecent(h: Long): FloatArray
     @JvmStatic external fun looperNudge(h: Long, da: Int, db: Int): Boolean
+    @JvmStatic external fun looperMarkPlain(h: Long, n: Int)
+    @JvmStatic external fun looperMarkGap(h: Long, from: Long, to: Long)
+    @JvmStatic external fun looperContinuous(h: Long, from: Long, to: Long): Boolean
+    @JvmStatic external fun looperPlainNow(h: Long): Boolean
+    @JvmStatic external fun looperNeedsStems(h: Long): Boolean
     @JvmStatic external fun engineReset(h: Long)
     @JvmStatic external fun setMono(input: Boolean, output: Boolean)
     @JvmStatic external fun looperRefresh(h: Long): Boolean

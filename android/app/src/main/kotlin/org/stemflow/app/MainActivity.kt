@@ -513,8 +513,9 @@ class MainActivity : Activity() {
             ), t = 10),
         ).apply { setPadding(dp(20), dp(14), dp(16), 0) }
 
-        val top = button("From the top") { edit(1, 0, 0, 0f) }
-        val actions = row(top).apply { setPadding(dp(16), dp(14), dp(16), 0) }
+        val top = button("From the top", weight = 0f) { edit(1, 0, 0, 0f) }.apply { layoutParams = lp(LayoutParams.MATCH_PARENT, dp(46)) }
+        val repair = button("Repair", weight = 0f) { CaptureService.repair(this) }.apply { layoutParams = lp(LayoutParams.MATCH_PARENT, dp(46)) }
+        val actions = column(top, margins(repair, t = 8)).apply { setPadding(dp(16), dp(14), dp(16), 0) }
 
         return page(
             header("Loops", loopDesc),

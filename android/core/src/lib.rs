@@ -744,6 +744,61 @@ pub extern "system" fn Java_org_stemflow_app_Native_looperRefresh(
     }
 }
 
+/// The last `n` frames pushed are the plain mix, not stems.
+#[no_mangle]
+pub extern "system" fn Java_org_stemflow_app_Native_looperMarkPlain(
+    _: JNIEnv,
+    _: JClass,
+    h: jlong,
+    n: jint,
+) {
+    looper(h).mark_plain(n.max(0) as usize);
+}
+
+/// Frames [from, to) aren't continuous song audio.
+#[no_mangle]
+pub extern "system" fn Java_org_stemflow_app_Native_looperMarkGap(
+    _: JNIEnv,
+    _: JClass,
+    h: jlong,
+    from: jlong,
+    to: jlong,
+) {
+    looper(h).mark_gap(from, to);
+}
+
+/// Is [from, to) free of gaps?
+#[no_mangle]
+pub extern "system" fn Java_org_stemflow_app_Native_looperContinuous(
+    _: JNIEnv,
+    _: JClass,
+    h: jlong,
+    from: jlong,
+    to: jlong,
+) -> jni::sys::jboolean {
+    looper(h).continuous(from, to) as jni::sys::jboolean
+}
+
+/// Is what's playing now still the plain mix?
+#[no_mangle]
+pub extern "system" fn Java_org_stemflow_app_Native_looperPlainNow(
+    _: JNIEnv,
+    _: JClass,
+    h: jlong,
+) -> jni::sys::jboolean {
+    looper(h).plain_now() as jni::sys::jboolean
+}
+
+/// Does the loop still contain plain mix to separate?
+#[no_mangle]
+pub extern "system" fn Java_org_stemflow_app_Native_looperNeedsStems(
+    _: JNIEnv,
+    _: JClass,
+    h: jlong,
+) -> jni::sys::jboolean {
+    looper(h).restem_range(false).is_some() as jni::sys::jboolean
+}
+
 /// Frames pushed so far (the newest frame the buffer has).
 #[no_mangle]
 pub extern "system" fn Java_org_stemflow_app_Native_looperTotal(
