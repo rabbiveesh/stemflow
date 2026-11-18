@@ -174,15 +174,38 @@ class CaptureService : Service() {
         fun recall(c: Context, b: Bookmarks.Bookmark) {
             val h = looper
             if (h == 0L || !running) { loopStatus = "Switch isolation on first"; return }
+            val id = ++recallId
+            recalling = true
             thread(name = "stemflow-recall") {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
-                loopStatus = try { recallNow(c, h, b); "" } catch (e: Exception) {
-                    Log.e(TAG, "recall failed: ${e.message}"); e.message ?: "Couldn't recall"
+                try {
+                    recallNow(c, h, b, id)
+                    loopStatus = ""
+                } catch (e: RecallCancelled) {
+                    Log.i(TAG, "recall of ${b.name} called off")
+                    if (!recalling) loopStatus = ""
+                } catch (e: Exception) {
+                    Log.e(TAG, "recall failed: ${e.message}")
+                    if (id == recallId) loopStatus = e.message ?: "Couldn't recall"
+                } finally {
+                    if (id == recallId) recalling = false
                 }
             }
         }
 
-        private fun recallNow(c: Context, h: Long, b: Bookmarks.Bookmark) {
+        /** A bookmark is on its way back: the music plays live until its loop is laid. */
+        @Volatile var recalling = false; private set
+        @Volatile private var recallId = 0
+        private class RecallCancelled : Exception()
+
+        private fun cancelRecall() {
+            recallId++
+            if (recalling) loopStatus = ""
+            recalling = false
+        }
+
+        private fun recallNow(c: Context, h: Long, b: Bookmarks.Bookmark, id: Int) {
+            val check = { if (id != recallId) throw RecallCancelled() }
             val ctl = NowPlaying.controller(c) ?: throw Exception(
                 if (NowPlaying.granted(c)) "No player found: start ${b.title} in the player" else "Allow notification access first")
             loopStatus = "Going to ${b.title} at ${Bookmarks.time(b.startMs)}…"
@@ -208,6 +231,7 @@ class CaptureService : Service() {
                 val t0 = System.currentTimeMillis()
                 var seen = ""
                 while (NowPlaying.song(ctl)?.same(b.song) != true) {
+                    check()
                     val cur = NowPlaying.song(ctl)?.let { "${it.title} / ${it.artist} state ${ctl.playbackState?.state}" } ?: "none"
                     if (cur != seen) { Log.i(TAG, "recall: player has $cur"); seen = cur }
                     val waited = System.currentTimeMillis() - t0
@@ -241,6 +265,7 @@ class CaptureService : Service() {
             val until = System.currentTimeMillis() + 60_000
             var a: Anchor
             while (true) {
+                check()
                 if (!running) throw Exception("Stopped")
                 if (System.currentTimeMillis() > until) throw Exception("Timed out waiting for the music")
                 Thread.sleep(250)
@@ -254,9 +279,11 @@ class CaptureService : Service() {
             // the stems up to there are in the buffer
             val need = a.frameOf(last + if (own) 300 else 1000)
             while (Native.looperTotal(h) < need) {
+                check()
                 if (!running || System.currentTimeMillis() > until) throw Exception("Timed out")
                 Thread.sleep(100)
             }
+            check()
             if (own) {
                 val frames = DoubleArray(b.beats.size) { a.frame + (b.beats[it] - a.songMs) * RATE / 1000 }
                 Native.looperLay(h, frames, b.a, b.b, b.one, b.meter, b.bpm, b.feel)
@@ -266,6 +293,10 @@ class CaptureService : Service() {
                 Native.looperSetTimes(h, a.frameOf(b.startMs).toDouble(), a.frameOf(b.endMs).toDouble(), a.frameOf(b.bar1Ms).toDouble())
                 // keep the beats now, so next time there's nothing to find
                 grid(h, a)?.let { Bookmarks.replace(c, b.withGrid(it)) }
+            }
+            if (id != recallId) { // Live was pressed while the bars were being found
+                Native.looperEdit(h, 8, 0, 0, 0f)
+                throw RecallCancelled()
             }
             loopAnchor = a
             loopChanged()
@@ -513,6 +544,7 @@ class CaptureService : Service() {
         /** Back from a loop to the live stream: stop the loop and un-pause the source. */
         fun goLive(c: Context) {
             phraseId++
+            cancelRecall()
             val h = looper
             if (h != 0L && Native.looperIsPlaying(h)) {
                 Log.i(TAG, "back to live")
@@ -537,6 +569,7 @@ class CaptureService : Service() {
             }
             val press = heardFrame()
             if (press < 0) return
+            cancelRecall()
             loopAnchor = anchor
             streamSince = 0L // live up to now: unbroken, as far as we know
             streamFromMs = 0L

@@ -727,8 +727,9 @@ class MainActivity : Activity() {
             else -> "Switch on under Stems"
         }
         npSave.visibility = if (v.size >= 14) View.VISIBLE else View.GONE
-        npLive.visibility = if (looping) View.VISIBLE else View.GONE
-        npLoop.visibility = if (CaptureService.running && !looping && h != 0L) View.VISIBLE else View.GONE
+        val recalling = CaptureService.recalling
+        npLive.visibility = if (looping || recalling) View.VISIBLE else View.GONE
+        npLoop.visibility = if (CaptureService.running && !looping && !recalling && h != 0L) View.VISIBLE else View.GONE
     }
 
     /** The loop card: what was found, or why not. */
