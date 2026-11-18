@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fetch ONNX Runtime (from Microsoft's GitHub releases) into vendor/, and for CUDA,
+# Fetch ONNX Runtime (from Microsoft's NuGet packages) into vendor/, and for CUDA,
 # the CUDA 12 runtime libs it needs (from NVIDIA's PyPI wheels) next to it.
 #   tools/fetch-ort.sh cpu     # ~30 MB
 #   tools/fetch-ort.sh cuda    # ~2.5 GB (cuDNN and cuBLAS are most of it)
@@ -11,14 +11,17 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 case "$flavor" in
-  cpu)  asset="onnxruntime-linux-x64-${ORT_VERSION}.tgz";            dest="$root/vendor/ort-cpu" ;;
-  cuda) asset="onnxruntime-linux-x64-gpu_cuda12-${ORT_VERSION}.tgz"; dest="$root/vendor/ort-cuda" ;;
+  cpu)  package=microsoft.ml.onnxruntime;           dest="$root/vendor/ort-cpu" ;;
+  cuda) package=microsoft.ml.onnxruntime.gpu.linux; dest="$root/vendor/ort-cuda" ;;
   *) echo "usage: $0 cpu|cuda" >&2; exit 1 ;;
 esac
 
-gh release download "v${ORT_VERSION}" -R microsoft/onnxruntime -p "$asset" -D "$tmp"
-rm -rf "$dest" && mkdir -p "$dest"
-tar -xzf "$tmp/$asset" -C "$dest" --strip-components=1
+curl -fsSL -o "$tmp/ort.nupkg" \
+  "https://api.nuget.org/v3-flatcontainer/$package/$ORT_VERSION/$package.$ORT_VERSION.nupkg"
+unzip -q "$tmp/ort.nupkg" 'runtimes/linux-x64/native/*' -d "$tmp/pkg"
+rm -rf "$dest" && mkdir -p "$dest/lib"
+cp -a "$tmp"/pkg/runtimes/linux-x64/native/* "$dest/lib/"
+chmod 755 "$dest"/lib/*
 rm -f "$dest"/lib/libonnxruntime_providers_tensorrt.so
 
 if [[ "$flavor" == cuda ]]; then
