@@ -495,6 +495,57 @@ impl Looper {
         Ok(())
     }
 
+    /// Take a fresh copy of the buffer and its beats, keeping the loop where it is
+    /// (same start, length in beats, and bar 1) and playing on undisturbed: then
+    /// edits into what was buffered since need no analysis. Near the loop's tempo.
+    /// False without a loop, or if the copy reaches no further.
+    pub fn refresh(&self) -> Result<bool> {
+        let (start, len, one, bpm, heard0) = {
+            let st = self.state.lock().unwrap();
+            let (Some(g), Some(c)) = (st.grid.as_ref(), st.clip.as_ref()) else {
+                return Ok(false);
+            };
+            let one = (st.a..st.b).find(|&i| g.bar[i]).unwrap_or(st.a);
+            let raw = g.bpm / st.settings.feel.max(0.25);
+            (g.beats[st.a], st.b - st.a, g.beats[one], raw, c.music_end())
+        };
+        let clip = self.snapshot();
+        if clip.music_end() <= heard0 + RATE as u64 {
+            return Ok(false);
+        }
+        let an = self.analyse(&clip)?;
+        let mut st = self.state.lock().unwrap();
+        if st.grid.is_none() {
+            return Ok(false); // the loop went meanwhile
+        }
+        let old = st.settings;
+        st.settings.min_bpm = bpm * 0.85;
+        st.settings.max_bpm = bpm * 1.18;
+        st.analysis = Some(an);
+        st.clip = Some(clip);
+        self.decode(&mut st);
+        st.settings.min_bpm = old.min_bpm;
+        st.settings.max_bpm = old.max_bpm;
+        let g = st.grid.as_mut().unwrap();
+        let near = |t: f64| {
+            (0..g.beats.len())
+                .min_by(|&i, &j| (g.beats[i] - t).abs().total_cmp(&(g.beats[j] - t).abs()))
+                .unwrap_or(0)
+        };
+        let (a, one) = (near(start), near(one));
+        let b = (a + len).min(g.beats.len() - 1);
+        let m = g.meter;
+        for (k, f) in g.bar.iter_mut().enumerate() {
+            *f = (k + m - one % m).is_multiple_of(m);
+        }
+        // keep the playhead on the same music
+        let shift = g.beats[a] - start;
+        st.a = a;
+        st.b = b;
+        st.pos = (st.pos as f64 - shift).max(0.0) as usize;
+        Ok(true)
+    }
+
     /// The phrase after the loop: as many beats, starting where the loop ends, with a
     /// bar line there. The buffer must have heard all of it (it can, if the source
     /// played on after the loop was made); then the newest minute is analysed again

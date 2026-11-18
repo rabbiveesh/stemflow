@@ -608,6 +608,37 @@ fn loop_test(
         (n0 - t1) * 1000.0 / SAMPLE_RATE as f64,
         ((n1 - n0) - (t1 - t0)) * 1000.0 / SAMPLE_RATE as f64
     );
+    // Refresh: more audio arrives, the copy and beats are re-taken with the loop
+    // kept; then a bar more at the end needs no analysis.
+    let (r0, r1, _, m, _, _) = lp.times().unwrap();
+    let more = played + 3 * SAMPLE_RATE as u64;
+    for chunk in x[2 * played as usize..].chunks_exact(2 * hop) {
+        if played >= more {
+            break;
+        }
+        let st = s.process(chunk)?;
+        lp.push(
+            &st.bass,
+            &st.band,
+            st.extra.first().map_or(&[][..], |v| &v[..]),
+        );
+        played += hop as u64;
+    }
+    let t = Instant::now();
+    let refreshed = lp.refresh()?;
+    let (q0, q1, _, _, _, _) = lp.times().unwrap();
+    let t2 = Instant::now();
+    let grew = lp.nudge(0, m as i64);
+    let (_, e1, _, _, _, _) = lp.times().unwrap();
+    eprintln!(
+        "refresh in {:.2}s ({refreshed}): loop moved {:+.0}/{:+.0} ms; a bar more in {:.1} ms ({grew}): {:.3}s..{:.3}s",
+        t.elapsed().as_secs_f32(),
+        (q0 - r0) * 1000.0 / SAMPLE_RATE as f64,
+        (q1 - r1) * 1000.0 / SAMPLE_RATE as f64,
+        t2.elapsed().as_secs_f64() * 1000.0,
+        secs(q0),
+        secs(e1)
+    );
     // Re-stem with the same model: should give back nearly the same stems.
     let before = lp.clip_mix(v.start as i64, 44100);
     let (b0, _) = {

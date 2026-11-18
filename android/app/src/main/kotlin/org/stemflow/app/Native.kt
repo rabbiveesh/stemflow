@@ -50,6 +50,7 @@ object Native {
     @JvmStatic external fun looperRecent(h: Long): FloatArray
     @JvmStatic external fun looperNudge(h: Long, da: Int, db: Int): Boolean
     @JvmStatic external fun engineReset(h: Long)
+    @JvmStatic external fun looperRefresh(h: Long): Boolean
     @JvmStatic external fun looperLay(h: Long, beats: DoubleArray, a: Int, b: Int, one: Int, meter: Int, bpm: Float, feel: Float)
     @JvmStatic fun looperIsPlaying(h: Long) = looperView(h, 1).let { it.isNotEmpty() && it[0] > 0f }
 }

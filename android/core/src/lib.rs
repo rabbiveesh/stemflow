@@ -675,6 +675,23 @@ pub extern "system" fn Java_org_stemflow_app_Native_looperNudge(
     looper(h).nudge(da as i64, db as i64) as jni::sys::jboolean
 }
 
+/// Re-take the loop's copy and beats from the buffer, keeping the loop (see
+/// `Looper::refresh`): true if it now reaches further.
+#[no_mangle]
+pub extern "system" fn Java_org_stemflow_app_Native_looperRefresh(
+    mut env: JNIEnv,
+    _: JClass,
+    h: jlong,
+) -> jni::sys::jboolean {
+    match looper(h).refresh() {
+        Ok(b) => b as jni::sys::jboolean,
+        Err(e) => {
+            throw(&mut env, e);
+            0
+        }
+    }
+}
+
 /// Frames pushed so far (the newest frame the buffer has).
 #[no_mangle]
 pub extern "system" fn Java_org_stemflow_app_Native_looperTotal(

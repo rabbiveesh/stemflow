@@ -400,7 +400,22 @@ class CaptureService : Service() {
             thread(name = "stemflow-prefetch") {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
                 try {
-                    if (stream(c, h, id, a0.song, r[0] - 6_000, r[1] + 1_000) != null) Log.i(TAG, "next phrase buffered")
+                    val a = stream(c, h, id, a0.song, r[0] - 6_000, r[1] + 1_000)
+                    if (a != null) {
+                        Log.i(TAG, "next phrase buffered")
+                        if (id == phraseId && Native.looperIsPlaying(h)) mediaKey(c, KeyEvent.KEYCODE_MEDIA_PAUSE)
+                        // its beats too, so extending into it is instant; only when the
+                        // buffered run reaches back into the loop (else it's a gap away)
+                        val t = Native.looperTimes(h)
+                        if (id == phraseId && t.size >= 6 && a.frameOf(r[0] - 6_000) <= t[1]) {
+                            val t0 = System.nanoTime()
+                            if (Native.looperRefresh(h)) {
+                                loopAnchor = a
+                                Log.i(TAG, "beats ahead found in %.2f s".format((System.nanoTime() - t0) / 1e9))
+                            }
+                        }
+                        return@thread
+                    }
                 } catch (e: Exception) {
                     Log.i(TAG, "prefetch: ${e.message}")
                 }
@@ -473,6 +488,7 @@ class CaptureService : Service() {
             phraseId++
             val h = looper
             if (h != 0L && Native.looperIsPlaying(h)) {
+                Log.i(TAG, "back to live")
                 Native.looperEdit(h, 0, 0, 0, 0f)
                 mediaKey(c, KeyEvent.KEYCODE_MEDIA_PLAY)
             }
