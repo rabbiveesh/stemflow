@@ -50,6 +50,8 @@ struct Ring {
     data: Vec<i16>,
     cap: usize,
     total: u64,
+    /// frames in the last block pushed: how bursty the arrivals are
+    last_push: usize,
 }
 
 fn to_i16(x: f32) -> i16 {
@@ -84,6 +86,7 @@ impl Ring {
             data: vec![0; CH * frames],
             cap: frames,
             total: 0,
+            last_push: 0,
         }
     }
 
@@ -94,6 +97,7 @@ impl Ring {
             put(&mut self.data[k..k + CH], bass, band, second, i);
         }
         self.total += n as u64;
+        self.last_push = n;
     }
 
     fn oldest(&self) -> u64 {
@@ -204,6 +208,8 @@ struct State {
     finding: bool,
     /// After a loop: playing on from the buffer at this frame (see `go_live`).
     tail: Option<i64>,
+    /// the tail ran out of audio: silence until a margin has built up again
+    tail_wait: bool,
     /// how far the tail has looked for the end of a silent gap
     scanned: i64,
     /// Practice speed (1 = as recorded), transposition in semitones, and whether a
@@ -249,6 +255,9 @@ fn loop_frame(clip: &Clip, start: i64, len: usize, p: usize) -> Frame {
     }
     v
 }
+
+/// Audio the tail keeps ahead of it, beyond one arriving block, after running out.
+const TAIL_MARGIN: usize = 3 * RATE / 10;
 
 /// Output frames per stretcher call.
 const STRETCH_BLOCK: usize = 512;
@@ -311,6 +320,7 @@ impl Looper {
                 click: false,
                 finding: false,
                 tail: None,
+                tail_wait: false,
                 scanned: 0,
                 speed: 1.0,
                 semis: 0.0,
@@ -803,6 +813,7 @@ impl Looper {
             .as_ref()
             .map(|g| g.beats[st.a].round() as i64 + st.pos as i64);
         st.tail = here;
+        st.tail_wait = false;
         st.scanned = here.unwrap_or(0);
     }
 
@@ -1009,6 +1020,21 @@ impl Looper {
         let mut c = st.tail.unwrap().max(ring.oldest() as i64);
         let first = c;
         click[..n].fill(0.0);
+        // Caught up with the newest audio: blocks would play as they arrive, and any
+        // unevenness in their arrival would be heard. Wait for a margin once instead.
+        let margin = (ring.last_push + TAIL_MARGIN).max(n) as i64;
+        let ahead = total - c;
+        if ahead < n as i64 {
+            st.tail_wait = true;
+        }
+        if st.tail_wait && ahead < margin {
+            st.tail = Some(c);
+            for i in 0..n {
+                write(&[0.0; CH], i, bass, band, second);
+            }
+            return first;
+        }
+        st.tail_wait = false;
         for i in 0..n {
             if i == advance {
                 st.tail = Some(c);
@@ -1427,6 +1453,42 @@ mod tests {
             "first {:?}",
             &b[..4]
         );
+    }
+
+    /// Going live and catching up with the newest audio: one wait for a margin, then
+    /// blocks arriving at the rate they're played never run it dry.
+    #[test]
+    fn tail_keeps_a_margin() {
+        let l = loop_on_a_grid();
+        let block = RATE / 10;
+        let mk = |n: usize| vec![0.5f32; 2 * n];
+        l.push(&mk(5 * RATE), &mk(5 * RATE), &[]);
+        {
+            let mut st = l.state.lock().unwrap();
+            st.playing = false;
+            st.tail = Some(5 * RATE as i64);
+        }
+        let n = 1764;
+        let adv = 882;
+        let (mut b, mut r, mut c) = (vec![0f32; 2 * n], vec![0f32; 2 * n], vec![0f32; n]);
+        let (mut silent, mut pending, mut started) = (0, 0usize, false);
+        let mut gaps_after_start = 0;
+        for _ in 0..400 {
+            pending += adv;
+            if pending >= block {
+                l.push(&mk(block), &mk(block), &[]);
+                pending -= block;
+            }
+            l.read(&mut b, &mut r, &mut [], &mut c, n, adv);
+            if b[0] == 0.0 {
+                silent += 1;
+                gaps_after_start += started as usize;
+            } else {
+                started = true;
+            }
+        }
+        assert!(started && silent > 0, "it waits once, then plays");
+        assert_eq!(gaps_after_start, 0, "no stutter once playing");
     }
 
     #[test]
