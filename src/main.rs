@@ -39,6 +39,19 @@ enum Cmd {
         #[arg(long, default_value_t = 0.3)]
         slack: f32,
     },
+    /// Check the live route without a model: capture the app (taking it off the
+    /// speakers) and play it straight back, printing its level every second.
+    Passthrough {
+        /// Capture apps whose name contains this (case-insensitive).
+        #[arg(long, default_value = "spotify")]
+        grab: String,
+        /// Output (default: the current default output).
+        #[arg(long)]
+        output: Option<String>,
+        /// Stop after this many seconds (default: run until Ctrl-C).
+        #[arg(long)]
+        seconds: Option<f32>,
+    },
     /// Run the streaming pipeline over a WAV file (44.1 kHz) and write the result.
     File {
         #[command(flatten)]
@@ -394,6 +407,11 @@ fn main() -> Result<()> {
                 };
             audio::live(st, ctl, tracker, &grab, output, slack, load)
         }
+        Cmd::Passthrough {
+            grab,
+            output,
+            seconds,
+        } => audio::passthrough(&grab, output, seconds),
         Cmd::Beats { opts, input, meter } => {
             let r = hound::WavReader::open(&input)?;
             let spec = r.spec();

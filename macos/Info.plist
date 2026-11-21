@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>org.stemflow.cli</string>
+	<key>CFBundleName</key>
+	<string>stemflow</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>stemflow listens to the app you pick (Spotify by default) to separate its stems as it plays.</string>
+</dict>
+</plist>

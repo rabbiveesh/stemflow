@@ -69,6 +69,8 @@ pub const HTDEMUCS_SEGMENT: usize = 343_980; // int(7.8 s * 44100)
 pub enum Device {
     Cpu,
     Cuda,
+    /// Core ML (macOS): ONNX Runtime hands what it can to the GPU / Neural Engine.
+    Coreml,
 }
 
 /// Load libonnxruntime: $ORT_DYLIB_PATH, else vendor/ort-{cpu,cuda} (tools/fetch-ort.sh).
@@ -108,7 +110,11 @@ pub(crate) fn runtime(device: Device) -> Result<&'static ort::environment::Envir
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("vendor")
                 .join(flavor)
-                .join("lib/libonnxruntime.so")
+                .join(if cfg!(target_os = "macos") {
+                    "lib/libonnxruntime.dylib"
+                } else {
+                    "lib/libonnxruntime.so"
+                })
         });
     let env = ort::init_from(&lib)
         .map_err(|e| anyhow::anyhow!("loading {}: {e} (run tools/fetch-ort.sh)", lib.display()))?
@@ -178,6 +184,25 @@ fn session(path: &Path, device: Device, threads: usize, gpu_mem_mb: usize) -> Re
         }
         #[cfg(not(feature = "cuda"))]
         anyhow::bail!("built without the `cuda` feature; rebuild with `--features cuda`");
+    }
+    if device == Device::Coreml {
+        #[cfg(target_os = "macos")]
+        {
+            use ort::ep::coreml::{ComputeUnits, ModelFormat};
+            // Compiling for Core ML takes a while; keep the result next to the model.
+            let cache = path.with_extension("coreml");
+            std::fs::create_dir_all(&cache)?;
+            b = b
+                .with_execution_providers([ort::ep::CoreML::default()
+                    .with_model_format(ModelFormat::MLProgram)
+                    .with_compute_units(ComputeUnits::All)
+                    .with_model_cache_dir(cache.display())
+                    .build()
+                    .error_on_failure()])
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        anyhow::bail!("--device coreml is macOS only");
     }
     b.commit_from_file(path).with_context(|| {
         format!(

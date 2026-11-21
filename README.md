@@ -96,6 +96,35 @@ tools/.venv/bin/python -I tools/export_beat_this.py models/beats tools/.venv-gpu
 
 Switch it on from the menu ("Beat click") or `busctl --user set-property org.stemflow.Control /org/stemflow/Control org.stemflow.Control Click b true`. `Meter` (beats per bar, 0 = auto) and `Feel` (0.5 half time, 1, 2 double time) set the bar lines and the beat; `Beats` says what the tracker found. Every 3 s it re-analyses the last 30 s of input (about 0.35 s on the GPU while separating). The input runs ahead of what you hear by the separator's lookahead, so the click comes from audio already analysed. A change of tempo or meter has to show up three times in a row (9 s) before the click follows it. `stemflow file --click in.wav out.wav` renders the same thing to a file.
 
+## macOS (Apple Silicon)
+
+*New, and not yet tried on a real Mac.* Live mode taps the app with a Core Audio
+process tap (macOS 14.2+), which also mutes it on the speakers while stemflow runs,
+and plays the result through a private aggregate device on your output. Both belong
+to the stemflow process, so Ctrl-C or a crash gives the app its sound back.
+
+```bash
+tools/fetch-ort.sh cpu          # osx-arm64 ONNX Runtime, CoreML provider included
+tools/setup-export-env.sh       # then export the models as above
+cargo build --release
+./target/release/stemflow passthrough      # no model: Spotify -> tap -> speakers, levels per second
+./target/release/stemflow live             # CPU
+./target/release/stemflow live --device coreml
+```
+
+- The first run asks for **System Audio Recording** permission for the app you started
+  stemflow from (Terminal, iTerm, ...). Without it the tap hears silence, and stemflow
+  says so once the app is playing. Over ssh there's no prompt: add the terminal (or
+  `/usr/libexec/sshd-keygen-wrapper`) under System Settings > Privacy & Security >
+  Screen & System Audio Recording.
+- `--grab` matches the bundle id or executable name (`spotify` catches Spotify's
+  audio helper). `--output` takes a device name or UID.
+- Audio runs at the output device's rate (often 48 kHz) and is resampled to and from
+  44.1 kHz around the pipeline.
+- `--device coreml` hands what Core ML can run to the GPU / Neural Engine. The first
+  load compiles the model and caches it next to the `.onnx` file.
+- There's no menu yet; the D-Bus control only exists where a session bus does.
+
 ## GNOME Shell extension (GNOME 42)
 
 ```bash

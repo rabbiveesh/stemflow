@@ -3,12 +3,21 @@
 # the CUDA 12 runtime libs it needs (from NVIDIA's PyPI wheels) next to it.
 #   tools/fetch-ort.sh cpu     # ~30 MB
 #   tools/fetch-ort.sh cuda    # ~2.5 GB (cuDNN and cuBLAS are most of it)
+# On macOS (Apple Silicon) `cpu` is the only flavor; its library has the CoreML
+# provider built in (`--device coreml`).
 set -euo pipefail
 ORT_VERSION=1.31.1
 root="$(cd "$(dirname "$0")/.." && pwd)"
 flavor="${1:-cpu}"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+
+if [[ "$(uname -s)" == Darwin ]]; then
+  [[ "$flavor" == cpu ]] || { echo "on macOS only the cpu flavor exists (it includes CoreML)" >&2; exit 1; }
+  platform=osx-arm64
+else
+  platform=linux-x64
+fi
 
 case "$flavor" in
   cpu)  package=microsoft.ml.onnxruntime;           dest="$root/vendor/ort-cpu" ;;
@@ -18,9 +27,9 @@ esac
 
 curl -fsSL -o "$tmp/ort.nupkg" \
   "https://api.nuget.org/v3-flatcontainer/$package/$ORT_VERSION/$package.$ORT_VERSION.nupkg"
-unzip -q "$tmp/ort.nupkg" 'runtimes/linux-x64/native/*' -d "$tmp/pkg"
+unzip -q "$tmp/ort.nupkg" "runtimes/$platform/native/*" -d "$tmp/pkg"
 rm -rf "$dest" && mkdir -p "$dest/lib"
-cp -a "$tmp"/pkg/runtimes/linux-x64/native/* "$dest/lib/"
+cp -a "$tmp"/pkg/runtimes/$platform/native/* "$dest/lib/"
 chmod 755 "$dest"/lib/*
 rm -f "$dest"/lib/libonnxruntime_providers_tensorrt.so
 

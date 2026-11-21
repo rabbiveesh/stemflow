@@ -67,3 +67,55 @@ jobs:
           GH_TOKEN: ${{ github.token }}
       - run: cargo build --release
       - run: ./target/release/stemflow verify
+
+  macos:
+    # The same build, tests and PyTorch check on Apple Silicon, plus two checks that
+    # only report: the CoreML provider, and whether a process tap hears `afplay`
+    # (the runner may not grant the audio-recording permission).
+    name: macOS (Apple Silicon)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --release
+      - uses: astral-sh/setup-uv@v10.3.3
+      - name: Cache exported model + demucs weights
+        id: model-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            models
+            ~/.cache/torch/hub/checkpoints
+          key: model-macos-${{ hashFiles('tools/export_htdemucs.py', 'tools/setup-export-env.sh') }}
+          restore-keys: model-macos-
+      - name: Export model
+        run: |
+          if [ "${{ steps.model-cache.outputs.cache-hit }}" != "true" ]; then
+            rm -f models/*.onnx
+          fi
+          if [ ! -f models/htdemucs_ft_bass.onnx ]; then
+            tools/setup-export-env.sh
+            cd tools && .venv/bin/python -I export_htdemucs.py ../models
+          fi
+      - run: tools/fetch-ort.sh cpu
+      - run: cargo build --release
+      - run: ./target/release/stemflow verify
+      - name: Verify on CoreML (report only)
+        continue-on-error: true
+        run: ./target/release/stemflow verify --device coreml
+      - name: Process tap on afplay (report only)
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          python3 -c "
+          import math, struct, wave
+          w = wave.open('tone.wav', 'wb'); w.setnchannels(2); w.setsampwidth(2); w.setframerate(44100)
+          w.writeframes(b''.join(struct.pack('<hh', s, s) for s in (int(8000 * math.sin(2 * math.pi * 220 * i / 44100)) for i in range(44100 * 30))))
+          "
+          afplay tone.wav &
+          sleep 1
+          ./target/release/stemflow passthrough --grab afplay --seconds 5
