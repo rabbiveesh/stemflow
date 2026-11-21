@@ -176,7 +176,7 @@ class CaptureService : Service() {
             if (h == 0L || !running) { loopStatus = "Switch isolation on first"; return }
             val id = ++recallId
             recalling = true
-            thread(name = "stemflow-recall") {
+            background("stemflow-recall") {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
                 try {
                     recallNow(c, h, b, id)
@@ -352,6 +352,15 @@ class CaptureService : Service() {
             if (h != 0L && Native.looperNeedsStems(h)) restemWanted = true
         }
 
+        /**
+         * The threads that use the looper (or the engine) besides the worker's own:
+         * switching off waits for them before freeing either, else they crash on it.
+         */
+        private val helpers = java.util.concurrent.ConcurrentLinkedQueue<Thread>()
+        private fun background(name: String, f: () -> Unit): Thread =
+            Thread({ try { f() } finally { helpers.remove(Thread.currentThread()) } }, name)
+                .also { helpers.add(it); it.start() }
+
         /** Bumped to call off whatever phrase work is running. */
         @Volatile private var phraseId = 0
 
@@ -437,7 +446,7 @@ class CaptureService : Service() {
         private fun pauseAfterPhrase(c: Context, h: Long) {
             val id = ++phraseId
             val (a0, r) = nextRange(h) ?: run { mediaKey(c, KeyEvent.KEYCODE_MEDIA_PAUSE); return }
-            thread(name = "stemflow-prefetch") {
+            background("stemflow-prefetch") {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
                 try {
                     val a = stream(c, h, id, a0.song, r[0] - 6_000, r[1] + 1_000)
@@ -454,7 +463,7 @@ class CaptureService : Service() {
                                 Log.i(TAG, "beats ahead found in %.2f s".format((System.nanoTime() - t0) / 1e9))
                             }
                         }
-                        return@thread
+                        return@background
                     }
                 } catch (e: Exception) {
                     Log.i(TAG, "prefetch: ${e.message}")
@@ -481,7 +490,7 @@ class CaptureService : Service() {
             // trimming past the other end: nothing to fetch
             if (da >= 0 && db <= 0) { loopStatus = "The loop can't get shorter than that"; return }
             val id = ++phraseId
-            thread(name = "stemflow-adjust") {
+            background("stemflow-adjust") {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
                 loopStatus = try { streamTo(c, h, id, da, db); "" } catch (e: Exception) {
                     Log.e(TAG, "adjust failed: ${e.message}"); e.message ?: "Couldn't get there"
@@ -498,7 +507,7 @@ class CaptureService : Service() {
             val h = looper
             if (h == 0L || !Native.looperIsPlaying(h)) return
             val id = ++phraseId
-            thread(name = "stemflow-repair") {
+            background("stemflow-repair") {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
                 loopStatus = try { streamTo(c, h, id, 0, 0, fresh = true); "" } catch (e: Exception) {
                     Log.e(TAG, "repair failed: ${e.message}"); e.message ?: "Couldn't repair the loop"
@@ -553,6 +562,26 @@ class CaptureService : Service() {
             }
         }
 
+        /** The last hop of input was silence: the source is paused (or between songs). */
+        @Volatile var sourceSilent = false
+
+        /** Is the source playing? Its media session says, else whether we hear it. */
+        fun sourcePlaying(c: Context): Boolean =
+            NowPlaying.controller(c)?.let { NowPlaying.playing(it) } ?: (running && !sourceSilent)
+
+        /** The pause button: pause or play the source (live only; a loop has Live). */
+        fun playPause(c: Context) {
+            val playing = sourcePlaying(c)
+            Log.i(TAG, "play/pause: source was ${if (playing) "playing" else "paused"}")
+            if (playing) {
+                sourceSilent = true // until the next hop says otherwise, so the button flips now
+                mediaKey(c, KeyEvent.KEYCODE_MEDIA_PAUSE)
+            } else {
+                sourceSilent = false
+                mediaKey(c, KeyEvent.KEYCODE_MEDIA_PLAY)
+            }
+        }
+
         /**
          * Loop the last `bars` bars of what is being heard (or, while looping, resize).
          * Once the loop plays, the source is paused: nobody hears the song meanwhile, and
@@ -575,7 +604,7 @@ class CaptureService : Service() {
             streamFromMs = 0L
             Log.i(TAG, "loop pressed: anchor %s".format(anchor?.let { "${it.song.title} @ ${it.songMs}" }))
             loopStatus = "Finding the bars…"
-            thread(name = "stemflow-find") {
+            background("stemflow-find") {
                 Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
                 val t = System.nanoTime()
                 loopStatus = try {
@@ -654,6 +683,7 @@ class CaptureService : Service() {
             i.getStringExtra("beatmodel")?.let { Models.selectBeatModel(c, it) } // next start
             if (i.hasExtra("loop")) loopLast(c, i.getIntExtra("loop", 4)) // bars
             if (i.getBooleanExtra("live", false)) goLive(c)
+            if (i.hasExtra("playpause")) playPause(c)
             Control.saveBeats(c)
             i.getStringExtra("source")?.let { pkg -> Sources.select(c, Sources.apps(c).firstOrNull { it.pkg == pkg }) }
             if (i.getBooleanExtra("stop", false)) stopSelf()
@@ -683,6 +713,7 @@ class CaptureService : Service() {
             .setSmallIcon(R.drawable.ic_stemflow)
             .setContentIntent(open)
             .setOngoing(true)
+            .addAction(action(if (sourceSilent) "Play" else "Pause", "playpause", "1", 4))
             .addAction(action("Bass solo", "snap", "solo", 1))
             .addAction(action("Full mix", "snap", "full", 2))
             .addAction(action("No bass", "snap", "nobass", 3))
@@ -788,11 +819,31 @@ class CaptureService : Service() {
             playerThread?.join()
             val h = looper
             looper = 0L
-            if (h != 0L) Native.looperFree(h)
+            // Called off (phraseId was bumped), they end soon; one that doesn't keeps
+            // the looper and the engine: leaking them beats freeing them under it.
+            val deadline = System.nanoTime() + 10_000_000_000L
+            for (t in helpers) t.join(((deadline - System.nanoTime()) / 1_000_000).coerceAtLeast(1))
+            val stuck = helpers.filter { it.isAlive }.map { it.name }
+            if (stuck.isEmpty()) {
+                if (h != 0L) Native.looperFree(h)
+                unload()
+            } else {
+                Log.e(TAG, "off: $stuck still running; not freeing the looper or the model")
+                engine = 0L
+                engineModel = ""
+            }
             loopStatus = ""
-            unload()
         }
     }
+
+    /** The source went quiet or came back: the notification's Pause/Play follows. */
+    private fun silence(quiet: Boolean) {
+        sourceSilent = quiet
+        if (quiet == notifiedSilent) return
+        notifiedSilent = quiet
+        getSystemService(NotificationManager::class.java).notify(1, notification())
+    }
+    private var notifiedSilent = false
 
     /** Buffer frame `frame` is where the player is now (if it says). */
     private fun markAnchor(frame: Long) {
@@ -863,7 +914,7 @@ class CaptureService : Service() {
                         loopChanged() // a part edited in meanwhile, or the next plain stretch
                     }
                 }
-                if (Control.stemsOnLoop) thread(name = "stemflow-restem") {
+                if (Control.stemsOnLoop) background("stemflow-restem") {
                     Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
                     work()
                 } else work()
@@ -873,6 +924,7 @@ class CaptureService : Service() {
                 // (in the band's place, played at full level): no model, no lag.
                 val c = chunks.poll(200, TimeUnit.MILLISECONDS) ?: continue
                 capturing = true
+                silence(c.all { it > -1e-4f && it < 1e-4f })
                 processed += c.size / 2
                 markAnchor(processed + chunks.size * (RATE / 10))
                 val z = FloatArray(c.size)
@@ -922,8 +974,10 @@ class CaptureService : Service() {
                     // The source is paused: play silence and leave the GPU alone.
                     stems.put(Stems(bass, band, second))
                     status = "${model.label} · paused"
+                    silence(true)
                     continue
                 }
+                silence(false)
                 computeS = try {
                     Native.engineProcess(engine, x, bass, band, second)
                 } catch (e: Throwable) {
@@ -1146,6 +1200,21 @@ class CaptureService : Service() {
     }
 
     override fun onDestroy() {
+        // Read the source before the route change below: the player pauses itself on
+        // it, so afterwards it always looks paused. A loop counts as not playing the
+        // source: we paused it (or are about to, once the next phrase is buffered).
+        val ctl = NowPlaying.controller(this)
+        val h = looper
+        val inLoop = h != 0L && Native.looperIsPlaying(h)
+        val loopAt = if (inLoop) loopSongRange()?.get(0) else null
+        val wasPlaying = !inLoop && sourcePlaying(this)
+        phraseId++ // a pending "pause after the next phrase" must not fire once we're off
+        cancelRecall()
+        Log.i(TAG, "off: source %s".format(when {
+            inLoop -> "paused for a loop${loopAt?.let { " at ${Bookmarks.time(it)}" } ?: ""}"
+            wasPlaying -> "playing: resume it"
+            else -> "paused: leave it"
+        }))
         running = false
         loading = false
         val error = status.contains("failed") || status.startsWith("No model") || status.contains("disconnected")
@@ -1157,15 +1226,19 @@ class CaptureService : Service() {
         Shizu.stop()
         chunks.clear()
         stems.clear()
-        if (source == "helper") {
-            // Dropping the helper's mix moves the source back to the speaker, and
-            // Spotify pauses itself when its route changes: press play for it.
-            val am = applicationContext.getSystemService(AudioManager::class.java)
-            Handler(Looper.getMainLooper()).postDelayed({
-                for (a in intArrayOf(KeyEvent.ACTION_DOWN, KeyEvent.ACTION_UP)) {
-                    am.dispatchMediaKeyEvent(KeyEvent(a, KeyEvent.KEYCODE_MEDIA_PLAY))
-                }
+        val app = applicationContext
+        if (inLoop) {
+            // Leaving a loop: keep the song quiet, and put it where the loop is, so
+            // the next play starts from what was heard (not the phrase it ran on to).
+            mediaKey(app, KeyEvent.KEYCODE_MEDIA_PAUSE)
+            if (loopAt != null) Handler(Looper.getMainLooper()).postDelayed({
+                (NowPlaying.controller(app) ?: ctl)?.transportControls?.seekTo(loopAt)
             }, 1200)
+        } else if (source == "helper" && wasPlaying) {
+            // Dropping the helper's mix moves the source back to the speaker, and
+            // Spotify pauses itself when its route changes: press play for it, but
+            // only if it was playing (else switching off would start the music).
+            Handler(Looper.getMainLooper()).postDelayed({ mediaKey(app, KeyEvent.KEYCODE_MEDIA_PLAY) }, 1200)
         }
         Control.save(this)
         tileChanged()
