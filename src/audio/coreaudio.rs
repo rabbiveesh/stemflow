@@ -542,6 +542,12 @@ pub fn open(grab: &str, output: Option<String>, _name: &str, play_frames: usize)
         }
     }
 
+    // Creating the first tap is where macOS asks for the recording permission, and
+    // it waits for the answer (on a headless Mac, for a long time).
+    eprintln!(
+        "stemflow: tapping {} (macOS may ask to allow audio recording)",
+        describe(&procs)
+    );
     let desc = tap_description(&procs);
     let tap_uuid = unsafe { desc.UUID() }.UUIDString().to_string();
     let mut tap: AudioObjectID = 0;
