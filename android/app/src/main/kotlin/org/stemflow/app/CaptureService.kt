@@ -921,6 +921,8 @@ class CaptureService : Service() {
     private var notifiedSilent = false
 
     private var lastStateLog = 0L
+    /** Debug builds only: the state line every 10 s is for chasing bugs, not to ship. */
+    private val debuggable by lazy { applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0 }
 
     /** Every few seconds: where the buffer, the player and the speaker are. */
     private fun logState(frame: Long) {
@@ -967,7 +969,7 @@ class CaptureService : Service() {
         val w = if (stale) "${ctl!!.packageName}: report from before our seek" else why
         if (w != anchorWhy) { Log.i(TAG, "anchor: ${w ?: anchor}"); anchorWhy = w }
         val now = System.nanoTime()
-        if (now - lastStateLog > 10_000_000_000L) {
+        if (debuggable && now - lastStateLog > 10_000_000_000L) {
             lastStateLog = now
             logState(frame)
         }
