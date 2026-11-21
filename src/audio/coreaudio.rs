@@ -286,6 +286,10 @@ struct Stats {
     dropped: AtomicU64,
     /// Callbacks that found too little to play after playback had started.
     underruns: AtomicU64,
+    /// IOProc calls so far, and the input buffer list's shape on the last one
+    /// (buffers << 16 | channels of the last buffer), for when nothing arrives.
+    callbacks: AtomicU64,
+    input_shape: AtomicU32,
 }
 
 /// What the IOProc owns.
@@ -306,6 +310,10 @@ unsafe extern "C-unwind" fn io_proc(
     data: *mut c_void,
 ) -> i32 {
     let rt = &mut *(data as *mut Rt);
+    rt.stats.callbacks.fetch_add(1, Ordering::Relaxed);
+    let ins = buffers(input);
+    let shape = (ins.len() as u32) << 16 | ins.last().map_or(0, |b| b.mNumberChannels);
+    rt.stats.input_shape.store(shape, Ordering::Relaxed);
     // The tap's streams come after any of the output device's own inputs.
     if let Some((l, r, n)) = pick(buffers(input), false) {
         let mut peak = 0f32;
@@ -400,13 +408,28 @@ struct Cap {
     rs: Option<Rs>,
     /// Frames per read at the device rate (20 ms).
     chunk: usize,
+    stats: Arc<Stats>,
+    /// Said once that nothing arrives.
+    told: bool,
 }
 
 impl Capture for Cap {
     fn read(&mut self) -> Result<Vec<f32>> {
         loop {
+            let t = std::time::Instant::now();
             while self.rx.slots() < 2 * self.chunk {
                 std::thread::sleep(Duration::from_millis(5));
+                if !self.told && t.elapsed() > Duration::from_secs(3) {
+                    self.told = true;
+                    let shape = self.stats.input_shape.load(Ordering::Relaxed);
+                    eprintln!(
+                        "stemflow: no audio from the tap after 3 s ({} device callbacks; last \
+                         input: {} buffer(s), {} channel(s) in the last)",
+                        self.stats.callbacks.load(Ordering::Relaxed),
+                        shape >> 16,
+                        shape & 0xffff
+                    );
+                }
             }
             let c = self.rx.read_chunk(2 * self.chunk)?;
             let (a, b) = c.as_slices();
@@ -624,6 +647,7 @@ pub fn open(grab: &str, output: Option<String>, _name: &str, play_frames: usize)
     };
     started?; // dropping `route` tears down what was made
 
+    let stats_cap = stats.clone();
     let shown = describe(&procs);
     let needle = grab.to_string();
     let (mut quiet, mut warned, mut dropped, mut under) = (0, false, 0u64, 0u64);
@@ -672,6 +696,8 @@ pub fn open(grab: &str, output: Option<String>, _name: &str, play_frames: usize)
             rx: cap_rx,
             rs: Rs::new(rate, SAMPLE_RATE)?,
             chunk: rate as usize / 50,
+            stats: stats_cap,
+            told: false,
         }),
         playback: Box::new(Play {
             tx: play_tx,

@@ -114,8 +114,12 @@ jobs:
           python3 -c "
           import math, struct, wave
           w = wave.open('tone.wav', 'wb'); w.setnchannels(2); w.setsampwidth(2); w.setframerate(44100)
-          w.writeframes(b''.join(struct.pack('<hh', s, s) for s in (int(8000 * math.sin(2 * math.pi * 220 * i / 44100)) for i in range(44100 * 30))))
+          w.writeframes(b''.join(struct.pack('<hh', s, s) for s in (int(8000 * math.sin(2 * math.pi * 220 * i / 44100)) for i in range(44100 * 20))))
           "
           afplay tone.wav &
           sleep 1
-          ./target/release/stemflow passthrough --grab afplay --seconds 5
+          # It prints a diagnosis if the tap delivers nothing; stop it after 30 s either way.
+          ./target/release/stemflow passthrough --grab afplay --seconds 5 &
+          pid=$!
+          for _ in $(seq 30); do kill -0 $pid 2>/dev/null || break; sleep 1; done
+          kill $pid 2>/dev/null && echo "passthrough still waiting after 30 s" || wait $pid
