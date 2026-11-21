@@ -19,7 +19,10 @@ use crate::spec::{frames_for, HannStft, Stft, BINS};
 use anyhow::{bail, ensure, Result};
 use engine::Engine;
 use realfft::num_complex::Complex32;
+use realfft::{ComplexToReal, RealFftPlanner};
+use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Accel {
@@ -383,11 +386,14 @@ mod engine {
                 // litert_gpu_options.cc and litert_cpu_options.cc serialize them (the
                 // Lrt*Options helpers themselves are not exported by libLiteRt.so).
                 // GPU precision: 1 = fp16, 2 = fp32.
+                // STEMFLOW_GPU_OPTIONS adds lines to the GPU's, e.g. "priority = 3"
+                // (1 low, 2 normal, 3 high), for experiments.
+                let extra = std::env::var("STEMFLOW_GPU_OPTIONS").unwrap_or_default();
                 let named = match accel {
                     Accel::Cpu if threads == 0 => None,
                     Accel::Cpu => Some((c"xnnpack", format!("num_threads = {threads}\n"))),
-                    Accel::Gpu => Some((c"gpu_options", "precision = 2\n".to_string())),
-                    Accel::GpuFp16 => Some((c"gpu_options", "precision = 1\n".to_string())),
+                    Accel::Gpu => Some((c"gpu_options", format!("precision = 2\n{extra}\n"))),
+                    Accel::GpuFp16 => Some((c"gpu_options", format!("precision = 1\n{extra}\n"))),
                 };
                 if let Some((name, toml)) = named {
                     let mut opaque = null;
@@ -578,7 +584,7 @@ mod engine {
     }
 }
 
-/// `[4, bins, frames]` planes (L re, L im, R re, R im) <-> one channel's spectrogram.
+/// One channel's spectrogram -> its two of the `[4, bins, frames]` planes (L re, L im, R re, R im).
 fn to_planes(z: &[Complex32], planes: &mut [f32]) {
     let (re, im) = planes.split_at_mut(z.len());
     for (i, c) in z.iter().enumerate() {
@@ -587,10 +593,121 @@ fn to_planes(z: &[Complex32], planes: &mut [f32]) {
     }
 }
 
-fn from_planes(planes: &[f32], z: &mut [Complex32]) {
-    let (re, im) = planes.split_at(z.len());
-    for (i, c) in z.iter_mut().enumerate() {
-        *c = Complex32::new(re[i], im[i]);
+/// The inverse STFT of spec.rs (`Stft::ispec` or `HannStft::istft`), for only the
+/// samples the caller will use. A live stream keeps `hop + crossfade` samples of each
+/// window, so inverting all of a 7.8 s window is mostly wasted: 80 ms per run on a
+/// Pixel 10a. Frames are added in the same order with the same arithmetic as in
+/// spec.rs, so the samples it does produce are bit-identical.
+struct Istft {
+    inv: Arc<dyn ComplexToReal<f32>>,
+    window: Vec<f32>,
+    nfft: usize,
+    hop: usize,
+    bins: usize,       // bins per frame in the spectrogram (demucs has no Nyquist bin)
+    pad_frames: usize, // all-zero frames assumed on each side (demucs: 2)
+    start: usize,      // overlap-add position of output sample 0
+    scale: f32,
+    guard: bool, // torch.istft's "window envelope is zero" check
+}
+
+impl Istft {
+    fn new(
+        nfft: usize,
+        hop: usize,
+        bins: usize,
+        pad_frames: usize,
+        start: usize,
+        scale: f32,
+        guard: bool,
+    ) -> Self {
+        let window = (0..nfft)
+            .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / nfft as f32).cos())
+            .collect();
+        let inv = RealFftPlanner::<f32>::new().plan_fft_inverse(nfft);
+        Istft {
+            inv,
+            window,
+            nfft,
+            hop,
+            bins,
+            pad_frames,
+            start,
+            scale,
+            guard,
+        }
+    }
+
+    /// As `Stft::ispec`.
+    fn demucs() -> Self {
+        let n = crate::spec::NFFT;
+        Self::new(
+            n,
+            n / 4,
+            BINS,
+            2,
+            n / 2 + n / 8 * 3,
+            1.0 / (n as f32).sqrt(),
+            false,
+        )
+    }
+
+    /// As `HannStft::istft`.
+    fn hann(nfft: usize, hop: usize) -> Self {
+        Self::new(
+            nfft,
+            hop,
+            nfft / 2 + 1,
+            0,
+            nfft / 2,
+            1.0 / nfft as f32,
+            true,
+        )
+    }
+
+    /// `planes` is one channel's (re, im) planes, `[bin * frames + frame]` each. Writes
+    /// (or, with `add`, adds to) `out[range]`; the rest of `out` is left alone.
+    fn run(&self, planes: &[f32], frames: usize, range: Range<usize>, out: &mut [f32], add: bool) {
+        let (n, hop) = (self.nfft, self.hop);
+        let (re, im) = planes.split_at(self.bins * frames);
+        let (lo, hi) = (self.start + range.start, self.start + range.end); // in overlap-add positions
+        let mut y = vec![0f32; range.len()];
+        let mut env = vec![0f32; range.len()];
+        let mut spec = self.inv.make_input_vec();
+        let mut frame = self.inv.make_output_vec();
+        let first = (lo + 1).saturating_sub(n).div_ceil(hop);
+        let last = ((hi - 1) / hop).min(frames + 2 * self.pad_frames - 1);
+        for f in first..=last {
+            let off = f * hop;
+            let (i0, i1) = (lo.saturating_sub(off), (hi - off).min(n));
+            for i in i0..i1 {
+                env[off + i - lo] += self.window[i] * self.window[i];
+            }
+            if f < self.pad_frames || f >= frames + self.pad_frames {
+                continue;
+            }
+            let col = f - self.pad_frames;
+            for bin in 0..self.bins {
+                spec[bin] = Complex32::new(re[bin * frames + col], im[bin * frames + col]);
+            }
+            spec[0].im = 0.0;
+            if self.bins == n / 2 {
+                spec[n / 2] = Complex32::new(0.0, 0.0);
+            } else {
+                spec[self.bins - 1].im = 0.0;
+            }
+            self.inv.process(&mut spec, &mut frame).expect("ifft");
+            for i in i0..i1 {
+                y[off + i - lo] += frame[i] * self.scale * self.window[i];
+            }
+        }
+        for ((o, y), e) in out[range].iter_mut().zip(&y).zip(&env) {
+            let v = if self.guard && *e <= 1e-11 {
+                0.0
+            } else {
+                y / e
+            };
+            *o = if add { *o + v } else { v };
+        }
     }
 }
 
@@ -604,10 +721,9 @@ pub struct LiteRtDemucs {
     stft: Stft,
     seg: usize,
     frames: usize,
-    // Scratch kept between runs, rather than ~30 MB allocated afresh each time
-    // (tidier on a phone; it made no measurable difference to the run time).
-    z: Vec<Complex32>,
-    y: Vec<f32>,
+    istft: Istft,
+    needed: Range<usize>,
+    z: Vec<Complex32>, // scratch kept between runs
 }
 
 impl LiteRtDemucs {
@@ -649,11 +765,20 @@ impl LiteRtDemucs {
             stft: Stft::new(),
             seg,
             frames,
+            istft: Istft::demucs(),
+            needed: 0..seg,
             z: vec![Complex32::new(0.0, 0.0); BINS * frames],
-            y: vec![0f32; seg],
         };
         m.separate(&vec![0.0; 2 * seg])?; // first run compiles the GPU kernels
         Ok(m)
+    }
+
+    /// Only these samples of each window will be used (a stream's are
+    /// `seg - lookahead - hop .. seg - lookahead + crossfade`): `separate` then leaves
+    /// the rest of what it returns without the spectrogram branch, i.e. wrong.
+    pub fn set_needed(&mut self, range: Range<usize>) {
+        assert!(range.start < range.end && range.end <= self.seg);
+        self.needed = range;
     }
 }
 
@@ -677,11 +802,14 @@ impl Separator for LiteRtDemucs {
         let mut out = self.engine.output(self.out_wave, 2 * seg)?.to_vec(); // time branch
         let spec = self.engine.output(self.out_spec, 4 * plane)?;
         for ch in 0..2 {
-            from_planes(&spec[2 * ch * plane..(2 * ch + 2) * plane], &mut self.z);
-            self.stft.ispec(&self.z, seg, &mut self.y);
-            for (o, v) in out[ch * seg..(ch + 1) * seg].iter_mut().zip(&self.y) {
-                *o += v;
-            }
+            let planes = &spec[2 * ch * plane..(2 * ch + 2) * plane];
+            self.istft.run(
+                planes,
+                self.frames,
+                self.needed.clone(),
+                &mut out[ch * seg..(ch + 1) * seg],
+                true,
+            );
         }
         Ok(out)
     }
@@ -697,6 +825,8 @@ pub struct LiteRtRoformer {
     seg: usize,
     frames: usize,
     heads: usize,
+    istft: Istft,
+    needed: Range<usize>,
     z: Vec<Complex32>,
 }
 
@@ -722,6 +852,8 @@ impl LiteRtRoformer {
         let mut m = LiteRtRoformer {
             engine,
             z: vec![Complex32::new(0.0, 0.0); stft.bins() * frames],
+            istft: Istft::hann(stft.nfft, stft.hop),
+            needed: 0..seg,
             stft,
             seg,
             frames,
@@ -729,6 +861,12 @@ impl LiteRtRoformer {
         };
         m.separate(&vec![0.0; 2 * seg])?; // first run compiles the GPU kernels
         Ok(m)
+    }
+
+    /// As `LiteRtDemucs::set_needed`; the rest of what `separate` returns is zero.
+    pub fn set_needed(&mut self, range: Range<usize>) {
+        assert!(range.start < range.end && range.end <= self.seg);
+        self.needed = range;
     }
 }
 
@@ -746,14 +884,19 @@ impl Separator for LiteRtRoformer {
             to_planes(&self.z, &mut spec_in[2 * ch * plane..(2 * ch + 2) * plane]);
         }
         self.engine.invoke()?;
-        let spec = self.engine.output(0, 4 * plane * self.heads)?.to_vec();
+        let spec = self.engine.output(0, 4 * plane * self.heads)?;
         let mut out = vec![0f32; 2 * seg * self.heads];
         for h in 0..self.heads {
             let (s, o) = (&spec[4 * plane * h..], &mut out[2 * seg * h..]);
             for ch in 0..2 {
-                from_planes(&s[2 * ch * plane..(2 * ch + 2) * plane], &mut self.z);
-                self.stft
-                    .istft(&self.z, self.frames, &mut o[ch * seg..(ch + 1) * seg]);
+                let planes = &s[2 * ch * plane..(2 * ch + 2) * plane];
+                self.istft.run(
+                    planes,
+                    self.frames,
+                    self.needed.clone(),
+                    &mut o[ch * seg..(ch + 1) * seg],
+                    false,
+                );
             }
         }
         Ok(out)
