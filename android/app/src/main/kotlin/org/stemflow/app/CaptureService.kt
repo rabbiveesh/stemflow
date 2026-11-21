@@ -921,7 +921,7 @@ class CaptureService : Service() {
     private var notifiedSilent = false
 
     private var lastStateLog = 0L
-    /** Debug builds only: the state line every 10 s is for chasing bugs, not to ship. */
+    /** Debug builds only: the per-hop line and the state line every 10 s are for chasing bugs, not to ship. */
     private val debuggable by lazy { applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0 }
 
     /** Every few seconds: where the buffer, the player and the speaker are. */
@@ -1105,7 +1105,7 @@ class CaptureService : Service() {
                     model.label, if (source == "helper") "helper" else "screen capture",
                     computeS, hopS, latency, if (skipped > 0) " · skipped $skipped" else "", levelDb,
                 )
-                Log.i(TAG, "run %.3fs late=%d skipped=%d in=%.1fdBFS unheard=%d ms %s".format(computeS, late, skipped, levelDb, unheardFrames() * 1000 / RATE, Control.describe()))
+                if (debuggable) Log.i(TAG, "run %.3fs late=%d skipped=%d in=%.1fdBFS unheard=%d ms %s".format(computeS, late, skipped, levelDb, unheardFrames() * 1000 / RATE, Control.describe()))
             }
         }
     }
