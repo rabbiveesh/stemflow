@@ -21,10 +21,13 @@ android {
     kotlinOptions { jvmTarget = "17" }
     // The LiteRT libraries are plain files next to ours; keep them loadable by name.
     packaging { jniLibs { useLegacyPackaging = true } }
+    // SongMap and other pure logic: `gradle testDebugUnitTest` on the laptop
+    testOptions { unitTests.isReturnDefaultValues = true }
 }
 
 dependencies {
     // Starts the capture helper as the shell uid without adb.
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
+    testImplementation("junit:junit:4.13.2")
 }

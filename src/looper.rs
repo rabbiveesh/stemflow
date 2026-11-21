@@ -1201,6 +1201,8 @@ impl Looper {
         let oldest = self.ring.lock().unwrap().oldest() as i64;
         let mut st = self.state.lock().unwrap();
         st.gaps.retain(|&(_, e)| e >= oldest);
+        // either order: a jump back gives the ends the other way round
+        let (from, to) = (from.min(to), from.max(to));
         st.gaps.push((from, to.max(from + 1)));
     }
 
@@ -1397,6 +1399,16 @@ mod tests {
             st.playing = true;
         }
         l
+    }
+
+    /// A gap given end first (the frames jumped back) is the same gap.
+    #[test]
+    fn gap_either_way_round() {
+        let l = Looper::new(Box::new(NoNet));
+        l.mark_gap(5_000, 2_000);
+        assert!(!l.continuous(3_000, 4_000));
+        assert!(l.continuous(0, 2_000));
+        assert!(l.continuous(5_000, 9_000));
     }
 
     /// Only what is still the plain mix is separated; a new model redoes it all.
