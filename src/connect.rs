@@ -68,7 +68,12 @@ impl Sink for FeedSink {
         };
         let mut q = self.feed.q.lock().unwrap();
         while q.len() >= 2 * AHEAD && self.running.load(Ordering::Relaxed) {
-            q = self.feed.room.wait_timeout(q, Duration::from_millis(100)).unwrap().0;
+            q = self
+                .feed
+                .room
+                .wait_timeout(q, Duration::from_millis(100))
+                .unwrap()
+                .0;
         }
         q.extend(s.iter().map(|&v| v as f32));
         Ok(())
@@ -283,7 +288,10 @@ mod tests {
     #[test]
     fn clock_paces_and_fills_silence() {
         let feed = Arc::new(Feed::default());
-        feed.q.lock().unwrap().extend(std::iter::repeat_n(0.5f32, 2 * BLOCK + 10));
+        feed.q
+            .lock()
+            .unwrap()
+            .extend(std::iter::repeat_n(0.5f32, 2 * BLOCK + 10));
         let (tx, rx) = mpsc::channel();
         let running = Arc::new(AtomicBool::new(true));
         let (f, r) = (feed.clone(), running.clone());

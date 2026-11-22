@@ -1,8 +1,8 @@
 mod audio;
 mod beats;
-mod control;
 #[cfg(feature = "connect")]
 mod connect;
+mod control;
 mod looper;
 mod model;
 mod models;

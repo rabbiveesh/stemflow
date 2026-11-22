@@ -136,23 +136,25 @@ pub fn live(
     let frame = 8usize; // bytes per stereo f32 frame
     let rec = match grab {
         None => None,
-        Some(_) => Some(Simple::new(
-        None,
-        "stemflow",
-        Direction::Record,
-        Some(&format!("{SINK}.monitor")),
-        "capture",
-        &spec,
-        None,
-        Some(&BufferAttr {
-            maxlength: u32::MAX,
-            tlength: u32::MAX,
-            prebuf: u32::MAX,
-            minreq: u32::MAX,
-            fragsize: (SAMPLE_RATE as usize / 50 * frame) as u32, // 20 ms
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("opening capture: {e}"))?),
+        Some(_) => Some(
+            Simple::new(
+                None,
+                "stemflow",
+                Direction::Record,
+                Some(&format!("{SINK}.monitor")),
+                "capture",
+                &spec,
+                None,
+                Some(&BufferAttr {
+                    maxlength: u32::MAX,
+                    tlength: u32::MAX,
+                    prebuf: u32::MAX,
+                    minreq: u32::MAX,
+                    fragsize: (SAMPLE_RATE as usize / 50 * frame) as u32, // 20 ms
+                }),
+            )
+            .map_err(|e| anyhow::anyhow!("opening capture: {e}"))?,
+        ),
     };
     let hop = st.as_ref().unwrap().hop;
     // Keep the device buffer small and the jitter buffer here instead, so the mix
@@ -204,18 +206,18 @@ pub fn live(
     let r = running.clone();
     match (rec, source) {
         (Some(rec), _) => drop(std::thread::spawn(move || {
-        let mut buf = vec![0u8; SAMPLE_RATE as usize / 50 * frame];
-        while r.load(Ordering::Relaxed) {
-            if rec.read(&mut buf).is_err() {
-                break;
+            let mut buf = vec![0u8; SAMPLE_RATE as usize / 50 * frame];
+            while r.load(Ordering::Relaxed) {
+                if rec.read(&mut buf).is_err() {
+                    break;
+                }
+                let mut v = Vec::with_capacity(buf.len() / 4);
+                bytes_to_f32(&buf, &mut v);
+                if tx_in.send(v).is_err() {
+                    break;
+                }
             }
-            let mut v = Vec::with_capacity(buf.len() / 4);
-            bytes_to_f32(&buf, &mut v);
-            if tx_in.send(v).is_err() {
-                break;
-            }
-        }
-    })),
+        })),
         #[cfg(feature = "connect")]
         (None, Source::Connect(o)) => crate::connect::spawn(o, tx_in, r)?,
         (None, _) => unreachable!("grabbing always opens the capture"),
@@ -362,7 +364,10 @@ pub fn live(
             }
         }
         // Pick up streams the app opens later (Spotify reopens on device changes).
-        if let Some(grab) = grab.as_deref().filter(|_| last_grab.elapsed().as_secs() >= 2) {
+        if let Some(grab) = grab
+            .as_deref()
+            .filter(|_| last_grab.elapsed().as_secs() >= 2)
+        {
             last_grab = Instant::now();
             if let Ok(ids) = find_streams(grab) {
                 for id in ids {
