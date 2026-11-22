@@ -98,7 +98,7 @@ Switch it on from the menu ("Beat click") or `busctl --user set-property org.ste
 
 ## macOS (Apple Silicon)
 
-*New, and not yet tried on a real Mac.* Live mode taps the app with a Core Audio
+Tested on an M5 MacBook Pro (macOS 26). Live mode taps the app with a Core Audio
 process tap (macOS 14.2+), which also mutes it on the speakers while stemflow runs,
 and plays the result through a private aggregate device on your output. Both belong
 to the stemflow process, so Ctrl-C or a crash gives the app its sound back.
@@ -123,11 +123,21 @@ cargo build --release
   44.1 kHz around the pipeline.
 - `--device coreml` hands what Core ML can run to the GPU / Neural Engine. The first
   load compiles the model and caches it next to the `.onnx` file. On an M5, htdemucs_ft
-  takes 0.35 s per 7.8 s window this way (1.7 s on the CPU), so on a Mac use
-  `stemflow live --sep demucs --device coreml`. BS-RoFormer takes 2.1 s per 3 s window
-  on the CPU, too slow for live, and is slower still under Core ML (stemflow keeps it
-  on the CPU).
-- On macOS, `live` defaults to `--sep demucs --device coreml`.
+  takes 0.35 s per 7.8 s window this way (1.7 s on the CPU).
+- BS-RoFormer needs a Core ML package of its own: ONNX Runtime's Core ML route runs it
+  slower than the CPU (2.5 s per 3 s window, too slow for live). Converted directly
+  and run on the GPU it takes 0.32 s (p99 0.52 s) on an M5, within 0.1% of the CPU
+  output (59 dB SDR):
+
+  ```bash
+  (cd tools && .venv/bin/python -I export_bsrofo_coreml.py ../models/ext/bsrofo ../models bass 3)
+  ```
+
+  That writes `models/bsrofo_sw_bass.t259.mlpackage` for the 3 s window (one package
+  per `--window`; add `fp32` for an exact but 2.5x slower one). The first run compiles
+  it in a few seconds and caches the result.
+- On macOS, `live` defaults to `--device coreml`, and to BS-RoFormer when its package
+  for the window is there, else `--sep demucs`.
 
 ### Menu bar app
 

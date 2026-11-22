@@ -43,19 +43,18 @@ class Loader(yaml.SafeLoader):
 
 Loader.add_constructor("tag:yaml.org,2002:python/tuple", lambda l, n: tuple(l.construct_sequence(n)))
 
-src_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "../models/ext/bsrofo")
-out_dir = Path(sys.argv[2] if len(sys.argv) > 2 else "../models")
-STEMS = (sys.argv[3] if len(sys.argv) > 3 else "bass").split(",")
-STEM = "+".join(STEMS)
-cfg = yaml.load((src_dir / "config.yaml").read_text(), Loader=Loader)
-mcfg = dict(cfg["model"], flash_attn=False)
-assert (mcfg["stft_n_fft"], mcfg["stft_hop_length"], mcfg.get("stft_normalized")) == (N_FFT, HOP, False)
-m = BSRoformer(**mcfg).eval()
-m.requires_grad_(False)  # no autograd state while tracing: the export took >12 GB of RAM without this
-state = torch.load(src_dir / "model.ckpt", map_location="cpu", weights_only=False)
-m.load_state_dict(state.get("state_dict", state))
-head_idx = [cfg["training"]["instruments"].index(s) for s in STEMS]
-assert not m.skip_connection and m.zero_dc
+
+def load(src_dir, stems):
+    """The checkpoint's BSRoformer, and the indices of the heads for `stems`."""
+    cfg = yaml.load((src_dir / "config.yaml").read_text(), Loader=Loader)
+    mcfg = dict(cfg["model"], flash_attn=False)
+    assert (mcfg["stft_n_fft"], mcfg["stft_hop_length"], mcfg.get("stft_normalized")) == (N_FFT, HOP, False)
+    m = BSRoformer(**mcfg).eval()
+    m.requires_grad_(False)  # no autograd state while tracing: the export took >12 GB of RAM without this
+    state = torch.load(src_dir / "model.ckpt", map_location="cpu", weights_only=False)
+    m.load_state_dict(state.get("state_dict", state))
+    assert not m.skip_connection and m.zero_dc
+    return m, [cfg["training"]["instruments"].index(s) for s in stems]
 
 
 class Core(torch.nn.Module):
@@ -127,41 +126,51 @@ def test_mix(n, seed=0):
     return torch.from_numpy(np.stack([bass + chords + hats, 0.8 * bass + chords - hats]).astype(np.float32))[None]
 
 
-core = Core(m, head_idx).eval()
-EXPORT_N = 4 * 44100  # trace length; T stays dynamic
-with torch.no_grad():
-    # The 13.35 s check takes ~20 GB of RAM on CPU; STEMFLOW_LONG_CHECK=0 skips it.
-    for n in (EXPORT_N, 588800) if os.environ.get("STEMFLOW_LONG_CHECK", "1") != "0" else (EXPORT_N,):
-        mix = test_mix(n)
-        full = m(mix)[0, head_idx]
-        full = full[0] if len(head_idx) == 1 else full
-        y = istft(core(stft(mix)), n)
-        print(f"n={n}: torch split vs stock forward, max abs err {float((y - full).abs().max()):.2e}")
-    z = stft(test_mix(EXPORT_N))
+def main():
+    src_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "../models/ext/bsrofo")
+    out_dir = Path(sys.argv[2] if len(sys.argv) > 2 else "../models")
+    STEMS = (sys.argv[3] if len(sys.argv) > 3 else "bass").split(",")
+    STEM = "+".join(STEMS)
+    m, head_idx = load(src_dir, STEMS)
+    core = Core(m, head_idx).eval()
+    EXPORT_N = 4 * 44100  # trace length; T stays dynamic
+    with torch.no_grad():
+        # The 13.35 s check takes ~20 GB of RAM on CPU; STEMFLOW_LONG_CHECK=0 skips it.
+        for n in (EXPORT_N, 588800) if os.environ.get("STEMFLOW_LONG_CHECK", "1") != "0" else (EXPORT_N,):
+            mix = test_mix(n)
+            full = m(mix)[0, head_idx]
+            full = full[0] if len(head_idx) == 1 else full
+            y = istft(core(stft(mix)), n)
+            print(f"n={n}: torch split vs stock forward, max abs err {float((y - full).abs().max()):.2e}")
+        z = stft(test_mix(EXPORT_N))
 
-onnx_path = out_dir / f"bsrofo_sw_{STEM}.onnx"
-with torch.no_grad():
-    torch.onnx.export(core, (z,), str(onnx_path), input_names=["spec_in"], output_names=["spec"],
-                      dynamic_axes={"spec_in": {3: "frames"}, "spec": {3: "frames"}},
-                      opset_version=17, do_constant_folding=True)
-print("wrote", onnx_path, f"{onnx_path.stat().st_size / 1e6:.1f} MB")
+    onnx_path = out_dir / f"bsrofo_sw_{STEM}.onnx"
+    with torch.no_grad():
+        torch.onnx.export(core, (z,), str(onnx_path), input_names=["spec_in"], output_names=["spec"],
+                          dynamic_axes={"spec_in": {3: "frames"}, "spec": {3: "frames"}},
+                          opset_version=17, do_constant_folding=True)
+    print("wrote", onnx_path, f"{onnx_path.stat().st_size / 1e6:.1f} MB")
 
-import onnxruntime as ort  # noqa: E402
+    import onnxruntime as ort  # noqa: E402
 
-sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-ref = out_dir / ("ref_bsrofo" if STEM == "bass" else f"ref_bsrofo_{STEM}")
-ref.mkdir(exist_ok=True)
-with torch.no_grad():
-    for n in (EXPORT_N, 3 * 44100 + 777):
-        mix = test_mix(n, seed=1)
-        z = stft(mix)
-        spec = core(z)
-        (o,) = sess.run(None, {"spec_in": z.numpy()})
-        print(f"n={n}: onnx vs torch spec max abs err {float(np.abs(o - spec.numpy()).max()):.2e}, "
-              f"peak {float(spec.abs().max()):.2f}")
-    mix.numpy().tofile(ref / "mix.f32")
-    full = m(mix)[0]
-    for s, h in zip(STEMS, head_idx):
-        full[h].numpy().astype(np.float32).tofile(ref / f"{s}.f32")
-    z.numpy().tofile(ref / "spec_in.f32")
-    print(f"wrote reference vectors ({mix.shape[-1]} samples) to", ref)
+    sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    ref = out_dir / ("ref_bsrofo" if STEM == "bass" else f"ref_bsrofo_{STEM}")
+    ref.mkdir(exist_ok=True)
+    with torch.no_grad():
+        for n in (EXPORT_N, 3 * 44100 + 777):
+            mix = test_mix(n, seed=1)
+            z = stft(mix)
+            spec = core(z)
+            (o,) = sess.run(None, {"spec_in": z.numpy()})
+            print(f"n={n}: onnx vs torch spec max abs err {float(np.abs(o - spec.numpy()).max()):.2e}, "
+                  f"peak {float(spec.abs().max()):.2f}")
+        mix.numpy().tofile(ref / "mix.f32")
+        full = m(mix)[0]
+        for s, h in zip(STEMS, head_idx):
+            full[h].numpy().astype(np.float32).tofile(ref / f"{s}.f32")
+        z.numpy().tofile(ref / "spec_in.f32")
+        print(f"wrote reference vectors ({mix.shape[-1]} samples) to", ref)
+
+
+if __name__ == "__main__":
+    main()

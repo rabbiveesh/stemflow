@@ -382,6 +382,9 @@ final class Controller: NSObject, NSMenuDelegate {
     var isOnOrStarting: Bool { state != nil || starting != nil }
 
     func setup() {
+        // Keeps its place in the bar across relaunches; without it every reinstall
+        // puts the icon at the far left, where the notch can hide it.
+        item.autosaveName = "stemflow"
         item.button?.image = statusIcon(tint: nil)
         item.menu = menu
         menu.delegate = self

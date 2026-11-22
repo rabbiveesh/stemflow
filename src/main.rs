@@ -1,6 +1,8 @@
 mod audio;
 mod beats;
 mod control;
+#[cfg(target_os = "macos")]
+mod coreml;
 mod looper;
 mod model;
 mod models;
@@ -147,7 +149,8 @@ enum Sep {
 
 #[derive(Args, Clone)]
 struct Opts {
-    /// Architecture (default bsrofo; demucs on macOS, where BS-RoFormer can't keep up).
+    /// Architecture (default bsrofo; on macOS demucs, unless BS-RoFormer has a Core ML
+    /// package for the window: tools/export_bsrofo_coreml.py).
     /// Live, without --sep/--target/--model, the model last picked in the menu is used.
     #[arg(long, value_enum)]
     sep: Option<Sep>,
@@ -167,7 +170,8 @@ struct Opts {
     #[arg(long)]
     stereo_in: bool,
     /// BS-RoFormer context window, seconds (trained at 13.35). 3 keeps up live on an
-    /// 8 GB laptop GPU; longer needs more VRAM and compute but not more latency.
+    /// 8 GB laptop GPU; longer needs more VRAM and compute but not more latency. With
+    /// Core ML, each window length needs its own package (tools/export_bsrofo_coreml.py).
     #[arg(long, default_value_t = 3.0)]
     window: f32,
     /// Ensemble weight of SCNet (Demucs gets 1 - this).
@@ -213,11 +217,18 @@ struct Opts {
 
 impl Opts {
     fn sep(&self) -> Sep {
-        self.sep.unwrap_or(if cfg!(target_os = "macos") {
-            Sep::Demucs
-        } else {
-            Sep::Bsrofo
-        })
+        // On macOS BS-RoFormer only keeps up with a Core ML package for its window.
+        self.sep
+            .unwrap_or(if cfg!(target_os = "macos") && !self.bsrofo_coreml() {
+                Sep::Demucs
+            } else {
+                Sep::Bsrofo
+            })
+    }
+    fn bsrofo_coreml(&self) -> bool {
+        let onnx = self.models.join(bsrofo_onnx(self.target()));
+        self.device == Device::Coreml
+            && model::coreml_package(&onnx, 1 + secs(self.window) / 512).is_some()
     }
     fn target(&self) -> Target {
         self.target.unwrap_or(Target::Bass)
