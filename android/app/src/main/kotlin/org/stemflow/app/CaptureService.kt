@@ -26,7 +26,6 @@ import android.os.Process
 import android.os.SystemClock
 import android.service.quicksettings.TileService
 import android.content.ComponentName
-import android.util.Log
 import android.view.KeyEvent
 import java.io.DataInputStream
 import java.io.IOException
@@ -814,9 +813,12 @@ class CaptureService : Service() {
         val data = intent?.getParcelableExtra<Intent>("data")
         source = if (data != null) "projection" else "helper"
 
+        Log.init(this)
+        Log.i(TAG, "--- switching on ---")
         Control.load(this)
         Control.loadBeats(this)
         // frame numbers start again with this run
+        captureSilenced = false
         songMap.clear()
         anchorWhy = "start"
         seekedAt = 0L
@@ -930,13 +932,52 @@ class CaptureService : Service() {
     }
 
     /** The source went quiet or came back: the notification's Pause/Play follows. */
-    private fun silence(quiet: Boolean) {
+    private fun silence(quiet: Boolean, frame: Long) {
         sourceSilent = quiet
+        silentWhilePlaying(quiet, frame)
         if (quiet == notifiedSilent) return
         notifiedSilent = quiet
         getSystemService(NotificationManager::class.java).notify(1, notification())
     }
     private var notifiedSilent = false
+
+    /**
+     * Exact silence coming in while the player says it is playing (for over a second,
+     * so not the moment after pressing play): our capture was silenced, which Android
+     * does to background capture while another app has the mic, say. It isn't the
+     * song: no anchors meanwhile, and a break either side, so loops keep clear of it.
+     */
+    private fun silentWhilePlaying(quiet: Boolean, frame: Long) {
+        val now = quiet && NowPlaying.controller(this)?.let {
+            NowPlaying.playing(it) && SystemClock.elapsedRealtime() - (NowPlaying.reportedAt(it) ?: Long.MAX_VALUE) > 1_000
+        } == true
+        if (now == captureSilenced) return
+        captureSilenced = now
+        if (now) {
+            silencedFrom = frame
+            silencedAt = SystemClock.elapsedRealtime()
+            val ctl = NowPlaying.controller(this)
+            Log.w(TAG, "input SILENT while %s plays (at %s ms): capture silenced? mic users: %s; buffer frame %d".format(
+                ctl?.packageName, ctl?.let { NowPlaying.positionMs(it) }, micUsers(), frame))
+            songMap.cut("input silent while playing")
+        } else {
+            val h = looper
+            if (h != 0L) Native.looperMarkGap(h, silencedFrom, frame)
+            songMap.cut("input back after silence")
+            Log.w(TAG, "input back after %d ms of silence while playing (frames %d–%d marked as a gap)".format(
+                SystemClock.elapsedRealtime() - silencedAt, silencedFrom, frame))
+        }
+    }
+    @Volatile private var captureSilenced = false
+    private var silencedFrom = 0L
+    private var silencedAt = 0L
+
+    /** Who is recording now (what we can see of it), for the log. */
+    private fun micUsers(): String = try {
+        getSystemService(AudioManager::class.java).activeRecordingConfigurations.joinToString {
+            "source %d%s".format(it.audioSource, if (it.isClientSilenced) " (silenced)" else "")
+        }.ifEmpty { "none visible" }
+    } catch (e: Exception) { "? (${e.message})" }
 
     private var lastStateLog = 0L
     /** Debug builds only: the per-hop line and the state line every 10 s are for chasing bugs, not to ship. */
@@ -980,7 +1021,7 @@ class CaptureService : Service() {
         // (For 3 s at most: a player that ignored the seek never reports again.)
         val stale = why == null && (NowPlaying.reportedAt(ctl!!) ?: Long.MAX_VALUE) < seekedAt &&
             SystemClock.elapsedRealtime() - seekedAt < 3_000
-        if (why == null && !stale) {
+        if (why == null && !stale && !captureSilenced) {
             // The song time didn't follow the buffer (a seek, a pause, skipped input,
             // the next track): what lies between isn't continuous song audio.
             val a = Anchor(frame, ms!!, song!!)
@@ -993,7 +1034,11 @@ class CaptureService : Service() {
             }
             if (h != 0L) songMap.prune(Native.looperTotal(h) - KEEP_FRAMES)
         }
-        val w = if (stale) "${ctl!!.packageName}: report from before our seek" else why
+        val w = when {
+            stale -> "${ctl!!.packageName}: report from before our seek"
+            why == null && captureSilenced -> "input silent while playing"
+            else -> why
+        }
         if (w != anchorWhy) { Log.i(TAG, "anchor: ${w ?: anchor}"); anchorWhy = w }
         val now = System.nanoTime()
         if (debuggable && now - lastStateLog > 10_000_000_000L) {
@@ -1059,8 +1104,8 @@ class CaptureService : Service() {
                     Log.i(TAG, "capture only from input %d (delay %d dropped)".format(processed, delayFrames))
                 }
                 capturing = true
-                silence(c.all { it > -1e-4f && it < 1e-4f })
                 processed += c.size / 2
+                silence(c.all { it > -1e-4f && it < 1e-4f }, processed)
                 markAnchor(processed + chunks.size * (RATE / 10))
                 val z = FloatArray(c.size)
                 stems.put(Stems(z, c, z, plain = true))
@@ -1108,18 +1153,18 @@ class CaptureService : Service() {
                 processed += hop
                 // Where the player is now = the newest input received (this hop and any
                 // chunks queued after it), whose stems land `delay` frames later.
+                val quiet = x.all { it > -1e-4f && it < 1e-4f }
+                silence(quiet, processed + delayFrames)
                 markAnchor(processed + chunks.size * (RATE / 10) + delayFrames)
                 val bass = FloatArray(2 * hop)
                 val band = FloatArray(2 * hop)
                 val second = FloatArray(2 * hop)
-                if (x.all { it > -1e-4f && it < 1e-4f }) {
+                if (quiet) {
                     // The source is paused: play silence and leave the GPU alone.
                     stems.put(Stems(bass, band, second))
                     status = "${model.label} · paused"
-                    silence(true)
                     continue
                 }
-                silence(false)
                 computeS = try {
                     Native.engineProcess(engine, x, bass, band, second)
                 } catch (e: Throwable) {

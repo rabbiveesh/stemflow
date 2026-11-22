@@ -22,7 +22,6 @@ import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.util.Log
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -288,6 +287,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Log.init(this)
         Control.load(this)
         Control.loadBeats(this)
         tab = getPreferences(Context.MODE_PRIVATE).getInt("tab", 1)
