@@ -19,23 +19,26 @@ from demucs.htdemucs import HTDemucs
 from demucs.pretrained import get_model
 from einops import rearrange
 
-out_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "../models")
-out_dir.mkdir(parents=True, exist_ok=True)
-STEM = sys.argv[2] if len(sys.argv) > 2 else "bass"
 
-bag = get_model("htdemucs_ft")
-bass_idx = bag.sources.index(STEM)
-# htdemucs_ft is 4 specialists; the bag weights pick one model per source.
-weights = torch.tensor(bag.weights)  # [n_models, n_sources]
-model_idx = int(weights[:, bass_idx].argmax())
-assert weights[model_idx, bass_idx] == 1 and weights[:, bass_idx].sum() == 1, weights
-m: HTDemucs = bag.models[model_idx].eval()
-m.requires_grad_(False)  # keeps tracing from holding autograd state
-# ...but then nn.MultiheadAttention takes its fused fast path, which ONNX can't export.
-torch.backends.mha.set_fastpath_enabled(False)
-assert m.cac and m.use_train_segment and m.samplerate == 44100
-SEG = int(m.segment * m.samplerate)
-print(f"{STEM} model = #{model_idx}, sources={m.sources}, segment={SEG} samples, nfft={m.nfft}")
+def load(stem):
+    """The htdemucs_ft specialist for `stem`, and that source's index in it."""
+    bag = get_model("htdemucs_ft")
+    src = bag.sources.index(stem)
+    # htdemucs_ft is 4 specialists; the bag weights pick one model per source.
+    weights = torch.tensor(bag.weights)  # [n_models, n_sources]
+    model_idx = int(weights[:, src].argmax())
+    assert weights[model_idx, src] == 1 and weights[:, src].sum() == 1, weights
+    m: HTDemucs = bag.models[model_idx].eval()
+    m.requires_grad_(False)  # keeps tracing from holding autograd state
+    # ...but then nn.MultiheadAttention takes its fused fast path, which ONNX can't export.
+    torch.backends.mha.set_fastpath_enabled(False)
+    assert m.cac and m.use_train_segment and m.samplerate == 44100
+    print(f"{stem} model = #{model_idx}, sources={m.sources}, segment={segment(m)} samples, nfft={m.nfft}")
+    return m, src
+
+
+def segment(m):
+    return int(m.segment * m.samplerate)
 
 
 class Core(torch.nn.Module):
@@ -111,53 +114,66 @@ class Core(torch.nn.Module):
         return x[:, self.src], xt[:, self.src]
 
 
-core = Core(m, bass_idx).eval()
+def test_mix(n):
+    """Deterministic test signal with some musical structure: a walking bass-ish line,
+    some chords and noisy hats, stereo-shifted. Only used to check numerics."""
+    rng = np.random.default_rng(0)
+    t = np.arange(n) / 44100
+    notes = 55 * 2 ** (np.array([0, 3, 5, 7, 10, 7, 5, 3]) / 12)
+    f0 = notes[(t * 2).astype(int) % len(notes)]
+    bassline = 0.4 * np.sin(2 * np.pi * np.cumsum(f0) / 44100)
+    chords = sum(0.08 * np.sin(2 * np.pi * f * t) for f in (261.6, 329.6, 392.0))
+    hats = 0.05 * rng.standard_normal(n) * (np.sin(2 * np.pi * 4 * t) > 0.9)
+    return np.stack([bassline + chords + hats, 0.8 * bassline + chords - hats]).astype(np.float32)
 
-# Deterministic test signal with some musical structure: a walking bass-ish line,
-# some chords and noisy hats, stereo-shifted. Only used to check numerics.
-rng = np.random.default_rng(0)
-t = np.arange(SEG) / 44100
-notes = 55 * 2 ** (np.array([0, 3, 5, 7, 10, 7, 5, 3]) / 12)
-f0 = notes[(t * 2).astype(int) % len(notes)]
-bassline = 0.4 * np.sin(2 * np.pi * np.cumsum(f0) / 44100)
-chords = sum(0.08 * np.sin(2 * np.pi * f * t) for f in (261.6, 329.6, 392.0))
-hats = 0.05 * rng.standard_normal(SEG) * (np.sin(2 * np.pi * 4 * t) > 0.9)
-mix_np = np.stack([bassline + chords + hats, 0.8 * bassline + chords - hats]).astype(np.float32)
-mix = torch.from_numpy(mix_np)[None]
 
-with torch.no_grad():
-    z = m._spec(mix)
-    mag = m._magnitude(z)
-    full = m(mix)[0, bass_idx]  # reference: the stock forward, that source
-    spec, wave = core(mix, mag)
-    # Re-assemble in torch to prove the split is exact before trusting ONNX.
-    zout = m._mask(z, spec[:, None])
-    re = (m._ispec(zout, SEG) + wave[:, None])[0, 0]
-    print("torch split vs stock forward, max abs err:", float((re - full).abs().max()))
+def main():
+    out_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "../models")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    STEM = sys.argv[2] if len(sys.argv) > 2 else "bass"
+    m, bass_idx = load(STEM)
+    SEG = segment(m)
+    core = Core(m, bass_idx).eval()
+    mix_np = test_mix(SEG)
+    mix = torch.from_numpy(mix_np)[None]
 
-onnx_path = out_dir / f"htdemucs_ft_{STEM}.onnx"
-with torch.no_grad():
-    torch.onnx.export(
-        core,
-        (mix, mag),
-        str(onnx_path),
-        input_names=["mix", "mag"],
-        output_names=["spec", "wave"],
-        opset_version=17,
-        do_constant_folding=True,
-    )
-print("wrote", onnx_path, f"{onnx_path.stat().st_size / 1e6:.1f} MB")
+    with torch.no_grad():
+        z = m._spec(mix)
+        mag = m._magnitude(z)
+        full = m(mix)[0, bass_idx]  # reference: the stock forward, that source
+        spec, wave = core(mix, mag)
+        # Re-assemble in torch to prove the split is exact before trusting ONNX.
+        zout = m._mask(z, spec[:, None])
+        re = (m._ispec(zout, SEG) + wave[:, None])[0, 0]
+        print("torch split vs stock forward, max abs err:", float((re - full).abs().max()))
 
-import onnxruntime as ort
+    onnx_path = out_dir / f"htdemucs_ft_{STEM}.onnx"
+    with torch.no_grad():
+        torch.onnx.export(
+            core,
+            (mix, mag),
+            str(onnx_path),
+            input_names=["mix", "mag"],
+            output_names=["spec", "wave"],
+            opset_version=17,
+            do_constant_folding=True,
+        )
+    print("wrote", onnx_path, f"{onnx_path.stat().st_size / 1e6:.1f} MB")
 
-sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-o_spec, o_wave = sess.run(None, {"mix": mix_np[None], "mag": mag.numpy()})
-print("onnx vs torch spec max abs err:", float(np.abs(o_spec - spec.numpy()).max()))
-print("onnx vs torch wave max abs err:", float(np.abs(o_wave - wave.numpy()).max()))
+    import onnxruntime as ort
 
-ref = out_dir / ("ref" if STEM == "bass" else f"ref_demucs_{STEM}")
-ref.mkdir(exist_ok=True)
-mix_np.tofile(ref / "mix.f32")  # [2, SEG] planar
-full.numpy().astype(np.float32).tofile(ref / f"{STEM}.f32")  # [2, SEG] planar
-mag.numpy().astype(np.float32).tofile(ref / "mag.f32")  # [1, 4, 2048, 336]
-print("wrote reference vectors to", ref)
+    sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    o_spec, o_wave = sess.run(None, {"mix": mix_np[None], "mag": mag.numpy()})
+    print("onnx vs torch spec max abs err:", float(np.abs(o_spec - spec.numpy()).max()))
+    print("onnx vs torch wave max abs err:", float(np.abs(o_wave - wave.numpy()).max()))
+
+    ref = out_dir / ("ref" if STEM == "bass" else f"ref_demucs_{STEM}")
+    ref.mkdir(exist_ok=True)
+    mix_np.tofile(ref / "mix.f32")  # [2, SEG] planar
+    full.numpy().astype(np.float32).tofile(ref / f"{STEM}.f32")  # [2, SEG] planar
+    mag.numpy().astype(np.float32).tofile(ref / "mag.f32")  # [1, 4, 2048, 336]
+    print("wrote reference vectors to", ref)
+
+
+if __name__ == "__main__":
+    main()

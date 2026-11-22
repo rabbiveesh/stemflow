@@ -228,7 +228,7 @@ impl Opts {
     fn bsrofo_coreml(&self) -> bool {
         let onnx = self.models.join(bsrofo_onnx(self.target()));
         self.device == Device::Coreml
-            && model::coreml_package(&onnx, 1 + secs(self.window) / 512).is_some()
+            && model::coreml_package(&onnx, &format!(".t{}", 1 + secs(self.window) / 512)).is_some()
     }
     fn target(&self) -> Target {
         self.target.unwrap_or(Target::Bass)
