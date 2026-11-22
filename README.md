@@ -99,10 +99,18 @@ Switch it on from the menu ("Beat click") or `busctl --user set-property org.ste
 ### Looping
 
 With the beat model in place, `stemflow live` can loop what you just heard, snapped to
-the bars: the menu's "1 bar · 2 · 4 · 8 bars" buttons (or `⌃⌥L` / `Super+Alt+L` for
-4) loop the last bars heard, and while a loop plays they resize it. "◂ Start",
-"Start ▸", "◂ End" and "End ▸" move an end by a beat; "Speed" slows it down (keeping
-the pitch); "Live" goes back. The stem mix keeps working on the loop.
+the bars, from the Loop section of the menu (Mac and GNOME, as on Android):
+
+- **1 bar · 2 · 4 · 8 bars** loop the last bars heard (`⌃⌥L` / `Super+Alt+L`: 4, or
+  back to live); while a loop plays they resize it. **Live** goes back.
+- The **loop view**: the waveform with a bar either side, a tick on every beat,
+  numbered bar lines and the playhead. Drag an end to move it (it snaps to the
+  beats); right-click a beat (or long-press it on GNOME, ⌃-click on the Mac) to make
+  it bar 1.
+- **Beat · Bar · Phrase** sets what the edits step by; **Start**, **Move** (the whole
+  loop, same length) and **End** move earlier ◀ or later ▶ by that much.
+- **Meter** and **feel** re-find the bars; **Speed** (40–120%), **Pitch** (±12
+  semitones), **Keep pitch**, **Click**, and **From the top**.
 
 While a loop plays stemflow pauses the app it captures (MPRIS on Linux; Spotify or
 Music over AppleScript on macOS, which asks once whether stemflow may control it), so
@@ -110,10 +118,11 @@ Music over AppleScript on macOS, which asks once whether stemflow may control it
 plays again. If the app can't be paused, "Live" jumps straight back to the live
 stream.
 
-The same commands go over the socket (`loop 4`, `loop live`, `loop again`,
-`loop move <start beats> <end beats>`, `loop shift <beats>`, `loop speed 0.75`,
-`loop pitch -2`, `loop keep_pitch off`, `loop click on`) and D-Bus (`Loop`, with the
-state as JSON in `LoopState`).
+The same commands go over the socket (`loop 4`, `loop live`, `loop top`,
+`loop move <start beats> <end beats>`, `loop shift <beats>`, `loop edges <a> <b>`,
+`loop bar1 <beat>`, `loop speed 0.75`, `loop pitch -2`, `loop keep_pitch off`,
+`loop click on`; `loop view <bins>` returns the loop for drawing) and D-Bus (`Loop`,
+`LoopView`, with the state as JSON in `LoopState`).
 
 ## macOS (Apple Silicon)
 

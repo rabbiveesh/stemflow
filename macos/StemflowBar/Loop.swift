@@ -241,8 +241,8 @@ final class LoopSection {
 
         // Start, the whole loop, or the end: earlier or later by the unit.
         let pair = { (name: String, note: String, da: Int, db: Int) -> NSView in
-            let l = smallButton("◀") { [unowned self] in self.edit(-da, -db) }
-            let r = smallButton("▶") { [unowned self] in self.edit(da, db) }
+            let l = smallButton("◀") { self.edit(-da, -db) }
+            let r = smallButton("▶") { self.edit(da, db) }
             let buttons = NSStackView(views: [l, r])
             buttons.distribution = .fillEqually
             buttons.spacing = 4
