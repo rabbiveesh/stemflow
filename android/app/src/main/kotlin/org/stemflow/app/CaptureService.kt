@@ -403,8 +403,19 @@ class CaptureService : Service() {
             else loopStatus = "Switch back to stemflow: the loop is on its way"
         }
 
-        /** A media key to whatever is playing (Spotify): we have no media session of our own. */
+        /**
+         * Play or pause the player: through its media session when we can read it (a
+         * media key goes nowhere once Android has dropped the media button session,
+         * which it does after the player sits paused a while), else as a media key.
+         */
         private fun mediaKey(c: Context, code: Int) {
+            val tc = NowPlaying.controller(c)?.transportControls
+            val name = KeyEvent.keyCodeToString(code)
+            if (tc != null) when (code) {
+                KeyEvent.KEYCODE_MEDIA_PLAY -> { tc.play(); Log.i(TAG, "player: play"); return }
+                KeyEvent.KEYCODE_MEDIA_PAUSE -> { tc.pause(); Log.i(TAG, "player: pause"); return }
+            }
+            Log.i(TAG, "player: $name as a media key${if (tc == null) " (no session to talk to)" else ""}")
             val am = c.applicationContext.getSystemService(AudioManager::class.java)
             for (a in intArrayOf(KeyEvent.ACTION_DOWN, KeyEvent.ACTION_UP)) am.dispatchMediaKeyEvent(KeyEvent(a, code))
         }
@@ -454,7 +465,11 @@ class CaptureService : Service() {
          * Have the buffer hold song ms [from, to]: wait if the player is already playing
          * through it, else seek there and play. Null if called off (or the loop stopped).
          */
-        private fun stream(c: Context, h: Long, id: Int, song: NowPlaying.Song, from: Long, to: Long, open: Boolean = false): Anchor? {
+        private fun stream(c: Context, h: Long, id: Int, song: NowPlaying.Song, from0: Long, to: Long, open: Boolean = false): Anchor? {
+            // A run-up before the song's start (a loop near its beginning) is the song
+            // from 0: asking for less than 0 made it look unbuffered and seek back to 0.
+            if (from0 < 0) Log.i(TAG, "stream: start %d ms is before the song; from 0".format(from0))
+            val from = from0.coerceAtLeast(0)
             covering(h, song, from, to)?.let { return it }
             val ctl = NowPlaying.controller(c) ?: throw Exception("No player found")
             // never seek in another song (the queue may have moved on past this one)
