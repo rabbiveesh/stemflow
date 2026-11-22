@@ -177,9 +177,9 @@ Notes:
 
 The system service (`vendor.google.edgetpu_vendor_service`) logs "DarwiNN compiler virtual memory limit set to 4096MB" and exits a few seconds into each compile, with no reason visible to the shell. Google's supported route is compiling ahead of time on a Linux desktop (`ai_edge_litert.aot` with the pip package `ai-edge-litert-sdk-google-tensor`, which downloads the Tensor ML SDK and its compiler from Google under their licence agreements). Tried on 2026-11-15 with the owner's go-ahead: the install fails, because the compiler archive it downloads (`tensor-ml-sdk/sdk/releases/6.1.0/litert_plugin_compiler.tar.gz`) returns 404, and earlier package versions only accept a tarball you already have. Google's page says the SDK is a beta you sign up for, so the NPU waits on that access.
 
-### Live-rate stress test (2026-11-21)
+### Live-rate stress tests (2026-11-21 and 22)
 
-Demucs ft2 bass, 7.8 s window, fp16 on ML Drift, one run per second as live (`--pace`), on battery. `tools/stress.sh` drives a phase and logs the GPU clock and temperatures beside the run times.
+Demucs ft2 bass, 7.8 s window, fp16 on ML Drift, one run per second as live (`--pace`). `tools/stress.sh` drives a phase and logs the GPU clock and temperatures beside the run times. The first table is from the 21st, on battery, converting the whole window.
 
 | phase | runs | p50 | worst | late (> 1 s) |
 |---|---|---|---|---|
@@ -192,13 +192,26 @@ Demucs ft2 bass, 7.8 s window, fp16 on ML Drift, one run per second as live (`--
 - Paced runs are slower than back-to-back ones (0.91 s against 0.865 s): the GPU clock (`/sys/devices/platform/1f000000.mali/cur_freq`, 150–940 MHz) falls in the gap between runs and ramps up again, and is at 940 MHz only about 60% of the time.
 - Heat: over the 15 minutes the skin-temperature estimate went from 39 °C to 44 °C (throttling status 2 from 43 °C). From about minute 12 the clock no longer reached 940 MHz (890 at most) and the p50 moved from 0.92 s to 0.93 s. The next step is at 45 °C; longer sessions are untested.
 - The shade's blur is the one screen load that made runs late. Scrolling did not.
-- GPU priority: `STEMFLOW_GPU_OPTIONS='priority = 3'` (1 low, 2 normal, 3 high) is passed to the accelerator's options. Not yet shown to matter: the default-priority run was disturbed from minute 6 by another process using the GPU (those minutes are left out above), so there is no 15-minute comparison.
+- GPU priority: `STEMFLOW_GPU_OPTIONS='priority = 3'` (1 low, 2 normal, 3 high) is passed to the accelerator's options. It has not shown a reliable effect; see the shade test below.
 - Two models cannot share this GPU: with a second separator running, runs took up to 2.5 s.
 - Audio: audioflinger's underrun counters for Spotify's output did not move during the last third of the test, including across the track skips.
 
+On the 22nd, on the wireless charger and with the Play Store busy in the background:
+
+| phase | runs | p50 | worst | late (> 1 s) | GPU clock |
+|---|---|---|---|---|---|
+| Settings scrolling, default priority, 15 min, whole window | 899 | 0.95 s | 1.09 s | 103 (11.5%), none in the first 5 min | capped at 807–850 MHz from minute 6 |
+| shade opening and closing (`tools/stress_shade.sh`), default priority, block 1 | 186 | 1.13 s | 1.45 s | 125 (67%) | mean 625 MHz |
+| same, priority high, block 1 | 186 | 0.98 s | 1.11 s | 41 (22%) | mean 755 MHz, max 890 |
+| same, default priority, block 2 | 186 | 1.02 s | 1.23 s | 116 (62%) | max 807 MHz |
+| same, priority high, block 2 | 186 | 1.03 s | 1.16 s | 137 (74%) | max 807 MHz |
+
+- Charging brings the heat forward: the skin estimate reached 43 °C at minute 6 (minute 12 on battery), the clock was capped from then on, and every late run of the 15 minutes came after that. So that run says nothing about priority either; it says a warm phone is over budget at a 1 s hop.
+- Under the shade, high priority won the first pair of blocks and lost the second (skin 41 → 45.6 °C across the four). No reliable effect; heat decides.
+
 Bench options added for this: `--pace` (one run per hop, sleeping in between), `--repeat N` (run over the input N times), and `--whole-window` (see below).
 
-**Converting only what the stream keeps.** A stream uses `hop + crossfade` samples of each window, so `LiteRtDemucs` and `LiteRtRoformer` have `set_needed(range)` and then run the inverse STFT for just those samples (the bench sets it from `--hop`, `--lookahead` and `--xfade`; `--whole-window` turns it off). On a laptop the samples it produces are bit-identical to `Stft::ispec` and `HannStft::istft` for whole windows, a stream's slice, single samples and the edges. On the phone it is untested and its saving unmeasured: the whole-window inverse STFT was about 80 ms of a Demucs run. The app does not call `set_needed` yet.
+**Converting only what the stream keeps.** A stream uses `hop + crossfade` samples of each window, so `LiteRtDemucs` and `LiteRtRoformer` have `set_needed(range)` and then run the inverse STFT for just those samples (the bench sets it from `--hop`, `--lookahead` and `--xfade`; `--whole-window` turns it off). On a laptop the samples it produces are bit-identical to `Stft::ispec` and `HannStft::istft` for whole windows, a stream's slice, single samples and the edges. On the phone the stem is sample-for-sample identical to `--whole-window` over the 30 s clip, and a run takes 0.836 s against 0.855–0.871 s (unpaced, warm phone): about 3%, with a tighter worst case (0.85 s against 0.90 s). The app does not call `set_needed` yet.
 
 ### Beat This! (beat tracker) on LiteRT
 
