@@ -52,6 +52,9 @@ struct Ring {
     total: u64,
     /// frames in the last block pushed: how bursty the arrivals are
     last_push: usize,
+    /// The frame after the last one with any sound: a paused source keeps adding
+    /// exact zeros after it.
+    sound_end: u64,
 }
 
 fn to_i16(x: f32) -> i16 {
@@ -87,6 +90,7 @@ impl Ring {
             cap: frames,
             total: 0,
             last_push: 0,
+            sound_end: 0,
         }
     }
 
@@ -95,6 +99,9 @@ impl Ring {
         for i in 0..n {
             let k = CH * ((self.total as usize + i) % self.cap);
             put(&mut self.data[k..k + CH], bass, band, second, i);
+            if self.data[k..k + CH].iter().any(|&x| x != 0) {
+                self.sound_end = self.total + i as u64 + 1;
+            }
         }
         self.total += n as u64;
         self.last_push = n;
@@ -367,6 +374,12 @@ impl Looper {
         self.ring.lock().unwrap().total
     }
 
+    /// The frame after the last one pushed with any sound in it (while the source is
+    /// paused, `total` runs on with silence).
+    pub fn sound_end(&self) -> u64 {
+        self.ring.lock().unwrap().sound_end
+    }
+
     /// Analyse the last minute and loop the `bars` bars ending at the bar line nearest
     /// to stem frame `press`. Blocks for the network runs (about a second each on a
     /// phone CPU); playback carries on meanwhile.
@@ -427,10 +440,13 @@ impl Looper {
         }
     }
 
-    /// A copy of the newest minute of the buffer, to loop from.
+    /// A copy of the newest minute of music in the buffer, to loop from: up to where
+    /// the sound stops (the silence of a paused source would push the music the loop
+    /// needs out of the minute).
     fn snapshot(&self) -> Clip {
         let ring = self.ring.lock().unwrap();
-        let to = ring.total;
+        // a second of the silence too, for a loop that ends as the music does
+        let to = (ring.sound_end + RATE as u64).min(ring.total);
         let from = to
             .saturating_sub((ANALYSE_S * RATE) as u64)
             .max(ring.oldest());

@@ -12,6 +12,8 @@ use std::time::Instant;
 pub const RATE: i64 = 44_100;
 /// How far the song time may drift from the frames before it is a break.
 const TOLERANCE_MS: i64 = 600;
+/// How far into a new stretch a loop may begin.
+const EDGE_MS: i64 = 250;
 
 /// A recording, as the player names it.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -170,9 +172,12 @@ impl SongMap {
             floor_ms: floor,
             floor_frame: p.frame,
         };
+        // Where a stretch begins is known to a few hundred ms (when the player was
+        // asked, and how long it took to say): keep loops clear of the edge, so one
+        // can't start on the last beat before it (the previous song's, say).
         let seen = Seen {
             gap_from: p.frame.min(a.frame),
-            gap_to: p.frame.max(seg2.start_frame()),
+            gap_to: p.frame.max(seg2.start_frame() + EDGE_MS * RATE / 1000),
             why,
         };
         self.segments.push(seg2);

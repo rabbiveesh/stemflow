@@ -269,8 +269,9 @@ impl Deck {
         let lo = (from + 6_000).min(to);
         let x = self.songs.lock().unwrap().for_song(song, lo, to, since)?;
         let total = self.looper.total() as i64;
-        // inside the newest minute, which is what gets analysed
-        if total < x.frame_of(to) || x.frame_of(from) < total - 55 * SRATE {
+        // inside the newest minute of music, which is what gets analysed
+        let music = self.looper.sound_end() as i64;
+        if total < x.frame_of(to) || x.frame_of(from) < music.max(x.frame_of(to)) - 55 * SRATE {
             return None;
         }
         // what's wanted (past the run-up) must be one unbroken stretch of the song
@@ -419,7 +420,33 @@ impl Deck {
         if da >= 0 && db <= 0 {
             return self.say("The loop can't get shorter than that");
         }
-        self.stream_to(da, db, false);
+        // What was buffered after (or before) the loop may hold it: find the beats
+        // there (keeping the loop as it is) and try again. Only if that isn't enough
+        // is the song played again.
+        let id = self.phrase.fetch_add(1, Ordering::Relaxed) + 1;
+        let me = self.clone();
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            match me.looper.refresh() {
+                Ok(true) => eprintln!(
+                    "loop: beats around found in {:.2}s",
+                    t.elapsed().as_secs_f32()
+                ),
+                Ok(false) => {}
+                Err(e) => eprintln!("loop: beats around: {e:#}"),
+            }
+            if me.phrase.load(Ordering::Relaxed) != id {
+                return;
+            }
+            if me.looper.nudge(da, db) {
+                me.say("");
+                if db > 0 {
+                    me.pause_after_phrase();
+                }
+            } else {
+                me.stream_to(da, db, false);
+            }
+        });
     }
 
     /// Play the loop's audio again from the player (back to before it and through
@@ -460,6 +487,10 @@ impl Deck {
         let beat_ms = (end - start) as f64 / (v.b - v.a).max(1) as f64;
         let new_start = start + (da as f64 * beat_ms) as i64;
         let new_end = end + (db as f64 * beat_ms) as i64;
+        // (the first beat may be a moment before 0: the song's own timing)
+        if new_start < -(beat_ms as i64) / 2 {
+            bail!("The song starts there: the loop can't start any earlier");
+        }
         // bar 1: where it was, moved with the start when that moves by whole bars
         let m = meter.max(1) as i64;
         let bar1 = if da % m != 0 {
@@ -506,7 +537,7 @@ impl Deck {
         // slightly different tempo can't add or drop a beat
         let beats = (v.b - v.a) as i64 + db - da;
         if let Some(w) = self.looper.view(1) {
-            if beats > 0 {
+            if beats > 0 && (w.b - w.a) as i64 != beats {
                 self.looper.set_edges(w.a, w.a + beats as usize);
             }
         }
@@ -778,7 +809,15 @@ impl Deck {
                     // Nobody hears the song now: pause it (once the next phrase is
                     // buffered), so live picks up from here.
                     me.pause_after_phrase();
-                    me.say("");
+                    // fewer bars when the song (or a seek, or a pause) began since
+                    let got = me.looper.view(1).map(|v| (v.b - v.a, v.meter.max(1)));
+                    me.say(match got {
+                        Some((n, m)) if n < bars * m => format!(
+                            "Only {} of {bars} bars: the song started (or was seeked or paused) just before",
+                            if n % m == 0 { format!("{}", n / m) } else { format!("{:.1}", n as f32 / m as f32) }
+                        ),
+                        _ => String::new(),
+                    });
                 }
                 Err(e) => {
                     eprintln!("loop: {e:#}");
