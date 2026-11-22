@@ -694,6 +694,10 @@ final class Controller: NSObject, NSMenuDelegate {
         status.title = String(format: "%@ · %.1f s behind · model %.2f s of %.1f s", app, lat, comp, hop)
             + (over > 0 ? " · \(over) dropouts" : "")
 
+        // No beat tracker model: no click (as the extension hides it for old daemons).
+        let tracker = s["beat_tracker"] as? Bool ?? false
+        clickItem.isHidden = !tracker
+        beatOpts.isHidden = !tracker
         let click = s["click"] as? Bool ?? false
         let beats = s["beats"] as? String ?? ""
         clickItem.state = click ? .on : .off

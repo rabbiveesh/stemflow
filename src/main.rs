@@ -366,6 +366,11 @@ fn main() -> Result<()> {
             };
             let target = m.as_ref().map_or(opts.target().name(), |m| m.target);
             let second = m.as_ref().and_then(|m| m.second);
+            eprintln!(
+                "stemflow: model {} on {:?}",
+                m.as_ref().map_or("ensemble", |m| &m.id),
+                opts.device
+            );
             let ctl = levels(&opts, target, second, true);
             ctl.set_model(m.as_ref().map_or("ensemble", |m| &m.id));
             control::load_beat_options(&ctl);
@@ -413,6 +418,7 @@ fn main() -> Result<()> {
                     app: grab.clone(),
                     latency: lat + slack as f64,
                     hop,
+                    beats: tracker.is_some(),
                 },
             ) {
                 Ok(p) => eprintln!("stemflow: control socket {}", p.display()),

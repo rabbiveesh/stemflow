@@ -8,7 +8,7 @@
 //! set balance -0.5           (also bass, band, second_level, model, click, meter, feel)
 //! nudge 0.1
 //! snap solo|full|nobass|novocals
-//! quit                       stop stemflow (as Ctrl-C would)
+//! quit                       stop stemflow (as Ctrl-C would), after replying
 //! ```
 //!
 //! `echo state | nc -U <socket>` works for a quick look. The socket is
@@ -47,6 +47,8 @@ pub struct Info {
     pub app: String,
     pub latency: f64,
     pub hop: f64,
+    /// Whether the beat tracker loaded (the click needs it).
+    pub beats: bool,
 }
 
 /// Listen on the control socket from a background thread.
@@ -107,8 +109,12 @@ fn request(line: &str, ctl: &Control, info: &Info) -> Result<()> {
                 .with_context(|| format!("unknown snap `{name}`"))?;
         }
         "quit" => {
-            // The Ctrl-C handler gives the app its sound back before exiting.
-            unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+            // The Ctrl-C handler gives the app its sound back before exiting; give
+            // the reply a moment to go out first.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+            });
             return Ok(());
         }
         "set" => match a.context("set what?")? {
@@ -189,6 +195,7 @@ fn state(ctl: &Control, info: &Info, err: Option<&str>) -> String {
             ctl.compute_us.load(Ordering::Relaxed) as f64 / 1e6
         ),
         format!("\"overruns\":{}", ctl.overruns.load(Ordering::Relaxed)),
+        format!("\"beat_tracker\":{}", info.beats),
         format!("\"click\":{}", ctl.click()),
         format!("\"meter\":{}", ctl.meter()),
         format!("\"feel\":{}", ctl.feel()),
@@ -213,6 +220,7 @@ mod tests {
             app: "spotify".into(),
             latency: 2.8,
             hop: 1.0,
+            beats: false,
         };
         // Levels are saved on change; keep that out of the real state dir.
         std::env::set_var("XDG_STATE_HOME", std::env::temp_dir().join("stemflow-test"));
