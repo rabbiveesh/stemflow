@@ -197,6 +197,13 @@ fn session(
         #[cfg(target_os = "macos")]
         {
             use ort::ep::coreml::{ComputeUnits, ModelFormat};
+            // Ops Core ML leaves to the CPU run on ORT's pool; don't let its idle
+            // threads spin between them (a live demucs sat at ~75% of a core).
+            b = b
+                .with_intra_op_spinning(false)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .with_inter_op_spinning(false)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             for &(name, n) in dims {
                 b = b
                     .with_dimension_override(name, n as i64)
