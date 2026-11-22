@@ -8,6 +8,9 @@
 //! set balance -0.5           (also bass, band, second_level, model, click, meter, feel)
 //! nudge 0.1
 //! snap solo|full|nobass|novocals
+//! loop 4                     loop the last 4 bars (or resize the loop playing)
+//! loop live                  back to the live stream (also again, move <da> <db>,
+//!                            shift <beats>, click on|off, speed <x>, pitch <semitones>)
 //! quit                       stop stemflow (as Ctrl-C would), after replying
 //! ```
 //!
@@ -117,6 +120,11 @@ fn request(line: &str, ctl: &Control, info: &Info) -> Result<()> {
             });
             return Ok(());
         }
+        "loop" => {
+            // the rest of the line: `loop move 1 -1` has three words
+            let rest = line.trim().strip_prefix("loop").unwrap_or("").trim();
+            return ctl.loop_command(rest);
+        }
         "set" => match a.context("set what?")? {
             "balance" => ctl.set_balance(num(b)?),
             "bass" => ctl.set_levels(num(b)?, ctl.levels().1),
@@ -201,6 +209,7 @@ fn state(ctl: &Control, info: &Info, err: Option<&str>) -> String {
         format!("\"feel\":{}", ctl.feel()),
         format!("\"beats\":{}", js(&ctl.beats())),
         format!("\"models\":[{}]", models.join(",")),
+        format!("\"loop\":{}", ctl.loop_json()),
     ];
     if let Some(e) = err {
         f.push(format!("\"error\":{}", js(e)));
@@ -234,7 +243,7 @@ mod tests {
         let s = state(&ctl, &info, Some("a \"quoted\" error"));
         assert!(s.starts_with("{\"ok\":false,\"balance\":0.25,"), "{s}");
         assert!(
-            s.ends_with(",\"models\":[],\"error\":\"a \\\"quoted\\\" error\"}"),
+            s.ends_with(",\"models\":[],\"loop\":null,\"error\":\"a \\\"quoted\\\" error\"}"),
             "{s}"
         );
     }

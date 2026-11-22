@@ -116,10 +116,12 @@ pub fn passthrough(grab: &str, output: Option<String>, seconds: Option<f32>) -> 
 pub type Live = Streamer<Box<dyn Separator + Send>>;
 
 /// `load` builds the streamer for a model id when the menu switches models.
+#[allow(clippy::too_many_arguments)]
 pub fn live(
     st: Live,
     ctl: Arc<Control>,
     beats: Option<Arc<crate::beats::Tracker>>,
+    deck: Option<Arc<crate::loopdeck::Deck>>,
     grab: &str,
     output: Option<String>,
     slack: f32,
@@ -171,8 +173,10 @@ pub fn live(
     }
     let (pbeats, pdelay) = (beats.clone(), delay.clone());
     let pctl = ctl.clone();
+    let pdeck = deck.clone();
     let refill = hop + (slack * SAMPLE_RATE as f32) as usize;
     let player = std::thread::spawn(move || -> Result<()> {
+        use mpsc::{RecvTimeoutError, TryRecvError};
         // bass, band and a second stem (all zero for one-stem models)
         let (mut bass, mut band, mut sec) =
             (Vec::<f32>::new(), Vec::<f32>::new(), Vec::<f32>::new());
@@ -182,68 +186,106 @@ pub fn live(
         let mut out = vec![0f32; 2 * block];
         let mut lim = Limiter::new();
         let mut played = 0i64; // stem frames played: input frame (played - delay)
+                               // a loop block plus the limiter's lookahead, and its click
+        let (mut lb, mut lr, mut ls, mut lc) = (
+            vec![0f32; 4 * block],
+            vec![0f32; 4 * block],
+            vec![0f32; 4 * block],
+            vec![0f32; 2 * block],
+        );
+        let mut looping = false; // the last block came from the looper
         loop {
-            // Take whatever the worker has finished; block only when starved.
+            // Take whatever the worker has finished. Wait only when the live stream is
+            // what plays and it's starved: a loop never waits for the separator (a
+            // model switch can hold it for many seconds).
             let avail = bass.len() / 2 - pos;
-            let next = if buffering || avail < block {
-                rx_out.recv().ok()
-            } else {
-                rx_out.try_recv().ok()
-            };
-            if let Some(st) = next {
-                bass.drain(..2 * pos);
-                band.drain(..2 * pos);
-                sec.drain(..2 * pos);
-                pos = 0;
-                match st.extra.into_iter().next() {
-                    Some(v) => sec.extend(v),
-                    None => sec.resize(sec.len() + st.bass.len(), 0.0),
+            if avail < 2 * block {
+                let next = if !looping && (buffering || avail < block) {
+                    match rx_out.recv_timeout(std::time::Duration::from_millis(200)) {
+                        Ok(st) => Some(st),
+                        Err(RecvTimeoutError::Timeout) => None,
+                        Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                    }
+                } else {
+                    match rx_out.try_recv() {
+                        Ok(st) => Some(st),
+                        Err(TryRecvError::Empty) => None,
+                        Err(TryRecvError::Disconnected) => return Ok(()),
+                    }
+                };
+                if let Some(st) = next {
+                    // every live block goes into the loop buffer, played or not
+                    if let Some(d) = &pdeck {
+                        d.looper.push(
+                            &st.bass,
+                            &st.band,
+                            st.extra.first().map_or(&[][..], |v| &v[..]),
+                        );
+                    }
+                    bass.drain(..2 * pos);
+                    band.drain(..2 * pos);
+                    sec.drain(..2 * pos);
+                    pos = 0;
+                    match st.extra.into_iter().next() {
+                        Some(v) => sec.extend(v),
+                        None => sec.resize(sec.len() + st.bass.len(), 0.0),
+                    }
+                    bass.extend(st.bass);
+                    band.extend(st.band);
                 }
-                bass.extend(st.bass);
-                band.extend(st.band);
-            } else if buffering || avail < block {
-                return Ok(()); // worker gone
             }
             let avail = bass.len() / 2 - pos;
-            if buffering {
-                if avail < refill {
-                    continue;
-                }
-                buffering = false;
-            }
-            while bass.len() / 2 - pos >= block {
-                let target = pctl.gains3();
-                for i in 0..block {
-                    let a = (i as f32 + 1.0) / block as f32; // ramp: no zipper noise
-                    let gb = g.0 + (target.0 - g.0) * a;
-                    let gr = g.1 + (target.1 - g.1) * a;
-                    let gs = g.2 + (target.2 - g.2) * a;
+            let target = pctl.gains3();
+            let src = pdeck.as_ref().and_then(|d| {
+                d.looper
+                    .read(&mut lb, &mut lr, &mut ls, &mut lc, 2 * block, block)
+            });
+            looping = src.is_some();
+            if let (Some(at), Some(d)) = (src, &pdeck) {
+                // A loop (or the music playing on after one): from the buffer, at
+                // the same levels. Live blocks are used up at the same pace.
+                mix_block([&lb, &lr, &ls], 0, block, g, target, &mut out);
+                lim.apply(&mut out, mix_peak([&lb, &lr, &ls], block, block, target));
+                for (i, c) in lc[..block].iter().enumerate() {
                     for ch in 0..2 {
-                        let k = 2 * (pos + i) + ch;
-                        out[2 * i + ch] = gb * bass[k] + gr * band[k] + gs * sec[k];
+                        out[2 * i + ch] = (out[2 * i + ch] + CLICK_LEVEL * c).clamp(-1.0, 1.0);
                     }
                 }
+                if avail >= block {
+                    pos += block;
+                    played += block as i64;
+                }
+                d.set_heard(at - DEVICE_LAG as i64);
+            } else {
+                if buffering {
+                    if avail < refill {
+                        continue;
+                    }
+                    buffering = false;
+                }
+                if avail < block {
+                    eprintln!("warning: playback ran dry; rebuffering");
+                    buffering = true;
+                    continue;
+                }
+                mix_block([&bass, &band, &sec], pos, block, g, target, &mut out);
                 // Look one block ahead (it's already buffered) so the limiter is down
                 // before a peak arrives rather than clipping it.
-                let ahead = (bass.len() / 2 - pos - block).min(block);
+                let ahead = (avail - block).min(block);
                 let next = mix_peak([&bass, &band, &sec], pos + block, ahead, target);
                 lim.apply(&mut out, next);
                 if let Some(tr) = pbeats.as_ref().filter(|_| pctl.click()) {
                     let d = pdelay.load(Ordering::Relaxed) as i64;
                     tr.click(&mut out, played - d, CLICK_LEVEL);
                 }
-                played += block as i64;
-                g = target;
-                pos += block;
-                playback.write(&out)?;
-                if running_low(&bass, pos, block) {
-                    break; // go fetch the next chunk once we're down to one block
+                if let Some(d) = &pdeck {
+                    d.set_heard(played - DEVICE_LAG as i64);
                 }
+                played += block as i64;
+                pos += block;
             }
-            if bass.len() / 2 - pos == 0 {
-                eprintln!("warning: playback ran dry; rebuffering");
-                buffering = true;
-            }
+            g = target;
+            playback.write(&out)?;
         }
     });
 
@@ -268,6 +310,14 @@ pub fn live(
                     load(&prev)?.0
                 }
             });
+            // A loop that's playing is heard in the new model's stems too.
+            if let (Some(d), Some(s)) = (&deck, st.as_mut()) {
+                match crate::looper::restem(&d.looper, s, true) {
+                    Ok(true) => eprintln!("stemflow: loop separated again with {id}"),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("stemflow: couldn't separate the loop again: {e:#}"),
+                }
+            }
             // Skip what queued up while loading, so the delay doesn't grow.
             while let Ok(v) = rx_in.try_recv() {
                 pending.extend(v);
@@ -287,6 +337,20 @@ pub fn live(
             // Every hop the separator gets: the tracker's frame count is the timeline.
             if let Some(tr) = &beats {
                 tr.push(&chunk);
+            }
+            // The app is paused (or between songs): silence, and leave the GPU alone.
+            // Exact zeros also tell the looper's tail where a pause is, to skip it.
+            if chunk.iter().all(|x| x.abs() < 1e-4) {
+                let z = vec![0f32; 2 * hop];
+                let stems = Stems {
+                    bass: z.clone(),
+                    band: z,
+                    extra: Vec::new(),
+                };
+                if tx_out.send(stems).is_err() {
+                    return player.join().unwrap();
+                }
+                continue;
             }
             let t = Instant::now();
             let out = st.process(&chunk)?;
@@ -345,10 +409,29 @@ fn beat_loop(tr: &crate::beats::Tracker, ctl: &Control, running: &AtomicBool) {
     }
 }
 
-/// The player drains its queue a block at a time and goes back for more input
-/// when only one block is left.
-fn running_low(bass: &[f32], pos: usize, block: usize) -> bool {
-    bass.len() / 2 - pos < 2 * block
+/// Frames between what the player writes and what is heard: the device buffer.
+const DEVICE_LAG: usize = 5 * BLOCK;
+
+/// `n` frames of the mix from `pos`, the gains ramping from `g0` to `g1` (no zipper
+/// noise when they change).
+fn mix_block(
+    s: [&[f32]; 3],
+    pos: usize,
+    n: usize,
+    g0: (f32, f32, f32),
+    g1: (f32, f32, f32),
+    out: &mut [f32],
+) {
+    for i in 0..n {
+        let a = (i as f32 + 1.0) / n as f32;
+        let gb = g0.0 + (g1.0 - g0.0) * a;
+        let gr = g0.1 + (g1.1 - g0.1) * a;
+        let gs = g0.2 + (g1.2 - g0.2) * a;
+        for ch in 0..2 {
+            let k = 2 * (pos + i) + ch;
+            out[2 * i + ch] = gb * s[0][k] + gr * s[1][k] + gs * s[2][k];
+        }
+    }
 }
 
 /// Peak of the mix (bass, band, second stem at `gains`) over `n` frames from `start`.

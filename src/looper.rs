@@ -891,6 +891,12 @@ impl Looper {
         self.state.lock().unwrap().playing
     }
 
+    /// After a loop: the buffer playing on from it (see `go_live`).
+    pub fn tail_playing(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        !st.playing && st.tail.is_some()
+    }
+
     fn loop_len(&self, st: &State) -> usize {
         st.grid
             .as_ref()

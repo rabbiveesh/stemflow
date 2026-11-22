@@ -66,6 +66,8 @@ pub struct Control {
     meter: AtomicU32,
     feel: AtomicU32,
     beats: Mutex<String>,
+    /// Looping, when there's a beat model for it.
+    pub deck: std::sync::OnceLock<Arc<crate::loopdeck::Deck>>,
 }
 
 fn level(v: f32, max: f32) -> f32 {
@@ -86,6 +88,36 @@ impl Control {
         c.set_second_level(1.0);
         Arc::new(c)
     }
+    /// Something the UIs show changed (from another thread): re-announce it.
+    pub fn touch(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The beat options as the looper takes them.
+    pub fn beat_settings(&self) -> crate::beats::Settings {
+        crate::beats::Settings {
+            meter: self.meter() as usize,
+            feel: self.feel(),
+            ..Default::default()
+        }
+    }
+
+    /// A `loop ...` command (`loopdeck::Deck::command`).
+    pub fn loop_command(&self, cmd: &str) -> anyhow::Result<()> {
+        let d = self
+            .deck
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("no looping: no beat model"))?;
+        d.command(cmd, self.beat_settings())
+    }
+
+    /// The loop's state as JSON, or `null` without looping.
+    pub fn loop_json(&self) -> String {
+        self.deck
+            .get()
+            .map_or_else(|| "null".into(), |d| d.state().json())
+    }
+
     pub fn target(&self) -> &'static str {
         *self.target.lock().unwrap()
     }
@@ -421,6 +453,7 @@ impl Service {
         let _ = self.meter_changed(em).await;
         let _ = self.feel_changed(em).await;
         let _ = self.beats_changed(em).await;
+        let _ = self.loop_state_changed(em).await;
     }
 }
 
@@ -604,6 +637,27 @@ impl Service {
     #[zbus(property)]
     fn beats(&self) -> String {
         self.ctl.beats()
+    }
+
+    /// The loop, as JSON (`loopdeck::State`), or `null` without looping. Changes are
+    /// announced; the playhead isn't (read it while showing it).
+    #[zbus(property)]
+    fn loop_state(&self) -> String {
+        self.ctl.loop_json()
+    }
+
+    /// A loop command: `4` (loop the last 4 bars, or resize), `live`, `again`,
+    /// `move <da> <db>`, `shift <beats>`, `click on|off`, `speed <x>`, `pitch <st>`.
+    async fn r#loop(
+        &mut self,
+        cmd: String,
+        #[zbus(signal_emitter)] em: zbus::object_server::SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.ctl
+            .loop_command(&cmd)
+            .map_err(|e| zbus::fdo::Error::InvalidArgs(format!("{e:#}")))?;
+        let _ = self.loop_state_changed(&em).await;
+        Ok(())
     }
 
     /// Move the one-slider balance by `step` (e.g. ±0.1); returns the new balance.
