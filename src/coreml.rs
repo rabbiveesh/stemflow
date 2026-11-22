@@ -17,8 +17,14 @@ use std::ptr::NonNull;
 
 pub struct Model {
     model: Retained<MLModel>,
-    input: Retained<NSString>,
-    output: Retained<NSString>,
+}
+
+/// Where Core ML may run a model.
+#[derive(Clone, Copy, Debug)]
+pub enum Units {
+    CpuAndGpu,
+    CpuAndNeuralEngine,
+    All,
 }
 
 // Core ML models may be used from any thread (one prediction at a time here).
@@ -55,36 +61,49 @@ fn compiled(pkg: &Path) -> Result<PathBuf> {
     })
 }
 
+impl Units {
+    /// `$STEMFLOW_COREML_UNITS` (gpu, ane or all) if set, for trying the others.
+    fn or_env(self) -> Units {
+        match std::env::var("STEMFLOW_COREML_UNITS").as_deref() {
+            Ok("gpu") => Units::CpuAndGpu,
+            Ok("ane") => Units::CpuAndNeuralEngine,
+            Ok("all") => Units::All,
+            _ => self,
+        }
+    }
+}
+
 impl Model {
-    /// Load on the CPU and GPU: the Neural Engine is much slower for transformers
-    /// like BS-RoFormer's (2.6 s vs 0.31 s per 3 s window on an M5).
-    pub fn load(pkg: &Path, input: &str, output: &str) -> Result<Model> {
+    /// Load for `units` (unless `$STEMFLOW_COREML_UNITS` says otherwise).
+    pub fn load(pkg: &Path, units: Units) -> Result<Model> {
+        let units = units.or_env();
         if !pkg.is_dir() {
             bail!("no Core ML package at {}", pkg.display());
         }
         let c = compiled(pkg)?;
         let model = unsafe {
             let config = MLModelConfiguration::new();
-            config.setComputeUnits(MLComputeUnits::CPUAndGPU);
+            config.setComputeUnits(match units {
+                Units::CpuAndGpu => MLComputeUnits::CPUAndGPU,
+                Units::CpuAndNeuralEngine => MLComputeUnits::CPUAndNeuralEngine,
+                Units::All => MLComputeUnits::All,
+            });
             MLModel::modelWithContentsOfURL_configuration_error(&url(&c), &config)
         }
         .map_err(ns_err)
         .with_context(|| format!("loading {}", c.display()))?;
-        Ok(Model {
-            model,
-            input: NSString::from_str(input),
-            output: NSString::from_str(output),
-        })
+        eprintln!("stemflow: Core ML on {units:?}");
+        Ok(Model { model })
     }
 
-    /// Run on a row-major `shape` input; returns the output, row-major.
-    pub fn run(&self, shape: &[usize], data: &mut [f32]) -> Result<Vec<f32>> {
-        assert_eq!(shape.iter().product::<usize>(), data.len());
+    /// Run on named row-major f32 inputs (`name, shape, data`); returns the named
+    /// outputs, row-major, in the order asked for.
+    pub fn run(
+        &self,
+        inputs: &mut [(&str, &[usize], &mut [f32])],
+        outputs: &[&str],
+    ) -> Result<Vec<Vec<f32>>> {
         autoreleasepool(|_| unsafe {
-            let mut strides = vec![1usize; shape.len()];
-            for i in (0..shape.len().saturating_sub(1)).rev() {
-                strides[i] = strides[i + 1] * shape[i + 1];
-            }
             let nums = |v: &[usize]| {
                 NSArray::from_retained_slice(
                     &v.iter()
@@ -92,19 +111,31 @@ impl Model {
                         .collect::<Vec<_>>(),
                 )
             };
-            // Wraps `data` without copying; it outlives the prediction.
-            let arr = MLMultiArray::initWithDataPointer_shape_dataType_strides_deallocator_error(
-                MLMultiArray::alloc(),
-                NonNull::new(data.as_mut_ptr() as *mut c_void).unwrap(),
-                &nums(shape),
-                MLMultiArrayDataType::Float32,
-                &nums(&strides),
-                None,
-            )
-            .map_err(ns_err)?;
-            let value = MLFeatureValue::featureValueWithMultiArray(&arr);
-            let value: &AnyObject = &value;
-            let dict = NSDictionary::from_slices(&[&*self.input], &[value]);
+            let mut names = Vec::new();
+            let mut values = Vec::new();
+            for (name, shape, data) in inputs.iter_mut() {
+                assert_eq!(shape.iter().product::<usize>(), data.len());
+                let mut strides = vec![1usize; shape.len()];
+                for i in (0..shape.len().saturating_sub(1)).rev() {
+                    strides[i] = strides[i + 1] * shape[i + 1];
+                }
+                // Wraps `data` without copying; it outlives the prediction.
+                let arr =
+                    MLMultiArray::initWithDataPointer_shape_dataType_strides_deallocator_error(
+                        MLMultiArray::alloc(),
+                        NonNull::new(data.as_mut_ptr() as *mut c_void).unwrap(),
+                        &nums(shape),
+                        MLMultiArrayDataType::Float32,
+                        &nums(&strides),
+                        None,
+                    )
+                    .map_err(ns_err)?;
+                names.push(NSString::from_str(name));
+                values.push(MLFeatureValue::featureValueWithMultiArray(&arr));
+            }
+            let keys: Vec<&NSString> = names.iter().map(|n| &**n).collect();
+            let objs: Vec<&AnyObject> = values.iter().map(|v| -> &AnyObject { v }).collect();
+            let dict = NSDictionary::from_slices(&keys, &objs);
             let features = MLDictionaryFeatureProvider::initWithDictionary_error(
                 MLDictionaryFeatureProvider::alloc(),
                 &dict,
@@ -114,11 +145,16 @@ impl Model {
                 .model
                 .predictionFromFeatures_error(ProtocolObject::from_ref(&*features))
                 .map_err(ns_err)?;
-            let out = out
-                .featureValueForName(&self.output)
-                .and_then(|v| v.multiArrayValue())
-                .with_context(|| format!("no output `{}`", self.output))?;
-            read(&out)
+            outputs
+                .iter()
+                .map(|name| {
+                    let v = out
+                        .featureValueForName(&NSString::from_str(name))
+                        .and_then(|v| v.multiArrayValue())
+                        .with_context(|| format!("no output `{name}`"))?;
+                    read(&v)
+                })
+                .collect()
         })
     }
 }

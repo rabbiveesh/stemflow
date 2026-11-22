@@ -57,7 +57,7 @@ pub trait Separator {
 
 /// htdemucs_ft bass specialist exported by tools/export_htdemucs.py.
 pub struct HtDemucs {
-    session: Session,
+    run: Runner,
     stft: Stft,
     seg: usize,
     frames: usize,
@@ -243,10 +243,19 @@ fn session(
 
 impl HtDemucs {
     pub fn load(path: &Path, device: Device, threads: usize) -> Result<Self> {
-        let session = session(path, device, threads, gpu_mem_mb(), &[])?;
+        let run = match (device, coreml_package(path, "")) {
+            // ONNX Runtime's Core ML route leaves some of it on the CPU; a package from
+            // tools/export_htdemucs_coreml.py runs all of it in Core ML.
+            #[cfg(target_os = "macos")]
+            (Device::Coreml, Some(pkg)) => {
+                eprintln!("stemflow: Demucs on Core ML: {}", pkg.display());
+                Runner::Coreml(crate::coreml::Model::load(&pkg, DEMUCS_UNITS)?)
+            }
+            _ => Runner::Ort(session(path, device, threads, gpu_mem_mb(), &[])?),
+        };
         let seg = HTDEMUCS_SEGMENT;
         let mut m = HtDemucs {
-            session,
+            run,
             stft: Stft::new(),
             seg,
             frames: frames_for(seg),
@@ -283,15 +292,33 @@ impl Separator for HtDemucs {
         let (seg, fr) = (self.seg, self.frames);
         assert_eq!(mix.len(), 2 * seg);
         let mag = self.mag(mix);
-        let outputs = self.session.run(ort::inputs![
-            "mix" => Tensor::from_array(([1usize, 2, seg], mix.to_vec()))?,
-            "mag" => Tensor::from_array(([1usize, 4, BINS, fr], mag))?,
-        ])?;
-        let (_, spec) = outputs["spec"].try_extract_tensor::<f32>()?;
-        let (_, wave) = outputs["wave"].try_extract_tensor::<f32>()?;
+        let (spec, wave) = match &mut self.run {
+            Runner::Ort(session) => {
+                let outputs = session.run(ort::inputs![
+                    "mix" => Tensor::from_array(([1usize, 2, seg], mix.to_vec()))?,
+                    "mag" => Tensor::from_array(([1usize, 4, BINS, fr], mag))?,
+                ])?;
+                let (_, spec) = outputs["spec"].try_extract_tensor::<f32>()?;
+                let (_, wave) = outputs["wave"].try_extract_tensor::<f32>()?;
+                (spec.to_vec(), wave.to_vec())
+            }
+            #[cfg(target_os = "macos")]
+            Runner::Coreml(m) => {
+                let (mut mix, mut mag) = (mix.to_vec(), mag);
+                let mut o = m.run(
+                    &mut [
+                        ("mix", &[1, 2, seg], &mut mix),
+                        ("mag", &[1, 4, BINS, fr], &mut mag),
+                    ],
+                    &["spec", "wave"],
+                )?;
+                let wave = o.pop().unwrap();
+                (o.pop().unwrap(), wave)
+            }
+        };
 
         let plane = BINS * fr;
-        let mut out = wave.to_vec(); // time branch, [2, seg]
+        let mut out = wave; // time branch, [2, seg]
         let mut z = vec![Complex32::new(0.0, 0.0); plane];
         let mut y = vec![0f32; seg];
         for ch in 0..2 {
@@ -397,17 +424,23 @@ enum Runner {
     Coreml(crate::coreml::Model),
 }
 
-/// `bsrofo_sw_bass.onnx` -> `bsrofo_sw_bass.t259.mlpackage` (fp16, else `.t259.fp32`).
-pub fn coreml_package(onnx: &Path, frames: usize) -> Option<std::path::PathBuf> {
+/// The Core ML package converted from an `.onnx`: `<stem><tag>.mlpackage` (fp16),
+/// else `<stem><tag>.fp32.mlpackage`; BS-RoFormer's tag names the frame count
+/// (`bsrofo_sw_bass.t259.mlpackage`).
+pub fn coreml_package(onnx: &Path, tag: &str) -> Option<std::path::PathBuf> {
     let stem = onnx.file_stem()?.to_str()?;
     [
-        format!("{stem}.t{frames}.mlpackage"),
-        format!("{stem}.t{frames}.fp32.mlpackage"),
+        format!("{stem}{tag}.mlpackage"),
+        format!("{stem}{tag}.fp32.mlpackage"),
     ]
     .into_iter()
     .map(|f| onnx.with_file_name(f))
     .find(|p| p.is_dir())
 }
+
+/// Where Demucs runs under Core ML.
+#[cfg(target_os = "macos")]
+const DEMUCS_UNITS: crate::coreml::Units = crate::coreml::Units::All;
 
 /// BS-RoFormer SW, bass head, exported by tools/export_bsrofo.py. Its STFT
 /// (n_fft 2048, hop 512, Hann, unnormalized) runs here; the graph's frame axis is
@@ -428,11 +461,16 @@ impl BsRoformer {
             // ORT's Core ML route is slower than the CPU for this model (M5, 3 s window:
             // 9.4 s on the Neural Engine, 50-70 s with the GPU, CPU 2.1 s); a package
             // converted by tools/export_bsrofo_coreml.py runs in 0.31 s on the GPU.
-            Device::Coreml => match coreml_package(path, frames) {
+            Device::Coreml => match coreml_package(path, &format!(".t{frames}")) {
                 #[cfg(target_os = "macos")]
                 Some(pkg) => {
                     eprintln!("stemflow: BS-RoFormer on Core ML: {}", pkg.display());
-                    Runner::Coreml(crate::coreml::Model::load(&pkg, "spec_in", "spec")?)
+                    // The Neural Engine is much slower for its transformer (2.6 s
+                    // vs 0.31 s per 3 s window on an M5).
+                    Runner::Coreml(crate::coreml::Model::load(
+                        &pkg,
+                        crate::coreml::Units::CpuAndGpu,
+                    )?)
                 }
                 _ => {
                     eprintln!(
@@ -483,7 +521,9 @@ impl BsRoformer {
             #[cfg(target_os = "macos")]
             Runner::Coreml(m) => {
                 let mut spec_in = spec_in;
-                m.run(&[1, 4, bins, fr], &mut spec_in)
+                let shape = [1, 4, bins, fr];
+                Ok(m.run(&mut [("spec_in", &shape, &mut spec_in)], &["spec"])?
+                    .remove(0))
             }
         }
     }
