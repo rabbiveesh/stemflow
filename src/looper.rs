@@ -260,7 +260,13 @@ fn loop_frame(clip: &Clip, start: i64, len: usize, p: usize) -> Frame {
 
 /// The first beat at or after `a`, a whole number of bars on, from which beats
 /// `..=b` are clear of every gap; None if not even the last bar is.
-fn clear_of_gaps(beats: &[f64], gaps: &[(i64, i64)], a: usize, b: usize, meter: usize) -> Option<usize> {
+fn clear_of_gaps(
+    beats: &[f64],
+    gaps: &[(i64, i64)],
+    a: usize,
+    b: usize,
+    meter: usize,
+) -> Option<usize> {
     let to = beats[b].round() as i64;
     let mut a = a;
     while a < b {
@@ -1431,11 +1437,20 @@ mod tests {
         let at = |t: f64| (t * s) as i64;
         // 4 bars ending at 15 s: beats 14 (7 s) ..= 30
         assert_eq!(clear_of_gaps(&beats, &[], 14, 30, 4), Some(14));
-        assert_eq!(clear_of_gaps(&beats, &[(at(1.0), at(2.0))], 14, 30, 4), Some(14));
+        assert_eq!(
+            clear_of_gaps(&beats, &[(at(1.0), at(2.0))], 14, 30, 4),
+            Some(14)
+        );
         // the next song began at 9 s: from the bar at 11 s (beat 22)
-        assert_eq!(clear_of_gaps(&beats, &[(at(8.5), at(9.0) + 1)], 14, 30, 4), Some(22));
+        assert_eq!(
+            clear_of_gaps(&beats, &[(at(8.5), at(9.0) + 1)], 14, 30, 4),
+            Some(22)
+        );
         // ... at 14 s: not one bar is clear
-        assert_eq!(clear_of_gaps(&beats, &[(at(13.8), at(14.0))], 14, 30, 4), None);
+        assert_eq!(
+            clear_of_gaps(&beats, &[(at(13.8), at(14.0))], 14, 30, 4),
+            None
+        );
     }
 
     /// A gap given end first (the frames jumped back) is the same gap.
