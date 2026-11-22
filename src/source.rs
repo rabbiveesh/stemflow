@@ -117,6 +117,17 @@ mod mpris {
             let id = if url.is_empty() { trackid.clone() } else { url };
             let us = p.get("Position").and_then(|v| i64::try_from(&**v).ok())?;
             let playing = p.get("PlaybackStatus").map(|v| text(v)).as_deref() == Some("Playing");
+            // µs, as an i64 or a u64 depending on the player
+            let len = md.get("mpris:length").map_or(0, |v| match &**v {
+                Value::I64(x) => *x,
+                Value::U64(x) => *x as i64,
+                Value::Value(v) => match &**v {
+                    Value::I64(x) => *x,
+                    Value::U64(x) => *x as i64,
+                    _ => 0,
+                },
+                _ => 0,
+            });
             Some((
                 Now {
                     song: Song {
@@ -126,6 +137,7 @@ mod mpris {
                         album: get("xesam:album"),
                     },
                     ms: us / 1000,
+                    len_ms: len / 1000,
                     playing,
                 },
                 trackid,
@@ -238,12 +250,19 @@ impl Source for Player {
         } else {
             "persistent ID of current track"
         };
-        // one line, tab-separated; the position in whole ms (no decimal comma)
+        // one line, tab-separated; the position in whole ms (no decimal comma); the
+        // length is ms in Spotify, seconds in Music
+        let len = if self.app()? == "Spotify" {
+            "(duration of t)"
+        } else {
+            "((duration of t) * 1000)"
+        };
         let out = self.tell(&format!(
             "if player state is stopped then return \"\"\n\
              set t to current track\n\
              return ({id}) & tab & (name of t) & tab & (artist of t) & tab & (album of t) & tab & \
-             ((player position * 1000) as integer) & tab & (player state as text)"
+             ((player position * 1000) as integer) & tab & (player state as text) & tab & \
+             ({len} as integer)"
         ))?;
         let f: Vec<&str> = out.split('\t').collect();
         if f.len() < 6 || f[1].is_empty() {
@@ -258,6 +277,7 @@ impl Source for Player {
             },
             ms: f[4].trim().parse().ok()?,
             playing: f[5].trim() == "playing",
+            len_ms: f.get(6).and_then(|x| x.trim().parse().ok()).unwrap_or(0),
         })
     }
     fn seek(&self, ms: i64) -> bool {

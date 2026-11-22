@@ -187,6 +187,7 @@ impl Analysis {
 }
 
 /// The decoded beats over the analysed stretch.
+#[derive(Clone)]
 struct Grid {
     beats: Vec<f64>,
     bar: Vec<bool>,
@@ -234,6 +235,20 @@ struct State {
 }
 
 impl State {
+    /// The loop's own tempo: the grid's is the whole analysed minute's, which can
+    /// hold the song before (at another tempo).
+    fn loop_bpm(&self) -> f32 {
+        let Some(g) = self.grid.as_ref() else {
+            return 0.0;
+        };
+        let span = g.beats[self.b] - g.beats[self.a];
+        if self.b > self.a && span > 0.0 {
+            (60.0 * RATE as f64 * (self.b - self.a) as f64 / span) as f32
+        } else {
+            g.bpm
+        }
+    }
+
     /// The pitch multiplier for the stretcher.
     fn transpose(&self) -> f32 {
         2f32.powf(self.semis / 12.0) * if self.keep_pitch { 1.0 } else { self.speed }
@@ -394,14 +409,28 @@ impl Looper {
         let clip = self.snapshot();
         let an = self.analyse(&clip)?;
         let mut st = self.with_fresh_clip();
+        // a find that fails leaves the loop (if any) as it was
+        let before = (st.settings, st.analysis.take(), st.grid.clone());
         st.settings = s;
         st.analysis = Some(an);
         self.decode(&mut st);
+        let r = Self::place(&mut st, press, bars);
+        if r.is_err() {
+            (st.settings, st.analysis, st.grid) = before;
+        }
+        r
+    }
+
+    /// The loop on a freshly decoded grid: `bars` bars ending at the bar line
+    /// nearest to `press`.
+    fn place(st: &mut State, press: u64, bars: usize) -> Result<()> {
         let g = st.grid.as_ref().unwrap();
         ensure!(g.beats.len() > 2, "no beat found");
-        // The bar line nearest to the press ends the loop.
+        // The bar line nearest to the press ends the loop; not one in the silence
+        // after the music stopped (a paused player), where the beats only go on.
+        let music = st.clip.as_ref().map_or(f64::MAX, |c| c.music_end() as f64);
         let b = (0..g.beats.len())
-            .filter(|&i| g.bar[i])
+            .filter(|&i| g.bar[i] && g.beats[i] <= music)
             .min_by(|&i, &j| {
                 (g.beats[i] - press as f64)
                     .abs()
@@ -515,7 +544,7 @@ impl Looper {
             st.b - lo,
             one - lo,
             g.meter,
-            g.bpm,
+            st.loop_bpm(),
         ))
     }
 
@@ -577,7 +606,7 @@ impl Looper {
                 return Ok(false);
             };
             let one = (st.a..st.b).find(|&i| g.bar[i]).unwrap_or(st.a);
-            let raw = g.bpm / st.settings.feel.max(0.25);
+            let raw = st.loop_bpm() / st.settings.feel.max(0.25);
             (g.beats[st.a], st.b - st.a, g.beats[one], raw, c.music_end())
         };
         let clip = self.snapshot();
@@ -590,12 +619,24 @@ impl Looper {
             return Ok(false); // the loop went meanwhile
         }
         let old = st.settings;
+        let before = (st.analysis.take(), st.grid.clone());
         st.settings.min_bpm = bpm * 0.85;
         st.settings.max_bpm = bpm * 1.18;
         st.analysis = Some(an);
         self.decode(&mut st);
         st.settings.min_bpm = old.min_bpm;
         st.settings.max_bpm = old.max_bpm;
+        // the loop as it was, if the new beats would put it across a gap
+        if !self.relay(&mut st, start, len, one) {
+            (st.analysis, st.grid) = before;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// The loop on fresh beats: the beat nearest `start`, `len` beats long, bar 1 the
+    /// beat nearest `one`. False if that runs across a gap.
+    fn relay(&self, st: &mut State, start: f64, len: usize, one: f64) -> bool {
         let g = st.grid.as_mut().unwrap();
         let near = |t: f64| {
             (0..g.beats.len())
@@ -610,10 +651,13 @@ impl Looper {
         }
         // keep the playhead on the same music
         let shift = g.beats[a] - start;
+        if b <= a || !self.spans_music(st, a, b) {
+            return false;
+        }
         st.a = a;
         st.b = b;
         st.pos = (st.pos as f64 - shift).max(0.0) as usize;
-        Ok(true)
+        true
     }
 
     /// The phrase after the loop: as many beats, starting where the loop ends, with a
@@ -896,7 +940,7 @@ impl Looper {
     /// Start the loop again from the top (or resume after `stop`).
     pub fn play(&self) {
         let mut st = self.state.lock().unwrap();
-        if st.grid.is_some() {
+        if st.grid.is_some() && st.b > st.a && st.clip.is_some() {
             st.playing = true;
             st.pos = 0;
             st.resync();
@@ -1179,7 +1223,7 @@ impl Looper {
         Some(View {
             playing: st.playing,
             finding: st.finding,
-            bpm: g.bpm,
+            bpm: st.loop_bpm(),
             meter: g.meter,
             bars: ((st.b - st.a) as f32 / g.meter as f32).round() as usize,
             from,

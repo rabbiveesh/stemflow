@@ -7,8 +7,6 @@
 //! A segment runs from its first anchor to its last (the newest one runs on). What
 //! lies between two segments isn't known: the break happened somewhere in there.
 
-use std::time::Instant;
-
 pub const RATE: i64 = 44_100;
 /// How far the song time may drift from the frames before it is a break.
 const TOLERANCE_MS: i64 = 600;
@@ -37,22 +35,22 @@ impl Song {
 }
 
 /// Buffer frame `frame` is song position `ms` of `song`, as the player said when that
-/// frame's input arrived (`at`).
+/// frame's input arrived (`at`, ms on the deck's clock).
 #[derive(Clone, Debug)]
 pub struct Anchor {
     pub frame: i64,
     pub ms: i64,
     pub song: Song,
-    pub at: Instant,
+    pub at: i64,
 }
 
 impl Anchor {
-    pub fn new(frame: i64, ms: i64, song: Song) -> Self {
+    pub fn new(frame: i64, ms: i64, song: Song, at: i64) -> Self {
         Anchor {
             frame,
             ms,
             song,
-            at: Instant::now(),
+            at,
         }
     }
     pub fn frame_of(&self, ms: i64) -> i64 {
@@ -114,6 +112,21 @@ impl SongMap {
     /// The newest anchor: what is playing, and where.
     pub fn latest(&self) -> Option<&Anchor> {
         self.segments.last().map(|s| s.last())
+    }
+
+    /// The song played on unbroken up to buffer frame `frame` (where its sound
+    /// stopped, when the player paused): the newest stretch reaches to there.
+    pub fn extend_to(&mut self, frame: i64) {
+        if let Some(seg) = self.segments.last_mut() {
+            let p = seg.last().clone();
+            if frame > p.frame {
+                seg.anchors.push(Anchor {
+                    frame,
+                    ms: p.ms_of(frame as f64),
+                    ..p
+                });
+            }
+        }
     }
 
     /// A break we know of (we seeked, frames were skipped, the source paused);
@@ -223,13 +236,7 @@ impl SongMap {
     /// segment (the newest that has them). The newest segment reaches only up to its
     /// last anchor: what plays after that isn't in the buffer yet. With `after`,
     /// only segments that began then or later count.
-    pub fn for_song(
-        &self,
-        song: &Song,
-        from: i64,
-        to: i64,
-        after: Option<Instant>,
-    ) -> Option<Anchor> {
+    pub fn for_song(&self, song: &Song, from: i64, to: i64, after: Option<i64>) -> Option<Anchor> {
         for s in self.segments.iter().rev() {
             if after.is_some_and(|t| s.first().at < t) {
                 break; // older segments began even earlier
@@ -303,7 +310,7 @@ mod tests {
         // a second of song per second of frames
         for k in 0..10 {
             assert!(m
-                .observe(Anchor::new(k * RATE, 30_000 + k * 1000, a.clone()))
+                .observe(Anchor::new(k * RATE, 30_000 + k * 1000, a.clone(), 0))
                 .is_none());
         }
         let x = m.for_frames(2.0 * RATE as f64, 8.0 * RATE as f64).unwrap();
@@ -311,12 +318,17 @@ mod tests {
         // a seek to 1:00: a new stretch, beginning at the seek
         m.cut("seek", Some(60_000));
         let seen = m
-            .observe(Anchor::new(11 * RATE, 60_500, a.clone()))
+            .observe(Anchor::new(11 * RATE, 60_500, a.clone(), 0))
             .unwrap();
         assert_eq!(seen.why, "seek");
         for k in 12..20 {
             assert!(m
-                .observe(Anchor::new(k * RATE, 60_500 + (k - 11) * 1000, a.clone()))
+                .observe(Anchor::new(
+                    k * RATE,
+                    60_500 + (k - 11) * 1000,
+                    a.clone(),
+                    0
+                ))
                 .is_none());
         }
         // nothing maps across the seek
@@ -330,11 +342,11 @@ mod tests {
         assert!(m.for_song(&a, 61_000, 70_000, None).is_none());
         // a jump in song time without a cut is a break too
         let seen = m
-            .observe(Anchor::new(21 * RATE, 10_000, a.clone()))
+            .observe(Anchor::new(21 * RATE, 10_000, a.clone(), 0))
             .unwrap();
         assert!(seen.why.starts_with("song at"), "{}", seen.why);
         // the next song, near its start, begins at 0
-        m.observe(Anchor::new(30 * RATE, 2_000, song("b")));
+        m.observe(Anchor::new(30 * RATE, 2_000, song("b"), 0));
         assert_eq!(m.ms_of(28.5 * RATE as f64).unwrap() / 100, 5);
         assert!(m.latest().unwrap().song.same(&song("b")));
     }

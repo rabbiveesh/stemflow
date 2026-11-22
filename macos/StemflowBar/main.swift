@@ -435,6 +435,7 @@ final class Controller: NSObject, NSMenuDelegate {
             menu.addItem(i!)
         }
         for i in loopSec.items { menu.addItem(i) }
+        loopSec.menu = menu
         menu.addItem(.separator())
         for i in [stemsItem, modelsItem, expItem, advItem] { menu.addItem(i) }
         menu.addItem(.separator())
@@ -637,13 +638,14 @@ final class Controller: NSObject, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         menuOpen = true
         poll()
-        loadBookmarks()
     }
 
-    func loadBookmarks() {
+    /// The loop panel, as stemflow declares it (`loop panel`).
+    func loadPanel() {
+        guard isOn, loopState != nil else { return loopSec.render(nil) }
         queue.async {
-            let list = requestAny("loop bookmarks") as? [[String: Any]]
-            DispatchQueue.main.async { self.loopSec.fillBookmarks(list ?? []) }
+            let p = requestAny("loop panel") as? [String: Any]
+            DispatchQueue.main.async { self.loopSec.render(p) }
         }
     }
 
@@ -701,7 +703,7 @@ final class Controller: NSObject, NSMenuDelegate {
         let rows: [NSMenuItem] = [desc, oneItem, boostItem, bassItem, bandItem, secondItem, snapsItem, sep1, status,
                                   modelsItem, stemsItem, clickItem, beatOpts]
         for r in rows { r.isHidden = !on }
-        if !on { loopSec.sync(nil, meter: 0, feel: 1) }
+        if !on { loopSec.render(nil) }
 
         let button = item.button
         guard let s = state else {
@@ -771,7 +773,7 @@ final class Controller: NSObject, NSMenuDelegate {
         beatOpts.title = "Meter and feel: \(meter > 0 ? "\(meter)/bar" : "auto meter")"
             + (feel == 0.5 ? " · half time" : feel == 2 ? " · double time" : "")
 
-        loopSec.sync(loopState, meter: meter, feel: feel)
+        loadPanel()
 
         let loading = statusText.hasPrefix("Loading")
         if wasLoading && !loading { pending = nil }

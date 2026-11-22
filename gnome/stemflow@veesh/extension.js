@@ -55,6 +55,7 @@ const IFACE = `
     <method name="Loop"><arg type="s" direction="in"/></method>
     <method name="LoopView"><arg type="u" direction="in"/><arg type="s" direction="out"/></method>
     <method name="LoopBookmarks"><arg type="s" direction="out"/></method>
+    <method name="LoopPanel"><arg type="s" direction="out"/></method>
     <method name="Nudge"><arg type="d" direction="in"/><arg type="d" direction="out"/></method>
     <method name="Snap"><arg type="s" direction="in"/><arg type="d" direction="out"/></method>
   </interface>
@@ -260,7 +261,7 @@ class StemflowIndicator extends PanelMenu.Button {
         }
 
         // Looping (loop.js): loop the last bars heard, and edit the loop.
-        this._loopSec = new Loop.LoopSection(this.menu, cmd => this.loop(cmd), (prop, v) => this._set(prop, v),
+        this._loopSec = new Loop.LoopSection(this.menu, cmd => this.loop(cmd),
             (bins, cb) => {
                 if (!this._proxy)
                     return cb(null);
@@ -273,14 +274,14 @@ class StemflowIndicator extends PanelMenu.Button {
                 });
             },
             cb => {
-                if (!this._proxy)
-                    return cb([]);
-                this._proxy.LoopBookmarksRemote((res, err) => {
-                    let list = [];
+                if (!this._proxy || !this._loopState())
+                    return cb(null);
+                this._proxy.LoopPanelRemote((res, err) => {
+                    let panel = null;
                     try {
-                        list = err ? [] : JSON.parse(res[0]);
+                        panel = err ? null : JSON.parse(res[0]);
                     } catch (e) {}
-                    cb(list);
+                    cb(panel);
                 });
             });
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -443,8 +444,10 @@ class StemflowIndicator extends PanelMenu.Button {
     }
 
     _syncLoop(on) {
-        const p = this._proxy;
-        this._loopSec.sync(on ? this._loopState() : null, p?.Meter ?? 0, p?.Feel ?? 1);
+        if (on && this._loopState())
+            this._loopSec.load();
+        else
+            this._loopSec.render(null);
     }
 
     _onScroll(ev) {
@@ -486,11 +489,8 @@ class StemflowIndicator extends PanelMenu.Button {
                     if (props.Models)
                         this._fillModels(v('Models'), v('Model'));
                     // the song position isn't announced: read it while showing it
-                    if (props.LoopState) {
-                        try {
-                            this._loopSec.sync(JSON.parse(v('LoopState')), v('Meter'), v('Feel'));
-                        } catch (e) {}
-                    }
+                    if (props.LoopState && v('LoopState') !== 'null')
+                        this._loopSec.load();
                     this._status.label.text =
                         `${v('App')} · ${v('Latency').toFixed(1)} s behind · ` +
                         `GPU ${v('Compute').toFixed(2)} s of ${v('Hop').toFixed(1)} s` +

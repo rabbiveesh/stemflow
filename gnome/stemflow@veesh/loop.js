@@ -1,15 +1,11 @@
-/* The Loop section of the menu: the Android app's Loops screen (LoopView.kt,
- * MainActivity.loopsPage) over D-Bus: `Loop(cmd)`, `LoopState` and `LoopView(bins)`
- * (src/loopdeck.rs). */
+/* The Loop section of the menu: the loop panel stemflow declares (D-Bus
+ * `LoopPanel()`, src/loopdeck/panel.rs), drawn; and the loop view, drawn from
+ * `LoopView(bins)`. Its controls send `Loop(cmd)`. */
 const { GObject, St, GLib, Clutter } = imports.gi;
+const Me = imports.misc.extensionUtils.getCurrentExtension();
 const PopupMenu = imports.ui.popupMenu;
 const Slider = imports.ui.slider;
 const ModalDialog = imports.ui.modalDialog;
-
-function mmss(ms) {
-    const s = Math.floor(ms / 1000);
-    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-}
 
 /* Ask for a name: `done(name)` unless cancelled. */
 function askName(title, value, done) {
@@ -58,15 +54,6 @@ function box(children, style = 'spacing: 6px;', vertical = false) {
 
 function small(text, style = 'font-size: 9pt; color: #9aa;') {
     return new St.Label({ text, style, x_align: Clutter.ActorAlign.CENTER, x_expand: true });
-}
-
-/* Buttons where one is picked: [labels], onPick(index). */
-function choice(labels, onPick) {
-    const buttons = labels.map((l, i) => btn(l, () => onPick(i), true));
-    const row = box(buttons, 'spacing: 4px;');
-    row.pick = i => buttons.forEach((b, k) => b.set_checked(k === i));
-    row.buttons = buttons;
-    return row;
 }
 
 /* The waveform of the loop with a bar either side: a tick on every beat, numbered
@@ -255,7 +242,9 @@ function sliderRow(label, onChange) {
     const s = new Slider.Slider(0);
     s.x_expand = true;
     const value = new St.Label({ y_align: Clutter.ActorAlign.CENTER, style: 'min-width: 3em; text-align: right;' });
-    const row = box([new St.Label({ text: label, y_align: Clutter.ActorAlign.CENTER, style: 'min-width: 3.5em;' }), s, value], 'spacing: 8px;');
+    const name = new St.Label({ text: label, y_align: Clutter.ActorAlign.CENTER, style: 'min-width: 3.5em;' });
+    const row = box([name, s, value], 'spacing: 8px;');
+    row.label = name;
     let quiet = false;
     s.connect('notify::value', () => {
         if (!quiet)
@@ -272,111 +261,196 @@ function sliderRow(label, onChange) {
     return row;
 }
 
-const METERS = [0, 2, 3, 4, 5, 6, 7];
-const FEELS = [1, 0.5, 2];
+/* The loop panel as stemflow declares it (`LoopPanel()`, src/loopdeck/panel.rs):
+ * rows of items, each of a kind in KINDS (panelKinds.js, generated from the Rust).
+ * Each kind is drawn here once, in `widget`: the Rust tests check there's a case
+ * for every kind. The texts, states and the lines the controls send all come from
+ * stemflow. */
+const KINDS = Me.imports.panelKinds.KINDS;
 
-/* The section: `send(cmd)` runs a loop command, `setBeat(prop, v)` sets Meter/Feel,
- * `fetchView(bins, cb)` asks for the loop view. */
+const lines = (j, k) => j[k] || [];
+
+/* One item of the panel: `actor` for a row of controls, or `item` for one that is a
+ * menu item itself; `update(j)` shows its JSON. */
+function widget(kind, sec) {
+    if (!KINDS.includes(kind))
+        log(`stemflow: no such panel item: ${kind}`);
+    switch (kind) {
+    case 'text': {
+        const item = new PopupMenu.PopupMenuItem('', { reactive: false });
+        const actor = small('', 'font-size: 9pt;');
+        const style = { title: 'font-weight: bold;', small: 'font-size: smaller;', normal: '' };
+        return {
+            item, actor, update: j => {
+                item.label.text = actor.text = j.text;
+                item.label.style = actor.style = style[j.style] ?? '';
+            },
+        };
+    }
+    case 'button': {
+        let j = {};
+        const b = btn('', () => sec.run(lines(j, 'send'), j.ask));
+        return {
+            actor: b, update: x => {
+                j = x;
+                b.label = j.label;
+                b.reactive = j.enabled !== false;
+                b.toggle_mode = j.on !== null && j.on !== undefined;
+                if (b.toggle_mode)
+                    b.set_checked(!!j.on);
+            },
+        };
+    }
+    case 'switch': {
+        let j = {};
+        const item = new PopupMenu.PopupSwitchMenuItem('', false);
+        item.activate = () => sec.run(lines(j, 'send'));
+        return {
+            item, update: x => {
+                j = x;
+                item.label.text = j.label;
+                item.setToggleState(!!j.on);
+            },
+        };
+    }
+    case 'choice': {
+        let opts = [];
+        const row = box([], 'spacing: 4px;');
+        let buttons = [];
+        return {
+            actor: row, update: j => {
+                opts = j.options || [];
+                if (buttons.length !== opts.length) {
+                    row.destroy_all_children();
+                    buttons = opts.map((_o, i) => {
+                        const b = btn('', () => sec.run(lines(opts[i], 'send')), true);
+                        row.add_child(b);
+                        return b;
+                    });
+                }
+                opts.forEach((o, i) => {
+                    buttons[i].label = o.label;
+                    buttons[i].set_checked(i === j.selected);
+                });
+            },
+        };
+    }
+    case 'nudge': {
+        let j = {};
+        const label = small('', 'font-size: 8pt; font-weight: bold;');
+        const note = small('');
+        const actor = box([
+            label,
+            box([btn('◀', () => sec.run(lines(j, 'back'))), btn('▶', () => sec.run(lines(j, 'forward')))], 'spacing: 4px;'),
+            note,
+        ], 'spacing: 2px;', true);
+        return {
+            actor, update: x => {
+                j = x;
+                label.text = j.label;
+                note.text = j.note;
+            },
+        };
+    }
+    case 'slider': {
+        let j = {};
+        const row = sliderRow('', pos => {
+            const step = Math.max(j.step || 1, 1e-6);
+            let v = Math.round((j.min + pos * (j.max - j.min)) / step) * step;
+            if (j.snap !== null && j.snap !== undefined && Math.abs(v - j.snap) < 2 * step)
+                v = j.snap;
+            sec.run([j.send.replace('{v}', step >= 1 ? `${Math.round(v)}` : v.toFixed(2))]);
+        });
+        return {
+            actor: row, update: x => {
+                j = x;
+                row.label.text = j.label;
+                const span = j.max - j.min;
+                row.set(span > 0 ? (j.value - j.min) / span : 0, j.text);
+            },
+        };
+    }
+    case 'loop_view': {
+        let j = {};
+        sec.view.onEdges = (a, b) => sec.run([j.edges.replace('{a}', `${a}`).replace('{b}', `${b}`)]);
+        sec.view.onBarOne = i => sec.run([j.bar1.replace('{beat}', `${i}`)]);
+        return { actor: sec.view, update: x => (j = x) };
+    }
+    case 'bookmarks': {
+        let j = null;
+        const item = new PopupMenu.PopupSubMenuMenuItem('Bookmarks');
+        const search = new St.Entry({ can_focus: true, x_expand: true });
+        item.menu.addMenuItem(holder(search));
+        let rows = [];
+        const fill = () => {
+            for (const r of rows)
+                r.destroy();
+            rows = [];
+            const add = r => {
+                item.menu.addMenuItem(r);
+                rows.push(r);
+            };
+            item.label.text = j.title;
+            search.hint_text = j.search_hint;
+            const q = search.get_text().toLowerCase();
+            let any = false;
+            for (const g of j.groups) {
+                const marks = g.marks.filter(m => !q || m.search.includes(q));
+                if (!marks.length)
+                    continue;
+                any = true;
+                const h = new PopupMenu.PopupMenuItem(g.title, { reactive: false });
+                h.label.style = 'font-weight: bold; font-size: smaller;';
+                add(h);
+                for (const m of marks) {
+                    const play = new St.Button({ label: m.label, style_class: 'button', x_expand: true, can_focus: true });
+                    play.connect('clicked', () => sec.run(m.play));
+                    const rename = btn('✎', () => sec.run(m.rename, m.rename_ask));
+                    const del = btn('✕', () => sec.run(m.delete));
+                    rename.x_expand = del.x_expand = false;
+                    add(holder(box([play, rename, del], 'spacing: 4px;')));
+                }
+            }
+            if (!any)
+                add(new PopupMenu.PopupMenuItem(j.groups.length ? j.no_match : j.empty, { reactive: false }));
+        };
+        search.clutter_text.connect('text-changed', () => j && fill());
+        return {
+            item, update: x => {
+                // only when it changed: keeps the search field's focus while typing
+                if (JSON.stringify(x) === JSON.stringify(j))
+                    return;
+                j = x;
+                fill();
+            },
+        };
+    }
+    }
+    return null;
+}
+
+/* The section: `send(cmd)` runs a `loop …` command (without the `loop `),
+ * `fetchView(bins, cb)` asks for the loop view, `fetchPanel(cb)` for the panel. */
 var LoopSection = class {
-    constructor(menu, send, setBeat, fetchView, fetchBookmarks) {
+    constructor(menu, send, fetchView, fetchPanel) {
         this._send = send;
         this._fetchView = fetchView;
-        this._fetchBookmarks = fetchBookmarks;
-        this._marks = [];
-        this.unit = 0; // what edits step by: 0 a beat, 1 a bar, 2 a phrase
-        this.loop = null;
+        this._fetchPanel = fetchPanel;
+        this.view = new LoopView((a, b) => this.view.onEdges(a, b), i => this.view.onBarOne(i));
+        this.view.onEdges = () => {};
+        this.view.onBarOne = () => {};
+        this.hasLoop = false;
+        this._rows = [];
+        this._shape = '';
         this._timer = 0;
         this._busy = false;
-
         this.sep = new PopupMenu.PopupSeparatorMenuItem();
-        // The player: what plays, play/pause it, save the loop; the saved loops.
-        this.now = new PopupMenu.PopupMenuItem('', { reactive: false });
-        this.now.label.style = 'font-size: smaller;';
-        this._playPause = btn('Pause', () => send('playpause'));
-        this._save = btn('Save…', () => this._saveLoop());
-        this.strip = holder(box([this._playPause, this._save]));
-        this.bookmarks = new PopupMenu.PopupSubMenuMenuItem('Bookmarks');
-        this._search = new St.Entry({ hint_text: 'Search songs and loops', can_focus: true, x_expand: true });
-        this._search.clutter_text.connect('text-changed', () => this._fillBookmarks(this._marks));
-        const searchRow = holder(this._search);
-        this.bookmarks.menu.addMenuItem(searchRow);
-        this._markItems = [];
-        this.info = new PopupMenu.PopupMenuItem('', { reactive: false });
-        this.info.label.style = 'font-weight: bold;';
-        this.hint = new PopupMenu.PopupMenuItem('', { reactive: false });
-        this.hint.label.style = 'font-size: smaller;';
-
-        this._grabs = {};
-        const grabs = [1, 2, 4, 8].map(n => {
-            const b = btn(n === 1 ? '1 bar' : `${n} bars`, () => send(`${n}`), true);
-            this._grabs[n] = b;
-            return b;
-        });
-        this._live = btn('Live', () => send('live'));
-        this.grab = holder(box([...grabs, this._live]));
-
-        this.view = new LoopView((a, b) => send(`edges ${a} ${b}`), i => send(`bar1 ${i}`));
-        this.viewItem = holder(this.view);
-
-        this._units = choice(['Beat', 'Bar', 'Phrase'], i => {
-            this.unit = i;
-            this._units.pick(i);
-        });
-        this._units.pick(0);
-        this.units = holder(this._units);
-
-        // Start, the whole loop, or the end: earlier or later by the unit.
-        const pair = (name, note, da, db) => box([
-            small(name.toUpperCase(), 'font-size: 8pt; font-weight: bold;'),
-            box([btn('◀', () => this._edit(-da, -db)), btn('▶', () => this._edit(da, db))], 'spacing: 4px;'),
-            small(note),
-        ], 'spacing: 2px;', true);
-        this.edit = holder(box([pair('Start', '◀ longer · shorter ▶', 1, 0), pair('Move', 'same length', 1, 1),
-            pair('End', '◀ shorter · longer ▶', 0, 1)], 'spacing: 10px;'));
-
-        // Meter and feel re-decode the loop's bars (and the click's).
-        this._meters = choice(['Auto', '2', '3', '4', '5', '6', '7'], i => setBeat('Meter', METERS[i]));
-        this._feels = choice(['As heard', '½×', '2×'], i => setBeat('Feel', FEELS[i]));
-        this.meters = holder(this._meters);
-        this.feels = holder(this._feels);
-
-        // Practice speed (40-120%) and transposition (±12 semitones).
-        this._speed = sliderRow('Speed', v => {
-            let x = 0.4 + 0.8 * v;
-            if (Math.abs(x - 1) < 0.02)
-                x = 1;
-            send(`speed ${x.toFixed(2)}`);
-        });
-        this._pitch = sliderRow('Pitch', v => send(`pitch ${Math.round(v * 24 - 12)}`));
-        this.speed = holder(this._speed);
-        this.pitch = holder(this._pitch);
-
-        this._keep = btn('Keep pitch', () => send(`keep_pitch ${this.loop?.keep_pitch === false ? 'on' : 'off'}`), true);
-        this._click = btn('Click', () => send(`click ${this.loop?.click ? 'off' : 'on'}`), true);
-        this.chips = holder(box([
-            btn('75%', () => send('speed 0.75')),
-            btn('50%', () => send('speed 0.5')),
-            this._keep, this._click,
-            btn('Reset', () => {
-                send('speed 1');
-                send('pitch 0');
-            }),
-        ], 'spacing: 4px;'));
-        // From the top; Repair plays the loop's part of the song again and lays the
-        // loop on that (for a glitch in it).
-        this.actions = holder(box([btn('From the top', () => send('top')), btn('Repair', () => send('repair'))]));
-        this.stemsOnly = new PopupMenu.PopupSwitchMenuItem('Stems only when looping', false);
-        this.stemsOnly.activate = () => send(`stems_only ${this.loop?.stems_only ? 'off' : 'on'}`);
-
-        this.items = [this.sep, this.now, this.strip, this.bookmarks, this.info, this.hint, this.grab,
-            this.viewItem, this.units, this.edit, this.meters, this.feels, this.speed, this.pitch, this.chips,
-            this.actions, this.stemsOnly];
-        for (const i of this.items)
-            menu.addMenuItem(i);
-
+        this.section = new PopupMenu.PopupMenuSection();
+        menu.addMenuItem(this.sep);
+        menu.addMenuItem(this.section);
         menu.connect('open-state-changed', (_m, open) => {
             if (open)
-                this.loadBookmarks();
+                this.load();
             if (open && !this._timer) {
                 this._timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
                     this._poll();
@@ -389,144 +463,69 @@ var LoopSection = class {
         });
     }
 
-    loadBookmarks() {
-        this._fetchBookmarks(list => this._fillBookmarks(list || []));
+    /* Ask stemflow for the panel and show it. */
+    load() {
+        this._fetchPanel(p => this.render(p));
     }
 
-    _saveLoop() {
-        const l = this.loop || {};
-        const guess = l.title ? (l.loop_from >= 0 ? `${l.title} ${mmss(l.loop_from)}` : l.title) : 'Loop';
-        askName('Save this loop', guess, name => {
-            this._send(`save ${name}`);
-            this.loadBookmarks();
-        });
-    }
-
-    /* The saved loops by recording, newest first; each plays, renames or deletes. */
-    _fillBookmarks(list) {
-        this._marks = list;
-        for (const i of this._markItems)
-            i.destroy();
-        this._markItems = [];
-        const add = i => {
-            this.bookmarks.menu.addMenuItem(i);
-            this._markItems.push(i);
+    /* Send `lines` (`loop …`), asking for a name first (`{name}` in them) if `ask`. */
+    run(ls, ask = null) {
+        const go = name => {
+            for (const l of ls)
+                this._send(l.replace(/^loop /, '').replace('{name}', name ?? ''));
+            this.load();
         };
-        this.bookmarks.label.text = list.length ? `Bookmarks (${list.length})` : 'Bookmarks';
-        const q = this._search.get_text().toLowerCase();
-        const shown = list.filter(b => !q || ['name', 'title', 'artist'].some(k => (b[k] || '').toLowerCase().includes(q)));
-        if (!shown.length) {
-            add(new PopupMenu.PopupMenuItem(list.length ? 'Nothing matches' : 'Save a loop (Save…) to come back to it later',
-                { reactive: false }));
-            return;
-        }
-        const groups = new Map();
-        for (const b of shown.sort((x, y) => y.created - x.created)) {
-            const key = `${b.title} — ${b.artist}`;
-            if (!groups.has(key))
-                groups.set(key, []);
-            groups.get(key).push(b);
-        }
-        for (const [key, marks] of groups) {
-            const h = new PopupMenu.PopupMenuItem(key, { reactive: false });
-            h.label.style = 'font-weight: bold; font-size: smaller;';
-            add(h);
-            for (const b of marks.sort((x, y) => x.start - y.start)) {
-                const play = new St.Button({
-                    label: `${b.name}  ·  ${b.bars} bar${b.bars === 1 ? '' : 's'} · ${mmss(b.start)}`,
-                    style_class: 'button', x_expand: true, can_focus: true,
-                });
-                play.connect('clicked', () => this._send(`recall ${b.created}`));
-                const rename = btn('✎', () => askName('Rename the loop', b.name, n => {
-                    this._send(`rename ${b.created} ${n}`);
-                    this.loadBookmarks();
-                }));
-                const del = btn('✕', () => {
-                    this._send(`delete ${b.created}`);
-                    this.loadBookmarks();
-                });
-                rename.x_expand = del.x_expand = false;
-                add(holder(box([play, rename, del], 'spacing: 4px;')));
-            }
+        if (ask)
+            askName(ask.title, ask.value, go);
+        else
+            go(null);
+    }
+
+    /* Show the panel (null: no looping): built once for its shape, then updated. */
+    render(panel) {
+        const rows = panel?.rows || [];
+        this.sep.visible = this.section.actor.visible = rows.length > 0;
+        const shape = rows.map(r => `${r.id}:${r.items.map(i => i.kind).join(',')}`).join('|');
+        if (shape !== this._shape)
+            this._build(rows, shape);
+        this.hasLoop = false;
+        rows.forEach((r, k) => {
+            const built = this._rows[k];
+            built.item.visible = !r.hidden;
+            if (r.id === 'view')
+                this.hasLoop = !r.hidden;
+            r.items.forEach((i, n) => built.widgets[n]?.update(i));
+        });
+        if (!this.hasLoop)
+            this.view.set(null);
+    }
+
+    _build(rows, shape) {
+        if (this.view.get_parent())
+            this.view.get_parent().remove_child(this.view);
+        this.section.removeAll();
+        this._rows = [];
+        this._shape = shape;
+        for (const r of rows) {
+            const widgets = r.items.map(i => widget(i.kind, this)).filter(w => w);
+            let item;
+            if (widgets.length === 1 && widgets[0].item)
+                item = widgets[0].item;
+            else
+                item = holder(box(widgets.map(w => w.actor).filter(a => a), r.id === 'edit' ? 'spacing: 10px;' : 'spacing: 6px;'));
+            this.section.addMenuItem(item);
+            this._rows.push({ item, widgets });
         }
     }
 
     _poll() {
-        if (this._busy || !this.loop?.playing)
+        if (this._busy || !this.hasLoop)
             return;
         this._busy = true;
         this._fetchView(Math.max(40, Math.floor(this.view.width / 2)), pic => {
             this._busy = false;
             this.view.set(pic);
         });
-    }
-
-    _step() {
-        const m = Math.max(this.loop?.meter || 4, 1);
-        return [1, m, Math.max(this.loop?.beats || m, 1)][this.unit];
-    }
-
-    _edit(da, db) {
-        const u = this._step();
-        this._send(`move ${da * u} ${db * u}`);
-    }
-
-    /* `l`: the parsed LoopState (null: no looping); `meter`, `feel`: the beat options. */
-    sync(l, meter, feel) {
-        this.loop = l;
-        for (const i of this.items)
-            i.visible = !!l;
-        if (!l)
-            return;
-        const m = Math.max(l.meter || 4, 1);
-        const beats = l.beats || 0;
-        for (const i of [this.viewItem, this.units, this.edit, this.chips, this.actions])
-            i.visible = l.playing;
-        // the player
-        if (!l.title)
-            this.now.label.text = "The player doesn't say what's playing";
-        else if (l.playing && l.loop_from >= 0)
-            this.now.label.text = `${l.title} — ${l.artist} · looping ${mmss(l.loop_from)}–${mmss(l.loop_to)}`;
-        else
-            this.now.label.text = `${l.title} — ${l.artist} · ${mmss(l.song_ms)}${l.song_playing ? '' : ' · paused'}`;
-        this._playPause.label = l.song_playing ? 'Pause' : 'Play';
-        this._playPause.reactive = !!l.title && !l.playing;
-        this._save.reactive = l.playing;
-        this.stemsOnly.setToggleState(!!l.stems_only);
-        for (const [n, b] of Object.entries(this._grabs))
-            b.set_checked(l.playing && Number(n) === l.bars);
-        this._live.reactive = l.playing || l.tail || l.finding;
-        let info;
-        if (l.playing) {
-            const [whole, extra] = [Math.floor(beats / m), beats % m];
-            info = `Looping ${whole} bar${whole === 1 ? '' : 's'}` +
-                (extra ? ` + ${extra} beat${extra === 1 ? '' : 's'}` : '') +
-                ` of ${m}/4 · ${Math.round(l.bpm)} bpm · ${l.length.toFixed(1)} s`;
-        } else if (l.recalling) {
-            info = 'Going back to a bookmark…';
-        } else if (l.finding) {
-            info = 'Finding the bars…';
-        } else if (l.tail) {
-            info = 'Catching up with the song';
-        } else {
-            info = 'Loop the last…';
-        }
-        this.info.label.text = info;
-        const hint = l.status && !l.finding ? l.status
-            : l.playing ? 'Drag an end · right-click or long-press a beat for bar 1'
-                : l.finding ? '' : 'Press a length to loop what you just heard';
-        this.hint.label.text = hint;
-        this.hint.visible = !!hint;
-        this._units.buttons[2].label = beats && beats % m === 0 ? `${beats / m}-bar phrase` : 'Phrase';
-        this._meters.pick(Math.max(METERS.indexOf(meter), 0));
-        this._feels.pick(Math.max(FEELS.indexOf(feel), 0));
-        this._speed.set((l.speed - 0.4) / 0.8, `${Math.round(l.speed * 100)}%`);
-        const st = Math.round(l.semis);
-        this._pitch.set((l.semis + 12) / 24, st === 0 ? '0 st' : `${st > 0 ? '+' : ''}${st} st`);
-        this._keep.set_checked(l.keep_pitch !== false);
-        this._click.set_checked(!!l.click);
-        if (!l.playing)
-            this.view.set(null);
     }
 
     destroy() {

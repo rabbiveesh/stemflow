@@ -9,10 +9,12 @@
 //! nudge 0.1
 //! snap solo|full|nobass|novocals
 //! loop 4                     loop the last 4 bars (or resize the loop playing)
-//! loop live                  back to the live stream (also again/top, move <da> <db>,
-//!                            shift <beats>, edges <a> <b>, bar1 <beat>, click on|off,
-//!                            speed <x>, pitch <semitones>, keep_pitch on|off)
+//! loop live                  back to the live stream (and the rest of
+//!                            src/loopdeck/command.rs: top, move <da> <db>, unit <u>,
+//!                            edges <a> <b>, bar1 <beat>, meter <n>, feel <x>,
+//!                            click on|off, speed <x>, pitch <semitones>, keep_pitch on|off)
 //! loop view 300              -> the loop for drawing (beats, peaks), not the state
+//! loop panel                 -> the loop panel to show (src/loopdeck/panel.rs)
 //! loop bookmarks             -> the saved loops, not the state (also loop save <name>,
 //!                            recall|delete <created>, rename <created> <name>, repair,
 //!                            playpause, stems_only on|off)
@@ -93,6 +95,12 @@ fn handle(conn: UnixStream, ctl: &Control, info: &Info) -> Result<()> {
         // `loop bookmarks`: the saved loops, instead of the state
         if line.trim() == "loop bookmarks" {
             out.write_all(crate::bookmarks::list_json().as_bytes())?;
+            out.write_all(b"\n")?;
+            continue;
+        }
+        // `loop panel`: the loop panel, instead of the state
+        if line.trim() == "loop panel" {
+            out.write_all(ctl.loop_panel().as_bytes())?;
             out.write_all(b"\n")?;
             continue;
         }

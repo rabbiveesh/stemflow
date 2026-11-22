@@ -102,13 +102,37 @@ impl Control {
         }
     }
 
-    /// A `loop ...` command (`loopdeck::Deck::command`).
+    /// A `loop ...` command (`loopdeck::Command`). The meter and feel are the
+    /// beat options (the click's too): set here, and the loop's bars follow.
     pub fn loop_command(&self, cmd: &str) -> anyhow::Result<()> {
+        use crate::loopdeck::Command;
         let d = self
             .deck
             .get()
             .ok_or_else(|| anyhow::anyhow!("no looping: no beat model"))?;
-        d.command(cmd, self.beat_settings())
+        match cmd.parse::<Command>()? {
+            Command::Meter(m) => self.set_beat_options(self.click(), m, self.feel()),
+            Command::Feel(f) => self.set_beat_options(self.click(), self.meter(), f),
+            _ => d.command(cmd, self.beat_settings())?,
+        }
+        self.touch();
+        Ok(())
+    }
+
+    /// The loop panel (`loopdeck::panel`) as JSON, or `null` without looping.
+    pub fn loop_panel(&self) -> String {
+        self.deck.get().map_or_else(
+            || "null".into(),
+            |d| {
+                crate::loopdeck::panel::build(
+                    &d.state(),
+                    self.meter(),
+                    self.feel(),
+                    &crate::bookmarks::all(),
+                )
+                .json()
+            },
+        )
     }
 
     /// The loop for drawing (`loopdeck::Deck::view_json`), or `null`.
@@ -174,9 +198,7 @@ impl Control {
         // A loop playing takes the new bars too.
         if old != (self.meter(), self.feel()) {
             if let Some(d) = self.deck.get() {
-                if d.looper.playing() {
-                    let _ = d.command("meter", self.beat_settings());
-                }
+                d.redecode(self.beat_settings());
             }
         }
     }
@@ -685,6 +707,12 @@ impl Service {
     /// The saved loops as a JSON array (`bookmarks::list_json`).
     fn loop_bookmarks(&self) -> String {
         crate::bookmarks::list_json()
+    }
+
+    /// The loop panel, as JSON (`loopdeck::panel`): what the extension shows. It
+    /// changes when LoopState does.
+    fn loop_panel(&self) -> String {
+        self.ctl.loop_panel()
     }
 
     /// Move the one-slider balance by `step` (e.g. ±0.1); returns the new balance.

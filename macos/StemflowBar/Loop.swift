@@ -1,6 +1,5 @@
-// The Loop section of the menu: the Android app's Loops screen (LoopView.kt,
-// MainActivity.loopsPage) over the control socket's `loop …` requests
-// (src/loopdeck.rs).
+// The Loop section of the menu: the loop panel stemflow declares (`loop panel`,
+// src/loopdeck/panel.rs), drawn; and the loop view, drawn from `loop view`.
 
 import AppKit
 
@@ -187,167 +186,283 @@ func smallLabel(_ s: String, size: CGFloat = 10, color: NSColor = .secondaryLabe
     return l
 }
 
+// MARK: - The panel
+
+/// The loop panel as stemflow declares it (`loop panel`, src/loopdeck/panel.rs):
+/// rows of items, each of a kind in PanelKind (generated from the Rust). Each kind
+/// is drawn here once; the switch in `makeWidget` is exhaustive, so a kind added in
+/// Rust doesn't build until it's drawn. The rows' texts, states and the lines the
+/// controls send all come from stemflow.
+class Widget {
+    /// A view in the row's stack, or nil for an item that is a menu item itself.
+    var view: NSView? { nil }
+    var menuItem: NSMenuItem? { nil }
+    func update(_ j: [String: Any]) {}
+}
+
+func str(_ j: [String: Any], _ k: String) -> String { j[k] as? String ?? "" }
+func lines(_ j: [String: Any], _ k: String) -> [String] { j[k] as? [String] ?? [] }
+
+func makeWidget(_ kind: PanelKind, _ sec: LoopSection) -> Widget {
+    switch kind {
+    case .text: return TextWidget()
+    case .button: return ButtonWidget(sec)
+    case .switch: return SwitchWidget(sec)
+    case .choice: return ChoiceWidget(sec)
+    case .nudge: return NudgeWidget(sec)
+    case .slider: return SliderWidget(sec)
+    case .loopView: return LoopViewWidget(sec)
+    case .bookmarks: return BookmarksWidget(sec)
+    }
+}
+
+/// A line of text: a menu item of its own when alone in its row.
+final class TextWidget: Widget {
+    let item = textItem()
+    let label = smallLabel("", size: 11, color: .labelColor)
+    override var view: NSView? { label }
+    override var menuItem: NSMenuItem? { item }
+    override func update(_ j: [String: Any]) {
+        let t = str(j, "text")
+        let style = str(j, "style")
+        let font: NSFont = style == "title" ? .boldSystemFont(ofSize: NSFont.systemFontSize)
+            : style == "small" ? .systemFont(ofSize: NSFont.smallSystemFontSize) : .menuFont(ofSize: 0)
+        item.attributedTitle = NSAttributedString(string: t, attributes: [.font: font])
+        label.stringValue = t
+        label.font = font
+    }
+}
+
+final class ButtonWidget: Widget {
+    let b: NSButton
+    var j: [String: Any] = [:]
+    init(_ sec: LoopSection) {
+        b = smallButton("") {}
+        super.init()
+        (b as? ClosureButton)?.handler = { [unowned self, unowned sec] in
+            sec.run(lines(j, "send"), ask: j["ask"] as? [String: Any])
+        }
+    }
+    override var view: NSView? { b }
+    override func update(_ j: [String: Any]) {
+        self.j = j
+        b.title = str(j, "label")
+        b.isEnabled = j["enabled"] as? Bool ?? true
+        if let on = j["on"] as? Bool {
+            b.setButtonType(.pushOnPushOff)
+            b.state = on ? .on : .off
+        }
+    }
+}
+
+/// A menu item with a checkmark.
+final class SwitchWidget: Widget {
+    let item = ClosureItem("") {}
+    var j: [String: Any] = [:]
+    init(_ sec: LoopSection) {
+        super.init()
+        item.handler = { [unowned self, unowned sec] in sec.run(lines(j, "send")) }
+    }
+    override var menuItem: NSMenuItem? { item }
+    override func update(_ j: [String: Any]) {
+        self.j = j
+        item.title = str(j, "label")
+        item.state = (j["on"] as? Bool ?? false) ? .on : .off
+        item.toolTip = str(j, "tip")
+    }
+}
+
+final class ChoiceWidget: Widget {
+    var seg: ClosureSegments!
+    var options: [[String: Any]] = []
+    init(_ sec: LoopSection) {
+        super.init()
+        seg = ClosureSegments([]) { [unowned self, unowned sec] i in
+            if i >= 0 && i < options.count { sec.run(lines(options[i], "send")) }
+        }
+    }
+    override var view: NSView? { seg }
+    override func update(_ j: [String: Any]) {
+        options = j["options"] as? [[String: Any]] ?? []
+        if seg.segmentCount != options.count { seg.segmentCount = options.count }
+        for (i, o) in options.enumerated() { seg.setLabel(str(o, "label"), forSegment: i) }
+        seg.selectedSegment = j["selected"] as? Int ?? -1
+    }
+}
+
+/// LABEL, ◀ ▶, a note: the start, the whole loop or the end, earlier or later.
+final class NudgeWidget: Widget {
+    let col = NSStackView()
+    let label = smallLabel("", size: 9, color: .labelColor)
+    let note = smallLabel("", size: 9)
+    var j: [String: Any] = [:]
+    init(_ sec: LoopSection) {
+        super.init()
+        let l = smallButton("◀") { [unowned self, unowned sec] in sec.run(lines(j, "back")) }
+        let r = smallButton("▶") { [unowned self, unowned sec] in sec.run(lines(j, "forward")) }
+        let buttons = NSStackView(views: [l, r])
+        buttons.distribution = .fillEqually
+        buttons.spacing = 4
+        for v in [label, buttons, note] { col.addArrangedSubview(v) }
+        col.orientation = .vertical
+        col.spacing = 2
+        col.alignment = .centerX
+        buttons.widthAnchor.constraint(equalTo: col.widthAnchor).isActive = true
+    }
+    override var view: NSView? { col }
+    override func update(_ j: [String: Any]) {
+        self.j = j
+        label.stringValue = str(j, "label")
+        note.stringValue = str(j, "note")
+    }
+}
+
+final class SliderWidget: Widget {
+    var row: SliderRow!
+    var j: [String: Any] = [:]
+    init(_ sec: LoopSection) {
+        super.init()
+        row = SliderRow("") { [unowned self, unowned sec] pos in
+            let d = { (k: String) in self.j[k] as? Double ?? 0 }
+            let (lo, hi, step) = (d("min"), d("max"), max(d("step"), 1e-6))
+            var v = ((lo + pos * (hi - lo)) / step).rounded() * step
+            if let snap = j["snap"] as? Double, abs(v - snap) < 2 * step { v = snap }
+            let text = step >= 1 ? String(Int(v.rounded())) : String(format: "%.2f", v)
+            sec.run([str(j, "send").replacingOccurrences(of: "{v}", with: text)])
+        }
+    }
+    override var view: NSView? { row }
+    override func update(_ j: [String: Any]) {
+        self.j = j
+        let d = { (k: String) in j[k] as? Double ?? 0 }
+        row.label.stringValue = str(j, "label")
+        let span = d("max") - d("min")
+        row.set(span > 0 ? (d("value") - d("min")) / span : 0, str(j, "text"))
+    }
+}
+
+/// The loop drawn (from `loop view`, polled while the menu shows it).
+final class LoopViewWidget: Widget {
+    var j: [String: Any] = [:]
+    let box: NSView
+    init(_ sec: LoopSection) {
+        box = padded(sec.view, height: 102)
+        super.init()
+        sec.view.onEdges = { [unowned self, unowned sec] a, b in
+            sec.run([str(j, "edges").replacingOccurrences(of: "{a}", with: "\(a)")
+                .replacingOccurrences(of: "{b}", with: "\(b)")])
+        }
+        sec.view.onBarOne = { [unowned self, unowned sec] i in
+            sec.run([str(j, "bar1").replacingOccurrences(of: "{beat}", with: "\(i)")])
+        }
+    }
+    override var view: NSView? { box }
+    override func update(_ j: [String: Any]) { self.j = j }
+}
+
+/// The saved loops: a submenu with a search field, by recording; each plays,
+/// renames or deletes.
+final class BookmarksWidget: Widget {
+    let item = NSMenuItem(title: "Bookmarks", action: nil, keyEquivalent: "")
+    let search = NSSearchField(frame: NSRect(x: 0, y: 0, width: 260, height: 22))
+    var j: [String: Any] = [:]
+    unowned let sec: LoopSection
+    init(_ sec: LoopSection) {
+        self.sec = sec
+        super.init()
+        item.submenu = NSMenu()
+        search.sendsSearchStringImmediately = true
+        search.target = self
+        search.action = #selector(searched)
+        let sf = NSView(frame: NSRect(x: 0, y: 0, width: 290, height: 30))
+        search.frame = NSRect(x: 14, y: 4, width: 262, height: 22)
+        sf.addSubview(search)
+        item.submenu!.addItem(viewItem(sf))
+    }
+    override var menuItem: NSMenuItem? { item }
+    @objc func searched() { fill() }
+    override func update(_ j: [String: Any]) {
+        // only when it changed: keeps the search field's focus while typing
+        if NSDictionary(dictionary: j).isEqual(to: self.j) { return }
+        self.j = j
+        fill()
+    }
+    func fill() {
+        let m = item.submenu!
+        while m.items.count > 1 { m.removeItem(at: m.items.count - 1) }
+        item.title = str(j, "title")
+        search.placeholderString = str(j, "search_hint")
+        let q = search.stringValue.lowercased()
+        let groups = j["groups"] as? [[String: Any]] ?? []
+        var any = false
+        for g in groups {
+            let marks = (g["marks"] as? [[String: Any]] ?? []).filter { q.isEmpty || str($0, "search").contains(q) }
+            if marks.isEmpty { continue }
+            any = true
+            m.addItem(.separator())
+            let h = textItem()
+            h.title = str(g, "title")
+            m.addItem(h)
+            for b in marks {
+                let i = NSMenuItem(title: str(b, "label"), action: nil, keyEquivalent: "")
+                let sub = NSMenu()
+                sub.addItem(ClosureItem("Play it") { [unowned self] in sec.run(lines(b, "play")) })
+                sub.addItem(ClosureItem("Rename…") { [unowned self] in
+                    sec.run(lines(b, "rename"), ask: b["rename_ask"] as? [String: Any])
+                })
+                sub.addItem(ClosureItem("Delete") { [unowned self] in sec.run(lines(b, "delete")) })
+                i.submenu = sub
+                m.addItem(i)
+            }
+        }
+        if !any {
+            let t = textItem()
+            t.title = groups.isEmpty ? str(j, "empty") : str(j, "no_match")
+            m.addItem(t)
+        }
+    }
+}
+
 final class LoopSection: NSObject {
     let send: (String) -> Void
     let sep = NSMenuItem.separator()
-    let info = textItem()
-    let hint = textItem()
-    var grabs: [Int: NSButton] = [:]
-    var live: NSButton!
-    var grabItem: NSMenuItem!
     let view = LoopView(frame: NSRect(x: 0, y: 0, width: 332, height: 96))
-    var viewItem_: NSMenuItem!
-    var units: ClosureSegments!
-    var unitsItem: NSMenuItem!
-    var editItem: NSMenuItem!
-    var meters: ClosureSegments!, feels: ClosureSegments!
-    var beatItem: NSMenuItem!
-    var speed: SliderRow!, pitch: SliderRow!
-    var speedItem: NSMenuItem!, pitchItem: NSMenuItem!
-    var keep: NSButton!, click: NSButton!
-    var chipsItem: NSMenuItem!
-    var actionsItem: NSMenuItem!
-    // the player: what plays, play/pause, save; bookmarks
-    let nowItem = textItem()
-    var playPause: NSButton!, save: NSButton!
-    var stripItem: NSMenuItem!
-    let bookmarksItem = NSMenuItem(title: "Bookmarks", action: nil, keyEquivalent: "")
-    let stemsOnly = ClosureItem("Stems only when looping") {}
-    var marks: [[String: Any]] = []
-    var search = ""
-    let searchField = NSSearchField(frame: NSRect(x: 0, y: 0, width: 260, height: 22))
-    /// What the edits step by: 0 a beat, 1 a bar, 2 a phrase (the loop's length).
-    var unit = 0
-    var loop: [String: Any]? // the state's "loop"
-    var meterValues = [0, 2, 3, 4, 5, 6, 7]
-    var feelValues = [1.0, 0.5, 2.0]
+    weak var menu: NSMenu?
+    /// The rows as built: their menu items and widgets, and the shape they were
+    /// built for (ids and kinds).
+    var rows: [(item: NSMenuItem, widgets: [Widget])] = []
+    var shape = ""
+    var hasLoop = false
 
-    var items: [NSMenuItem] {
-        [sep, nowItem, stripItem, bookmarksItem, info, hint, grabItem, viewItem_, unitsItem, editItem, beatItem,
-         speedItem, pitchItem, chipsItem, actionsItem, stemsOnly]
-    }
+    var items: [NSMenuItem] { [sep] }
 
     init(send: @escaping (String) -> Void) {
         self.send = send
         super.init()
-        let grabRow = NSStackView()
-        grabRow.distribution = .fillEqually
-        grabRow.spacing = 6
-        for n in [1, 2, 4, 8] {
-            let b = smallButton(n == 1 ? "1 bar" : "\(n) bars") { send("loop \(n)") }
-            b.setButtonType(.pushOnPushOff)
-            grabs[n] = b
-            grabRow.addArrangedSubview(b)
-        }
-        live = smallButton("Live") { send("loop live") }
-        grabRow.addArrangedSubview(live)
-        grabItem = viewItem(padded(grabRow, height: 30))
-
-        view.onEdges = { a, b in send("loop edges \(a) \(b)") }
-        view.onBarOne = { i in send("loop bar1 \(i)") }
-        viewItem_ = viewItem(padded(view, height: 102))
-
-        units = ClosureSegments(["Beat", "Bar", "Phrase"]) { [unowned self] i in unit = i }
-        units.selectedSegment = 0
-        unitsItem = viewItem(padded(units, height: 28))
-
-        // Start, the whole loop, or the end: earlier or later by the unit.
-        let pair = { (name: String, note: String, da: Int, db: Int) -> NSView in
-            let l = smallButton("◀") { self.edit(-da, -db) }
-            let r = smallButton("▶") { self.edit(da, db) }
-            let buttons = NSStackView(views: [l, r])
-            buttons.distribution = .fillEqually
-            buttons.spacing = 4
-            let col = NSStackView(views: [smallLabel(name.uppercased(), size: 9, color: .labelColor), buttons,
-                                          smallLabel(note, size: 9)])
-            col.orientation = .vertical
-            col.spacing = 2
-            col.alignment = .centerX
-            buttons.widthAnchor.constraint(equalTo: col.widthAnchor).isActive = true
-            return col
-        }
-        let edits = NSStackView(views: [pair("Start", "◀ longer · shorter ▶", 1, 0),
-                                        pair("Move", "same length", 1, 1),
-                                        pair("End", "◀ shorter · longer ▶", 0, 1)])
-        edits.distribution = .fillEqually
-        edits.spacing = 10
-        editItem = viewItem(padded(edits, height: 62))
-
-        // Meter and feel re-decode the loop's bars (and the click's).
-        meters = ClosureSegments(["Auto", "2", "3", "4", "5", "6", "7"]) { [unowned self] i in
-            send("set meter \(meterValues[i])")
-        }
-        feels = ClosureSegments(["As heard", "½×", "2×"]) { [unowned self] i in
-            send("set feel \(feelValues[i])")
-        }
-        let beatRow = NSStackView(views: [meters, feels])
-        beatRow.spacing = 8
-        meters.widthAnchor.constraint(equalTo: feels.widthAnchor, multiplier: 1.4).isActive = true
-        beatItem = viewItem(padded(beatRow, height: 28))
-
-        // Practice speed (40-120%) and transposition (±12 semitones).
-        speed = SliderRow("Speed") { v in
-            var x = 0.4 + 0.8 * v
-            if abs(x - 1) < 0.02 { x = 1 }
-            send(String(format: "loop speed %.2f", x))
-        }
-        pitch = SliderRow("Pitch") { v in send("loop pitch \(Int((v * 24 - 12).rounded()))") }
-        (speedItem, pitchItem) = (viewItem(speed), viewItem(pitch))
-
-        keep = smallButton("Keep pitch") { [unowned self] in
-            send("loop keep_pitch \((loop?["keep_pitch"] as? Bool ?? true) ? "off" : "on")")
-        }
-        keep.setButtonType(.pushOnPushOff)
-        click = smallButton("Click") { [unowned self] in
-            send("loop click \((loop?["click"] as? Bool ?? false) ? "off" : "on")")
-        }
-        click.setButtonType(.pushOnPushOff)
-        let chips = NSStackView(views: [
-            smallButton("75%") { send("loop speed 0.75") },
-            smallButton("50%") { send("loop speed 0.5") },
-            keep, click,
-            smallButton("Reset") { send("loop speed 1"); send("loop pitch 0") },
-        ])
-        chips.spacing = 4
-        chipsItem = viewItem(padded(chips, height: 30))
-        // From the top; Repair plays the loop's part of the song again and lays the
-        // loop on that (for a glitch in it).
-        let actions = NSStackView(views: [smallButton("From the top") { send("loop top") },
-                                          smallButton("Repair") { send("loop repair") }])
-        actions.distribution = .fillEqually
-        actions.spacing = 6
-        actionsItem = viewItem(padded(actions, height: 30))
-
-        // The player: play/pause it, and save the loop as a bookmark.
-        playPause = smallButton("Pause") { send("loop playpause") }
-        save = smallButton("Save…") { [unowned self] in saveLoop() }
-        let strip = NSStackView(views: [playPause, save])
-        strip.distribution = .fillEqually
-        strip.spacing = 6
-        stripItem = viewItem(padded(strip, height: 30))
-        bookmarksItem.submenu = NSMenu()
-        searchField.placeholderString = "Search songs and loops"
-        searchField.sendsSearchStringImmediately = true
-        searchField.target = self
-        searchField.action = #selector(searched)
-        stemsOnly.handler = { [unowned self] in
-            send("loop stems_only \((loop?["stems_only"] as? Bool ?? false) ? "off" : "on")")
-        }
-        stemsOnly.toolTip = "Hear the plain mix and save power; a loop is separated when you make it"
     }
 
-    @objc func searched() {
-        search = searchField.stringValue
-        fillBookmarks(marks)
+    /// Send `lines`, asking for a name first (`{name}` in them) if `ask` says so.
+    func run(_ lines: [String], ask a: [String: Any]? = nil) {
+        guard let a = a else {
+            for l in lines { send(l) }
+            Controller.shared.loadPanel()
+            return
+        }
+        // after the menu has closed
+        DispatchQueue.main.async { [self] in
+            guard let name = ask(str(a, "title"), str(a, "text"), value: str(a, "value"), ok: str(a, "ok")) else { return }
+            for l in lines { send(l.replacingOccurrences(of: "{name}", with: name)) }
+            Controller.shared.loadPanel()
+        }
     }
 
     /// A name from the person (nil: cancelled).
-    func ask(_ title: String, _ text: String, value: String) -> String? {
+    func ask(_ title: String, _ text: String, value: String, ok: String) -> String? {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
         a.messageText = title
         a.informativeText = text
-        a.addButton(withTitle: "Save")
+        a.addButton(withTitle: ok.isEmpty ? "OK" : ok)
         a.addButton(withTitle: "Cancel")
         let f = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
         f.stringValue = value
@@ -358,154 +473,48 @@ final class LoopSection: NSObject {
         return name.isEmpty ? nil : name
     }
 
-    func saveLoop() {
-        let title = loop?["title"] as? String ?? ""
-        let from = loop?["loop_from"] as? Int ?? -1
-        let guess = title.isEmpty ? "Loop" : from >= 0 ? "\(title) \(mmss(from))" : title
-        // after the menu has closed
-        DispatchQueue.main.async { [self] in
-            guard let name = ask("Save this loop", "Name it to come back to it later.", value: guess) else { return }
-            send("loop save \(name)")
-            Controller.shared.loadBookmarks()
+    /// Show the panel (nil: no looping): built once for its shape, then updated.
+    func render(_ panel: [String: Any]?) {
+        let rowsJ = panel?["rows"] as? [[String: Any]] ?? []
+        sep.isHidden = rowsJ.isEmpty
+        let sig = rowsJ.map { r in
+            str(r, "id") + ":" + (r["items"] as? [[String: Any]] ?? []).map { str($0, "kind") }.joined(separator: ",")
+        }.joined(separator: "|")
+        if sig != shape { build(rowsJ, sig) }
+        hasLoop = false
+        for (r, j) in zip(rows, rowsJ) {
+            let hidden = j["hidden"] as? Bool ?? false
+            r.item.isHidden = hidden
+            if str(j, "id") == "view" { hasLoop = !hidden }
+            for (w, i) in zip(r.widgets, j["items"] as? [[String: Any]] ?? []) { w.update(i) }
         }
+        if !hasLoop { view.pic = nil }
     }
 
-    /// The saved loops, by recording; each one recalls, renames or deletes.
-    func fillBookmarks(_ list: [[String: Any]]) {
-        marks = list
-        let m = bookmarksItem.submenu!
-        // keep the search field (and its focus) while typing
-        while m.items.count > 1 { m.removeItem(at: m.items.count - 1) }
-        if m.items.isEmpty {
-            let sf = NSView(frame: NSRect(x: 0, y: 0, width: 290, height: 30))
-            searchField.frame = NSRect(x: 14, y: 4, width: 262, height: 22)
-            sf.addSubview(searchField)
-            m.addItem(viewItem(sf))
-        }
-        let q = search.lowercased()
-        let shown = list.filter { b in
-            q.isEmpty || ["name", "title", "artist"].contains { (b[$0] as? String ?? "").lowercased().contains(q) }
-        }
-        bookmarksItem.title = list.isEmpty ? "Bookmarks" : "Bookmarks (\(list.count))"
-        if shown.isEmpty {
-            let t = textItem()
-            t.title = list.isEmpty ? "Save a loop (Save…) to come back to it later" : "Nothing matches"
-            m.addItem(t)
-            return
-        }
-        // by recording, the newest saved first
-        var order: [String] = []
-        var groups: [String: [[String: Any]]] = [:]
-        for b in shown.sorted(by: { ($0["created"] as? Int ?? 0) > ($1["created"] as? Int ?? 0) }) {
-            let key = "\(b["title"] as? String ?? "") — \(b["artist"] as? String ?? "")"
-            if groups[key] == nil { order.append(key) }
-            groups[key, default: []].append(b)
-        }
-        for key in order {
-            m.addItem(.separator())
-            let h = textItem()
-            h.title = key
-            m.addItem(h)
-            for b in groups[key]!.sorted(by: { ($0["start"] as? Int ?? 0) < ($1["start"] as? Int ?? 0) }) {
-                let created = b["created"] as? Int ?? 0
-                let name = b["name"] as? String ?? "Loop"
-                let bars = b["bars"] as? Int ?? 0
-                let i = NSMenuItem(title: "\(name)  ·  \(bars) bar\(bars == 1 ? "" : "s") · \(mmss(b["start"] as? Int ?? 0))",
-                                   action: nil, keyEquivalent: "")
-                let sub = NSMenu()
-                sub.addItem(ClosureItem("Play it") { [unowned self] in send("loop recall \(created)") })
-                sub.addItem(ClosureItem("Rename…") { [unowned self] in
-                    DispatchQueue.main.async { [self] in
-                        guard let n = ask("Rename the loop", "", value: name) else { return }
-                        send("loop rename \(created) \(n)")
-                        Controller.shared.loadBookmarks()
-                    }
-                })
-                sub.addItem(ClosureItem("Delete") { [unowned self] in
-                    send("loop delete \(created)")
-                    Controller.shared.loadBookmarks()
-                })
-                i.submenu = sub
-                m.addItem(i)
+    private func build(_ rowsJ: [[String: Any]], _ sig: String) {
+        guard let menu = menu ?? sep.menu else { return }
+        for r in rows { menu.removeItem(r.item) }
+        rows = []
+        shape = sig
+        var at = menu.index(of: sep) + 1
+        for j in rowsJ {
+            let ws: [Widget] = (j["items"] as? [[String: Any]] ?? []).map { i in
+                makeWidget(PanelKind(rawValue: str(i, "kind")) ?? .text, self)
             }
+            let item: NSMenuItem
+            if ws.count == 1, let mi = ws[0].menuItem {
+                item = mi
+            } else {
+                let stack = NSStackView(views: ws.compactMap { $0.view })
+                stack.distribution = .fillEqually
+                stack.spacing = 6
+                let tall = ws.contains { $0 is LoopViewWidget } ? 102.0 : ws.contains { $0 is NudgeWidget } ? 62.0 : 30.0
+                item = viewItem(ws.count == 1 && ws[0] is LoopViewWidget ? ws[0].view! : padded(stack, height: tall))
+            }
+            menu.insertItem(item, at: at)
+            at += 1
+            rows.append((item, ws))
         }
-    }
-
-    /// The step for an edit, in beats.
-    func step() -> Int {
-        let meter = loop?["meter"] as? Int ?? 4
-        let beats = loop?["beats"] as? Int ?? meter
-        return [1, max(meter, 1), max(beats, 1)][unit]
-    }
-
-    func edit(_ da: Int, _ db: Int) {
-        let u = step()
-        send("loop move \(da * u) \(db * u)")
-    }
-
-    var hasLoop: Bool { (loop?["playing"] as? Bool ?? false) }
-
-    /// From the state: `loop` is the state's "loop" (nil: no looping), `meter`/`feel`
-    /// the beat options.
-    func sync(_ l: [String: Any]?, meter: Int, feel: Double) {
-        loop = l
-        guard let l = l else {
-            for i in items { i.isHidden = true }
-            return
-        }
-        for i in items { i.isHidden = false }
-        let playing = l["playing"] as? Bool ?? false
-        let finding = l["finding"] as? Bool ?? false
-        let tail = l["tail"] as? Bool ?? false
-        let bars = l["bars"] as? Int ?? 0
-        let m = max(l["meter"] as? Int ?? 4, 1)
-        let beats = l["beats"] as? Int ?? 0
-        let status = l["status"] as? String ?? ""
-        for r in [viewItem_, unitsItem, editItem, chipsItem, actionsItem] { r!.isHidden = !playing }
-        // the player
-        let title = l["title"] as? String ?? "", artist = l["artist"] as? String ?? ""
-        let songPlaying = l["song_playing"] as? Bool ?? false
-        let from = l["loop_from"] as? Int ?? -1, to = l["loop_to"] as? Int ?? -1
-        if title.isEmpty {
-            nowItem.title = "The player doesn't say what's playing"
-        } else if playing && from >= 0 {
-            nowItem.title = "\(title) — \(artist) · looping \(mmss(from))–\(mmss(to))"
-        } else {
-            nowItem.title = "\(title) — \(artist) · \(mmss(l["song_ms"] as? Int ?? 0))\(songPlaying ? "" : " · paused")"
-        }
-        playPause.title = songPlaying ? "Pause" : "Play"
-        playPause.isEnabled = !title.isEmpty && !playing
-        save.isEnabled = playing
-        stemsOnly.state = (l["stems_only"] as? Bool ?? false) ? .on : .off
-        for (n, b) in grabs { b.state = playing && n == bars ? .on : .off }
-        live.isEnabled = playing || tail || finding
-        if playing {
-            let (whole, extra) = (beats / m, beats % m)
-            info.title = "Looping \(whole) bar\(whole == 1 ? "" : "s")"
-                + (extra > 0 ? " + \(extra) beat\(extra == 1 ? "" : "s")" : "") + " of \(m)/4"
-                + String(format: " · %.0f bpm · %.1f s", l["bpm"] as? Double ?? 0, l["length"] as? Double ?? 0)
-        } else if l["recalling"] as? Bool ?? false {
-            info.title = "Going back to a bookmark…"
-        } else if finding {
-            info.title = "Finding the bars…"
-        } else if tail {
-            info.title = "Catching up with the song"
-        } else {
-            info.title = "Loop the last…"
-        }
-        hint.title = !status.isEmpty && !finding ? status
-            : playing ? "Drag an end · right-click a beat for bar 1"
-            : finding ? "" : "Press a length to loop what you just heard"
-        hint.isHidden = hint.title.isEmpty
-        units.setLabel(beats > 0 && beats % m == 0 ? "\(beats / m)-bar phrase" : "Phrase", forSegment: 2)
-        meters.selectedSegment = meterValues.firstIndex(of: meter) ?? 0
-        feels.selectedSegment = feelValues.firstIndex(of: feel) ?? 0
-        let sp = l["speed"] as? Double ?? 1, st = l["semis"] as? Double ?? 0
-        speed.set((sp - 0.4) / 0.8, "\(Int((sp * 100).rounded()))%")
-        pitch.set((st + 12) / 24, st == 0 ? "0 st" : String(format: "%+d st", Int(st.rounded())))
-        keep.state = (l["keep_pitch"] as? Bool ?? true) ? .on : .off
-        click.state = (l["click"] as? Bool ?? false) ? .on : .off
-        if !playing { view.pic = nil }
     }
 }
 
