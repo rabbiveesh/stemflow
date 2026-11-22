@@ -41,4 +41,4 @@ if [[ "${1:-}" == --login ]]; then
   echo "added to login items"
 fi
 open "$app"
-echo "installed $app (the note icon in the menu bar)"
+echo "installed $app (the clef icon in the menu bar)"
