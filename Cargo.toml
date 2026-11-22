@@ -16,9 +16,9 @@ hound = "3"
 # releases by tools/fetch-ort.sh); ort's own CDN download is not used.
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
 realfft = "3"
-zbus = "5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
 libpulse-binding = "2"
 libpulse-simple-binding = "2"
 

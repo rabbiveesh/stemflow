@@ -82,6 +82,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --release
+      - name: Menu bar app compiles
+        run: swiftc -typecheck macos/StemflowBar/main.swift
       - uses: astral-sh/setup-uv@v10.3.3
       - name: Cache exported model + demucs weights
         id: model-cache

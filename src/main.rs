@@ -4,6 +4,7 @@ mod control;
 mod looper;
 mod model;
 mod models;
+mod socket;
 mod spec;
 mod stream;
 mod stretch;
@@ -146,8 +147,8 @@ enum Sep {
 
 #[derive(Args, Clone)]
 struct Opts {
-    /// Architecture (default bsrofo). Live, without --sep/--target/--model, the model
-    /// last picked in the menu is used.
+    /// Architecture (default bsrofo; demucs on macOS, where BS-RoFormer can't keep up).
+    /// Live, without --sep/--target/--model, the model last picked in the menu is used.
     #[arg(long, value_enum)]
     sep: Option<Sep>,
     /// Stem to isolate or remove (default bass). Anything but bass needs --sep bsrofo or
@@ -212,7 +213,11 @@ struct Opts {
 
 impl Opts {
     fn sep(&self) -> Sep {
-        self.sep.unwrap_or(Sep::Bsrofo)
+        self.sep.unwrap_or(if cfg!(target_os = "macos") {
+            Sep::Demucs
+        } else {
+            Sep::Bsrofo
+        })
     }
     fn target(&self) -> Target {
         self.target.unwrap_or(Target::Bass)
@@ -230,7 +235,9 @@ impl Opts {
 }
 
 fn default_device() -> Device {
-    if cfg!(feature = "cuda") {
+    if cfg!(target_os = "macos") {
+        Device::Coreml
+    } else if cfg!(feature = "cuda") {
         Device::Cuda
     } else {
         Device::Cpu
@@ -388,6 +395,7 @@ fn main() -> Result<()> {
                 st.hop as f64 / SAMPLE_RATE as f64,
             );
             // Off the bus is fine (e.g. no session bus over ssh): CLI flags still work.
+            #[cfg(target_os = "linux")]
             let _bus = control::serve(
                 ctl.clone(),
                 opts.models.clone(),
@@ -397,6 +405,19 @@ fn main() -> Result<()> {
             )
             .map_err(|e| eprintln!("stemflow: no D-Bus control ({e})"))
             .ok();
+            // The same controls on a Unix socket (the macOS menu bar app, scripts).
+            match socket::serve(
+                ctl.clone(),
+                socket::Info {
+                    models: opts.models.clone(),
+                    app: grab.clone(),
+                    latency: lat + slack as f64,
+                    hop,
+                },
+            ) {
+                Ok(p) => eprintln!("stemflow: control socket {}", p.display()),
+                Err(e) => eprintln!("stemflow: no control socket ({e:#})"),
+            }
             // Switching models from the menu: drop the running one (frees the GPU),
             // then load the new one with the same settings.
             let load =

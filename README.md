@@ -127,7 +127,37 @@ cargo build --release
   `stemflow live --sep demucs --device coreml`. BS-RoFormer takes 2.1 s per 3 s window
   on the CPU, too slow for live, and is slower still under Core ML (stemflow keeps it
   on the CPU).
-- There's no menu yet; the D-Bus control only exists where a session bus does.
+- On macOS, `live` defaults to `--sep demucs --device coreml`.
+
+### Menu bar app
+
+```bash
+cargo build --release
+macos/install.sh            # builds ~/Applications/Stemflow.app and opens it (--login: start at login)
+```
+
+The same menu as the GNOME extension: start/stop, the balance slider with a boost, or
+separate sliders, snap buttons, beat click with meter and feel, the stem and model
+pickers, and the stats line. It starts `stemflow live` itself (flags from
+`STEMFLOW_ARGS` in `~/.config/stemflow/env`, log in `~/Library/Logs/stemflow.log`), so
+the recording permission is asked for "Stemflow". Scrolling on the icon moves the mix.
+Hotkeys use ⌃⌥ where GNOME uses Super (⌘[ and ⌘] are Back and Forward in Mac apps):
+
+| key | |
+|---|---|
+| `⌃⌥[` / `⌃⌥]` | toward bass solo / toward play-along |
+| `⌃⌥\` | bass solo, or back to where you were |
+| `⌃⌥⇧\` | no bass (play-along), or back |
+| `⌃⌥B` | start / stop |
+
+### Control socket
+
+Every platform also serves the controls on a Unix socket, one request per line and
+the whole state back as JSON (`src/socket.rs` has the list):
+
+```bash
+echo "snap solo" | nc -U ~/Library/Application\ Support/stemflow/control.sock   # Linux: $XDG_RUNTIME_DIR/stemflow.sock
+```
 
 ## GNOME Shell extension (GNOME 42)
 
