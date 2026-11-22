@@ -197,9 +197,11 @@ pub fn live(
         loop {
             // Take whatever the worker has finished. Wait only when the live stream is
             // what plays and it's starved: a loop never waits for the separator (a
-            // model switch can hold it for many seconds).
+            // model switch can hold it for many seconds). While buffering, always take
+            // more: otherwise a first hop of more than two blocks but less than
+            // `refill` would spin here forever without playing.
             let avail = bass.len() / 2 - pos;
-            if avail < 2 * block {
+            if buffering || avail < 2 * block {
                 let next = if !looping && (buffering || avail < block) {
                     match rx_out.recv_timeout(std::time::Duration::from_millis(200)) {
                         Ok(st) => Some(st),
