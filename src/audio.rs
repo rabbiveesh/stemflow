@@ -78,12 +78,21 @@ fn f32_to_bytes(x: &[f32]) -> Vec<u8> {
 
 pub type Live = Streamer<Box<dyn Separator + Send>>;
 
+/// Where live mode's input comes from.
+pub enum Source {
+    /// Move this app's streams (application name substring) into our null sink.
+    Grab(String),
+    /// Be a Spotify Connect speaker and take the audio straight from librespot.
+    #[cfg(feature = "connect")]
+    Connect(crate::connect::Opts),
+}
+
 /// `load` builds the streamer for a model id when the menu switches models.
 pub fn live(
     st: Live,
     ctl: Arc<Control>,
     beats: Option<Arc<crate::beats::Tracker>>,
-    grab: &str,
+    source: Source,
     output: Option<String>,
     slack: f32,
     load: impl Fn(&str) -> Result<(Live, &'static str, Option<&'static str>)>,
@@ -96,7 +105,15 @@ pub fn live(
     if output == SINK {
         bail!("default sink is `{SINK}` itself; pass --output <real sink> (see `pactl list short sinks`)");
     }
-    let module = ensure_sink()?;
+    let grab = match &source {
+        Source::Grab(g) => Some(g.clone()),
+        #[cfg(feature = "connect")]
+        Source::Connect(_) => None,
+    };
+    let module = match grab {
+        Some(_) => ensure_sink()?,
+        None => None,
+    };
     let running = Arc::new(AtomicBool::new(true));
     {
         let (r, module) = (running.clone(), module.clone());
@@ -117,7 +134,9 @@ pub fn live(
         rate: SAMPLE_RATE,
     };
     let frame = 8usize; // bytes per stereo f32 frame
-    let rec = Simple::new(
+    let rec = match grab {
+        None => None,
+        Some(_) => Some(Simple::new(
         None,
         "stemflow",
         Direction::Record,
@@ -133,7 +152,8 @@ pub fn live(
             fragsize: (SAMPLE_RATE as usize / 50 * frame) as u32, // 20 ms
         }),
     )
-    .map_err(|e| anyhow::anyhow!("opening capture: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("opening capture: {e}"))?),
+    };
     let hop = st.as_ref().unwrap().hop;
     // Keep the device buffer small and the jitter buffer here instead, so the mix
     // levels (applied as samples leave for the device) change within ~0.1 s.
@@ -157,25 +177,33 @@ pub fn live(
     )
     .map_err(|e| anyhow::anyhow!("opening playback on {output}: {e}"))?;
 
-    let grabbed = find_streams(grab)?;
-    for id in &grabbed {
-        pactl(&["move-sink-input", id, SINK])?;
-    }
-    eprintln!(
-        "stemflow: {} `{grab}` stream(s) -> {SINK} -> {} -> {output}; latency ≈ {:.1}s (Ctrl-C to stop)",
-        grabbed.len(),
-        ctl.target(),
-        (st.as_ref().unwrap().latency() as f32 / SAMPLE_RATE as f32) + slack
-    );
-    if grabbed.is_empty() {
-        eprintln!("  (no `{grab}` stream yet; start playback, or move any app to \"stemflow\" in pavucontrol)");
+    let latency = (st.as_ref().unwrap().latency() as f32 / SAMPLE_RATE as f32) + slack;
+    if let Some(grab) = &grab {
+        let grabbed = find_streams(grab)?;
+        for id in &grabbed {
+            pactl(&["move-sink-input", id, SINK])?;
+        }
+        eprintln!(
+            "stemflow: {} `{grab}` stream(s) -> {SINK} -> {} -> {output}; latency ≈ {latency:.1}s (Ctrl-C to stop)",
+            grabbed.len(),
+            ctl.target(),
+        );
+        if grabbed.is_empty() {
+            eprintln!("  (no `{grab}` stream yet; start playback, or move any app to \"stemflow\" in pavucontrol)");
+        }
+    } else {
+        eprintln!(
+            "stemflow: Spotify Connect -> {} -> {output}; latency ≈ {latency:.1}s (Ctrl-C to stop)",
+            ctl.target(),
+        );
     }
 
     // capture -> worker -> playback, each on its own thread.
     let (tx_in, rx_in) = mpsc::channel::<Vec<f32>>();
     let (tx_out, rx_out) = mpsc::channel::<Stems>();
     let r = running.clone();
-    std::thread::spawn(move || {
+    match (rec, source) {
+        (Some(rec), _) => drop(std::thread::spawn(move || {
         let mut buf = vec![0u8; SAMPLE_RATE as usize / 50 * frame];
         while r.load(Ordering::Relaxed) {
             if rec.read(&mut buf).is_err() {
@@ -187,7 +215,11 @@ pub fn live(
                 break;
             }
         }
-    });
+    })),
+        #[cfg(feature = "connect")]
+        (None, Source::Connect(o)) => crate::connect::spawn(o, tx_in, r)?,
+        (None, _) => unreachable!("grabbing always opens the capture"),
+    }
     // The output trails the input by the separator's delay; the player maps what it
     // plays onto the tracker's timeline (input frames) with it.
     let delay = Arc::new(std::sync::atomic::AtomicUsize::new(
@@ -330,7 +362,7 @@ pub fn live(
             }
         }
         // Pick up streams the app opens later (Spotify reopens on device changes).
-        if last_grab.elapsed().as_secs() >= 2 {
+        if let Some(grab) = grab.as_deref().filter(|_| last_grab.elapsed().as_secs() >= 2) {
             last_grab = Instant::now();
             if let Ok(ids) = find_streams(grab) {
                 for id in ids {

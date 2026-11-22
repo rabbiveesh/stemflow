@@ -1,6 +1,8 @@
 mod audio;
 mod beats;
 mod control;
+#[cfg(feature = "connect")]
+mod connect;
 mod looper;
 mod model;
 mod models;
@@ -38,6 +40,20 @@ enum Cmd {
         /// Extra playback buffer in seconds to absorb compute jitter.
         #[arg(long, default_value_t = 0.3)]
         slack: f32,
+        /// Be a Spotify Connect speaker instead of grabbing an app: pick it under
+        /// Devices in any Spotify app (Premium). Ignores --grab.
+        #[cfg(feature = "connect")]
+        #[arg(long)]
+        connect: bool,
+        /// With --connect: the name in Spotify's device list.
+        #[cfg(feature = "connect")]
+        #[arg(long, default_value = "stemflow")]
+        connect_name: String,
+        /// With --connect: log in through the browser now (for when the Spotify app
+        /// isn't on this network). The login is remembered.
+        #[cfg(feature = "connect")]
+        #[arg(long)]
+        spotify_login: bool,
     },
     /// Run the streaming pipeline over a WAV file (44.1 kHz) and write the result.
     File {
@@ -338,7 +354,22 @@ fn main() -> Result<()> {
             grab,
             output,
             slack,
+            #[cfg(feature = "connect")]
+            connect,
+            #[cfg(feature = "connect")]
+            connect_name,
+            #[cfg(feature = "connect")]
+            spotify_login,
         } => {
+            #[allow(unused_mut)]
+            let mut source = audio::Source::Grab(grab.clone());
+            #[cfg(feature = "connect")]
+            if connect || spotify_login {
+                source = audio::Source::Connect(connect::Opts {
+                    name: connect_name,
+                    login: spotify_login,
+                });
+            }
             let m = live_model(&opts);
             let st = match &m {
                 Some(m) => wrap(&opts, load_model(&opts, m)?)?,
@@ -392,7 +423,7 @@ fn main() -> Result<()> {
                         .with_context(|| format!("no model `{id}`"))?;
                     Ok((wrap(&opts, load_model(&opts, &m)?)?, m.target, m.second))
                 };
-            audio::live(st, ctl, tracker, &grab, output, slack, load)
+            audio::live(st, ctl, tracker, source, output, slack, load)
         }
         Cmd::Beats { opts, input, meter } => {
             let r = hound::WavReader::open(&input)?;
