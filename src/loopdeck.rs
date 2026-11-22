@@ -201,6 +201,8 @@ impl Deck {
         std::thread::spawn(move || {
             let mut shown: Option<(String, bool)> = None;
             let mut was_playing = false;
+            // polls in a row the player has played while we had it paused
+            let mut played = 0;
             loop {
                 std::thread::sleep(every);
                 let n = me.source.now();
@@ -214,9 +216,36 @@ impl Deck {
                             if s.gap_to > s.gap_from {
                                 me.looper.mark_gap(s.gap_from, s.gap_to);
                             }
+                            // Another song, or a seek in the player: what's buffered
+                            // after the loop isn't what plays now.
+                            let theirs =
+                                s.why.starts_with("next song") || s.why.starts_with("song at");
+                            if theirs && me.looper.tail_playing() {
+                                eprintln!("loop: the player moved on; straight to live");
+                                me.looper.stop();
+                                (me.notify)();
+                            }
+                        }
+                        // We paused it for the loop and someone else played it: they
+                        // want to hear the player, not the loop. (Twice in a row: the
+                        // poll just after our pause can still say playing.)
+                        played = if me.paused.load(Ordering::Relaxed) {
+                            played + 1
+                        } else {
+                            0
+                        };
+                        if played >= 2
+                            && me.paused.swap(false, Ordering::Relaxed)
+                            && me.looper.playing()
+                        {
+                            eprintln!("loop: the player was played; back to live");
+                            me.phrase.fetch_add(1, Ordering::Relaxed);
+                            me.looper.stop();
+                            me.say("");
                         }
                     }
                     Some(n) if !n.playing && was_playing => {
+                        played = 0;
                         me.songs.lock().unwrap().cut("paused", None);
                     }
                     _ => {}
@@ -243,6 +272,7 @@ impl Deck {
             .cut(&format!("seek to {to} ms ({why})"), Some(to));
         *self.stream_since.lock().unwrap() = Some(Instant::now());
         self.stream_from_ms.store(to, Ordering::Relaxed);
+        self.paused.store(false, Ordering::Relaxed); // we play it: not someone else
         self.source.seek(to);
         self.source.play();
     }
@@ -904,6 +934,9 @@ impl Deck {
             "playpause" => {
                 if self.source.now().is_some_and(|n| n.playing) {
                     self.source.pause();
+                } else if self.looper.playing() && self.paused.load(Ordering::Relaxed) {
+                    // the song from where the loop is, as Live does
+                    self.live();
                 } else {
                     self.source.play();
                 }
