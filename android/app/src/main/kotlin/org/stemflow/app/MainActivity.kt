@@ -22,7 +22,6 @@ import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.util.Log
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -130,9 +129,12 @@ class MainActivity : Activity() {
     private lateinit var npLine: TextView
     private lateinit var npSave: Button
     private lateinit var npLive: Button
+    private lateinit var npPause: Button
     private lateinit var npLoop: Button
     private var songCheck = 0L
     private var song: NowPlaying.Song? = null
+    /** The player's session says it's playing; null when we can't read it. */
+    private var sourcePlaying: Boolean? = null
     private var songMs: Long? = null
 
     private val tick = object : Runnable {
@@ -285,6 +287,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Log.init(this)
         Control.load(this)
         Control.loadBeats(this)
         tab = getPreferences(Context.MODE_PRIVATE).getInt("tab", 1)
@@ -561,6 +564,12 @@ class MainActivity : Activity() {
         npLine = label("", 12f, muted).apply { isSingleLine = true; ellipsize = android.text.TextUtils.TruncateAt.END }
         npSave = button("Save", chip = true, weight = 0f) { saveLoop() }
         npLive = button("Live", primary = true, chip = true, weight = 0f) { CaptureService.goLive(this) }
+        npPause = button("Pause", chip = true, weight = 0f) {
+            // the player takes a moment to say; flip the button now, re-check in a second
+            CaptureService.playPause(this)
+            sourcePlaying = !(sourcePlaying ?: !CaptureService.sourceSilent)
+            songCheck = System.currentTimeMillis()
+        }
         npLoop = button("Loop 4", primary = true, chip = true, weight = 0f) { loopBars = 4; CaptureService.loopLast(this, 4); showTab(1) }
         val texts = column(npTitle, npLine).apply { layoutParams = lp(0, LayoutParams.WRAP_CONTENT, 1f) }
         val icon = android.widget.ImageView(this).apply {
@@ -570,7 +579,7 @@ class MainActivity : Activity() {
             setPadding(dp(8), dp(8), dp(8), dp(8))
             layoutParams = lp(dp(36), dp(36))
         }
-        return row(icon, texts, npSave, npLive, npLoop, gap = 10).apply {
+        return row(icon, texts, npPause, npSave, npLive, npLoop, gap = 10).apply {
             background = rounded(surface, 14)
             setPadding(dp(14), dp(8), dp(10), dp(8))
             layoutParams = lp().apply { setMargins(dp(12), dp(6), dp(12), dp(8)) }
@@ -714,6 +723,7 @@ class MainActivity : Activity() {
             val ctl = NowPlaying.controller(this)
             song = ctl?.let { NowPlaying.song(it) } ?: CaptureService.anchor?.song
             songMs = ctl?.let { NowPlaying.positionMs(it) }
+            sourcePlaying = ctl?.let { NowPlaying.playing(it) }
         }
         val h = CaptureService.looper
         val v = if (h != 0L && CaptureService.running) Native.looperView(h, 1) else FloatArray(0)
@@ -732,6 +742,9 @@ class MainActivity : Activity() {
         val recalling = CaptureService.recalling
         npLive.visibility = if (looping || recalling) View.VISIBLE else View.GONE
         npLoop.visibility = if (CaptureService.running && !looping && !recalling && h != 0L) View.VISIBLE else View.GONE
+        val live = CaptureService.running && !looping && !recalling
+        npPause.visibility = if (live) View.VISIBLE else View.GONE
+        if (live) npPause.text = if (sourcePlaying ?: !CaptureService.sourceSilent) "Pause" else "Play"
     }
 
     /** The loop card: what was found, or why not. */
@@ -826,7 +839,12 @@ class MainActivity : Activity() {
             minimumHeight = dp(56)
             isClickable = true
             setBackgroundResource(android.R.drawable.list_selector_background)
-            setOnClickListener { CaptureService.recall(this@MainActivity, b); showTab(1) }
+            setOnClickListener {
+                val off = !CaptureService.running
+                CaptureService.recall(this@MainActivity, b)
+                if (off) start() // switch on; the bookmark is recalled once the audio flows
+                showTab(1)
+            }
             setOnLongClickListener { bookmarkMenu(b); true }
         }
     }
@@ -903,7 +921,7 @@ class MainActivity : Activity() {
     }
 
     private fun start() {
-        if (!notificationsOk()) return
+        if (!notificationsOk()) { CaptureService.pendingRecall = null; return }
         val go = {
             CaptureService.status = "Starting…"
             startForegroundService(Intent(this, CaptureService::class.java)); Unit

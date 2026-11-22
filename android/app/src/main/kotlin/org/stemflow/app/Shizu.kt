@@ -6,7 +6,6 @@ import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.IBinder
 import android.os.Parcel
-import android.util.Log
 import rikka.shizuku.Shizuku
 
 /**

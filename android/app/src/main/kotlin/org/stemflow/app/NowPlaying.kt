@@ -55,6 +55,9 @@ object NowPlaying {
 
     fun playing(m: MediaController) = m.playbackState?.state == PlaybackState.STATE_PLAYING
 
+    /** When the player last reported its position (elapsedRealtime ms), or null. */
+    fun reportedAt(m: MediaController): Long? = m.playbackState?.lastPositionUpdateTime
+
     /** Where the player is now, ms (its last report moved on by the time since). */
     fun positionMs(m: MediaController): Long? {
         val st = m.playbackState ?: return null

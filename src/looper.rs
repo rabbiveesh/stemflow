@@ -258,6 +258,27 @@ fn loop_frame(clip: &Clip, start: i64, len: usize, p: usize) -> Frame {
     v
 }
 
+/// The first beat at or after `a`, a whole number of bars on, from which beats
+/// `..=b` are clear of every gap; None if not even the last bar is.
+fn clear_of_gaps(
+    beats: &[f64],
+    gaps: &[(i64, i64)],
+    a: usize,
+    b: usize,
+    meter: usize,
+) -> Option<usize> {
+    let to = beats[b].round() as i64;
+    let mut a = a;
+    while a < b {
+        let from = beats[a].round() as i64;
+        if !gaps.iter().any(|&(s, e)| s < to && e > from) {
+            return Some(a);
+        }
+        a += meter.max(1);
+    }
+    None
+}
+
 /// Audio the tail keeps ahead of it, beyond one arriving block, after running out.
 const TAIL_MARGIN: usize = 3 * RATE / 10;
 
@@ -376,6 +397,11 @@ impl Looper {
             .unwrap_or(g.beats.len() - 1);
         let a = b.saturating_sub(bars.max(1) * g.meter);
         ensure!(b > a, "no bars found");
+        // Only one unbroken play of the song: a loop pressed just after the next track
+        // began (or a seek) would reach back across it. Fewer bars then, or none yet.
+        let a = clear_of_gaps(&g.beats, &st.gaps, a, b, g.meter).ok_or_else(|| {
+            anyhow::anyhow!("not enough of this song yet: loop again in a few seconds")
+        })?;
         st.a = a;
         st.b = b;
         st.pos = 0;
@@ -1201,6 +1227,8 @@ impl Looper {
         let oldest = self.ring.lock().unwrap().oldest() as i64;
         let mut st = self.state.lock().unwrap();
         st.gaps.retain(|&(_, e)| e >= oldest);
+        // either order: a jump back gives the ends the other way round
+        let (from, to) = (from.min(to), from.max(to));
         st.gaps.push((from, to.max(from + 1)));
     }
 
@@ -1397,6 +1425,42 @@ mod tests {
             st.playing = true;
         }
         l
+    }
+
+    /// A loop that would reach back across a gap (the previous song) loses its
+    /// first bars instead; with no whole bar clear of it, there is none.
+    #[test]
+    fn loops_keep_clear_of_gaps() {
+        let s = RATE as f64;
+        // a beat every 0.5 s, 4 to the bar: bars at 0, 2, 4, ... s
+        let beats: Vec<f64> = (0..40).map(|k| k as f64 * s / 2.0).collect();
+        let at = |t: f64| (t * s) as i64;
+        // 4 bars ending at 15 s: beats 14 (7 s) ..= 30
+        assert_eq!(clear_of_gaps(&beats, &[], 14, 30, 4), Some(14));
+        assert_eq!(
+            clear_of_gaps(&beats, &[(at(1.0), at(2.0))], 14, 30, 4),
+            Some(14)
+        );
+        // the next song began at 9 s: from the bar at 11 s (beat 22)
+        assert_eq!(
+            clear_of_gaps(&beats, &[(at(8.5), at(9.0) + 1)], 14, 30, 4),
+            Some(22)
+        );
+        // ... at 14 s: not one bar is clear
+        assert_eq!(
+            clear_of_gaps(&beats, &[(at(13.8), at(14.0))], 14, 30, 4),
+            None
+        );
+    }
+
+    /// A gap given end first (the frames jumped back) is the same gap.
+    #[test]
+    fn gap_either_way_round() {
+        let l = Looper::new(Box::new(NoNet));
+        l.mark_gap(5_000, 2_000);
+        assert!(!l.continuous(3_000, 4_000));
+        assert!(l.continuous(0, 2_000));
+        assert!(l.continuous(5_000, 9_000));
     }
 
     /// Only what is still the plain mix is separated; a new model redoes it all.
