@@ -5,7 +5,7 @@
 //! 1. Credentials cached by an earlier pairing (`~/.cache/stemflow/spotify`): the
 //!    device logs straight in and is listed in every Spotify app on the account,
 //!    on any network.
-//! 2. Zeroconf, always on: any Spotify app on the same network lists "stemflow"
+//! 2. Zeroconf, always on: any Spotify app on the same network lists "stemflow (host)"
 //!    under Devices; picking it pairs (and caches) that account. Picking it from
 //!    another account switches to that one.
 //! 3. `--spotify-login`, or no zeroconf: log in once in the browser (OAuth).
@@ -114,6 +114,42 @@ fn cache_dir() -> PathBuf {
         .join("stemflow/spotify")
 }
 
+/// "stemflow (laptop)": every machine running stemflow is its own speaker, so the
+/// name says which one.
+pub fn default_name() -> String {
+    match hostname() {
+        Some(h) => format!("stemflow ({h})"),
+        None => "stemflow".into(),
+    }
+}
+
+fn hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most buf.len() bytes into buf.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let h = String::from_utf8_lossy(&buf[..end]);
+    let h = h.split('.').next().unwrap_or_default().trim();
+    (!h.is_empty() && h != "localhost").then(|| h.to_string())
+}
+
+/// librespot makes up a new device id every run, which Spotify sees as a new speaker
+/// each time. Keep the first one.
+fn device_id(dir: &std::path::Path) -> String {
+    let path = dir.join("device_id");
+    if let Ok(id) = std::fs::read_to_string(&path) {
+        let id = id.trim();
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+    let id = SessionConfig::default().device_id;
+    let _ = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&path, &id));
+    id
+}
+
 /// Start the Connect device; its audio arrives on `tx` in 20 ms stereo blocks.
 pub fn spawn(opts: Opts, tx: mpsc::Sender<Vec<f32>>, running: Arc<AtomicBool>) -> Result<()> {
     let feed = Arc::new(Feed::default());
@@ -139,7 +175,10 @@ async fn run(opts: Opts, feed: Arc<Feed>, running: Arc<AtomicBool>) -> Result<()
     // Credentials and volume only: no audio cache.
     let cache = Cache::new(Some(&dir), Some(&dir), None, None)
         .with_context(|| format!("opening {}", dir.display()))?;
-    let session_config = SessionConfig::default();
+    let session_config = SessionConfig {
+        device_id: device_id(&dir),
+        ..SessionConfig::default()
+    };
 
     let discovery = Discovery::builder(
         session_config.device_id.clone(),

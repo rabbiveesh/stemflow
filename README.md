@@ -73,7 +73,7 @@ about 0.1 s. The last levels are remembered in `~/.local/state/stemflow/levels`.
 ./target/release/stemflow live --device cuda --connect
 ```
 
-stemflow shows up as a speaker called "stemflow" in Spotify's device list (the
+stemflow shows up as a speaker called "stemflow (your hostname)" in Spotify's device list (the
 speaker icon in any Spotify app on the same network). Pick it and the music plays
 through stemflow, decoded by [librespot](https://github.com/librespot-org/librespot)
 inside stemflow, with no app to grab and no null sink. Play, pause, skip and the
@@ -84,7 +84,8 @@ volume slider work from the Spotify app as usual.
   it logs in by itself and is listed on every device on the account, on any network.
 - Not on the same network as a Spotify app (zeroconf blocked, a VPN)? `--spotify-login`
   logs in once through the browser instead.
-- `--connect-name NAME` renames the speaker.
+- Each machine running stemflow is its own speaker, named after its hostname and
+  kept under the same id across restarts. `--connect-name NAME` renames it.
 - Needs Spotify Premium. librespot is unofficial: Spotify can break it, and some
   accounts (often newer ones) currently fail with "audio key error"
   (librespot-org/librespot#1649). If tracks get skipped with that error, use

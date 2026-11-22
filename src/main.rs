@@ -45,10 +45,11 @@ enum Cmd {
         #[cfg(feature = "connect")]
         #[arg(long)]
         connect: bool,
-        /// With --connect: the name in Spotify's device list.
+        /// With --connect: the name in Spotify's device list
+        /// [default: "stemflow (<hostname>)"].
         #[cfg(feature = "connect")]
-        #[arg(long, default_value = "stemflow")]
-        connect_name: String,
+        #[arg(long)]
+        connect_name: Option<String>,
         /// With --connect: log in through the browser now (for when the Spotify app
         /// isn't on this network). The login is remembered.
         #[cfg(feature = "connect")]
@@ -366,7 +367,7 @@ fn main() -> Result<()> {
             #[cfg(feature = "connect")]
             if connect || spotify_login {
                 source = audio::Source::Connect(connect::Opts {
-                    name: connect_name,
+                    name: connect_name.unwrap_or_else(connect::default_name),
                     login: spotify_login,
                 });
             }
