@@ -186,6 +186,12 @@ impl Deck {
             "live" => self.live(),
             "again" => {
                 self.looper.play();
+                if self.looper.playing()
+                    && !self.paused.load(Ordering::Relaxed)
+                    && self.source.pause()
+                {
+                    self.paused.store(true, Ordering::Relaxed);
+                }
                 (self.notify)();
             }
             "move" => {

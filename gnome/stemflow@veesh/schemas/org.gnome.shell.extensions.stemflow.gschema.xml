@@ -29,5 +29,9 @@
       <default><![CDATA[['<Super><Alt>b']]]></default>
       <summary>Start or stop stemflow</summary>
     </key>
+    <key name="toggle-loop" type="as">
+      <default><![CDATA[['<Super><Alt>l']]]></default>
+      <summary>Loop the last 4 bars, or back to live</summary>
+    </key>
   </schema>
 </schemalist>

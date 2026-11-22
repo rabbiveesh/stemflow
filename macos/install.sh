@@ -30,6 +30,8 @@ cat > "$app/Contents/Info.plist" <<EOF
 	<key>LSUIElement</key><true/>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>stemflow listens to the app you pick (Spotify by default) to separate its stems as it plays.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>stemflow pauses Spotify or Music while a loop plays, so going live again carries on from the loop.</string>
 	<key>StemflowRoot</key><string>$root</string>
 </dict>
 </plist>

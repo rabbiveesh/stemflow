@@ -50,6 +50,8 @@ const IFACE = `
     <property name="Meter" type="u" access="readwrite"/>
     <property name="Feel" type="d" access="readwrite"/>
     <property name="Beats" type="s" access="read"/>
+    <property name="LoopState" type="s" access="read"/>
+    <method name="Loop"><arg type="s" direction="in"/></method>
     <method name="Nudge"><arg type="d" direction="in"/><arg type="d" direction="out"/></method>
     <method name="Snap"><arg type="s" direction="in"/><arg type="d" direction="out"/></method>
   </interface>
@@ -124,6 +126,21 @@ function stemOf(id) {
 function stayOpen(item) {
     item.activate = () => item.toggle();
     return item;
+}
+
+/* A row of buttons sharing the width: [[label, onClick], …]. */
+function buttonRow(specs) {
+    const row = new PopupMenu.PopupBaseMenuItem({ activate: false, reactive: false });
+    const box = new St.BoxLayout({ x_expand: true, style: 'spacing: 6px;' });
+    const buttons = specs.map(([label, act]) => {
+        const b = new St.Button({ label, style_class: 'button', x_expand: true, can_focus: true });
+        b.connect('clicked', act);
+        box.add_child(b);
+        return b;
+    });
+    row.add_child(box);
+    row.buttons = buttons;
+    return row;
 }
 
 /* A labelled slider row: [label  ───○───  value]. */
@@ -254,6 +271,30 @@ class StemflowIndicator extends PanelMenu.Button {
             this._feelItems.set(f, item);
         }
 
+        // Looping (src/loopdeck.rs): loop the last bars heard; while a loop plays the
+        // same buttons resize it, and the row below moves either end a beat.
+        this._loopSep = new PopupMenu.PopupSeparatorMenuItem();
+        this.menu.addMenuItem(this._loopSep);
+        this._loopHead = new PopupMenu.PopupMenuItem('', { reactive: false });
+        this.menu.addMenuItem(this._loopHead);
+        this._loopBars = buttonRow([1, 2, 4, 8].map(n => [n === 1 ? '1 bar' : `${n} bars`, () => this.loop(`${n}`)])
+            .concat([['Live', () => this.loop('live')]]));
+        this.menu.addMenuItem(this._loopBars);
+        this._loopEdit = buttonRow([['◂ Start', 'move -1 0'], ['Start ▸', 'move 1 0'], ['◂ End', 'move 0 -1'],
+            ['End ▸', 'move 0 1'], ['Again', 'again']].map(([l, c]) => [l, () => this.loop(c)]));
+        this.menu.addMenuItem(this._loopEdit);
+        // 0.5x .. 1.5x, with a detent at 1.
+        this._loopSpeed = new SliderRow('Speed', v => {
+            let x = 0.5 + v;
+            if (Math.abs(x - 1) < 0.03)
+                x = 1;
+            this.loop(`speed ${x.toFixed(3)}`);
+        });
+        this.menu.addMenuItem(this._loopSpeed);
+        this._loopClick = stayOpen(new PopupMenu.PopupSwitchMenuItem('Click in the loop', false));
+        this._loopClick.connect('toggled', (_i, on) => this.loop(`click ${on ? 'on' : 'off'}`));
+        this.menu.addMenuItem(this._loopClick);
+
         // Stem: which part of the music the controls act on (vocals = karaoke,
         // other = the horns in a jazz combo). Picking one switches to the model last
         // used for it (or the first one); only stems with a model are listed.
@@ -376,6 +417,65 @@ class StemflowIndicator extends PanelMenu.Button {
             this._back = b;
             this._snap(name);
         }
+    }
+
+    /* The loop's state (JSON from the daemon), or null: off, no beat model, or an
+     * older daemon. */
+    _loopState() {
+        const j = this._proxy?.LoopState;
+        if (!j)
+            return null;
+        try {
+            return JSON.parse(j);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    loop(cmd) {
+        if (!this._proxy)
+            return this._osdOff();
+        this._proxy.LoopRemote(cmd, (_r, err) => {
+            if (err)
+                Main.notify('stemflow', err.message.replace(/^.*InvalidArgs: /, ''));
+        });
+    }
+
+    /* Super+Alt+L: loop the last 4 bars, or back to live if a loop plays (or is
+     * being found). */
+    toggleLoop() {
+        const l = this._loopState();
+        if (!l)
+            return this._proxy ? Main.notify('stemflow', 'No looping: no beat model') : this._osdOff();
+        const live = l.playing || l.finding;
+        this.loop(live ? 'live' : '4');
+        Main.osdWindowManager.show(-1, icon(), live ? 'Live' : 'Looping the last 4 bars', null);
+    }
+
+    _syncLoop(on) {
+        const l = on ? this._loopState() : null;
+        for (const w of [this._loopSep, this._loopHead, this._loopBars, this._loopEdit, this._loopSpeed, this._loopClick])
+            w.visible = !!l;
+        if (!l)
+            return;
+        this._loopEdit.visible = l.playing;
+        this._loopBars.buttons[4].reactive = l.playing || l.tail || l.finding;
+        let head;
+        if (l.playing) {
+            head = `Looping ${l.bars} bar${l.bars === 1 ? '' : 's'} · ${Math.round(l.bpm)} bpm · ` +
+                `${l.meter}/bar · ${l.length.toFixed(1)} s` + (l.speed !== 1 ? ` · ${l.speed.toFixed(2)}×` : '');
+        } else if (l.finding) {
+            head = 'Finding the bars…';
+        } else if (l.tail) {
+            head = 'Catching up with the song';
+        } else {
+            head = 'Loop the last…';
+        }
+        if (l.status && !l.finding)
+            head = l.status;
+        this._loopHead.label.text = head;
+        this._loopSpeed.set(l.speed - 0.5, `${l.speed.toFixed(2)}×`);
+        this._loopClick.setToggleState(!!l.click);
     }
 
     _onScroll(ev) {
@@ -524,6 +624,7 @@ class StemflowIndicator extends PanelMenu.Button {
         // An older daemon has no Model property: no pickers.
         this._stems.visible = on && !!this._proxy.Model;
         this._models.visible = on && this._settings.get_boolean('experiments') && !!this._proxy.Model;
+        this._syncLoop(on);
         if (!on) {
             this._status.label.text = '';
             // Starting, or why it didn't: one line under the switch.
@@ -592,7 +693,7 @@ class StemflowIndicator extends PanelMenu.Button {
 
 let indicator = null;
 let settings = null;
-const KEYS = ['slide-left', 'slide-right', 'toggle-solo', 'toggle-nobass', 'toggle-running'];
+const KEYS = ['slide-left', 'slide-right', 'toggle-solo', 'toggle-nobass', 'toggle-running', 'toggle-loop'];
 
 function init() {
 }
@@ -607,6 +708,7 @@ function enable() {
         'toggle-solo': () => indicator.toggle('solo', -1),
         'toggle-nobass': () => indicator.toggle('nobass', 1),
         'toggle-running': () => indicator.setRunning(!indicator._proxy && !indicator._starting),
+        'toggle-loop': () => indicator.toggleLoop(),
     };
     for (const k of KEYS)
         Main.wm.addKeybinding(k, settings, Meta.KeyBindingFlags.NONE,

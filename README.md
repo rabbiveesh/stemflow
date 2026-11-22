@@ -96,6 +96,25 @@ tools/.venv/bin/python -I tools/export_beat_this.py models/beats tools/.venv-gpu
 
 Switch it on from the menu ("Beat click") or `busctl --user set-property org.stemflow.Control /org/stemflow/Control org.stemflow.Control Click b true`. `Meter` (beats per bar, 0 = auto) and `Feel` (0.5 half time, 1, 2 double time) set the bar lines and the beat; `Beats` says what the tracker found. Every 3 s it re-analyses the last 30 s of input (about 0.35 s on the GPU while separating). The input runs ahead of what you hear by the separator's lookahead, so the click comes from audio already analysed. A change of tempo or meter has to show up three times in a row (9 s) before the click follows it. `stemflow file --click in.wav out.wav` renders the same thing to a file.
 
+### Looping
+
+With the beat model in place, `stemflow live` can loop what you just heard, snapped to
+the bars: the menu's "1 bar · 2 · 4 · 8 bars" buttons (or `⌃⌥L` / `Super+Alt+L` for
+4) loop the last bars heard, and while a loop plays they resize it. "◂ Start",
+"Start ▸", "◂ End" and "End ▸" move an end by a beat; "Speed" slows it down (keeping
+the pitch); "Live" goes back. The stem mix keeps working on the loop.
+
+While a loop plays stemflow pauses the app it captures (MPRIS on Linux; Spotify or
+Music over AppleScript on macOS, which asks once whether stemflow may control it), so
+"Live" carries on from the loop, through what was buffered after it, and the app
+plays again. If the app can't be paused, "Live" jumps straight back to the live
+stream.
+
+The same commands go over the socket (`loop 4`, `loop live`, `loop again`,
+`loop move <start beats> <end beats>`, `loop shift <beats>`, `loop speed 0.75`,
+`loop pitch -2`, `loop keep_pitch off`, `loop click on`) and D-Bus (`Loop`, with the
+state as JSON in `LoopState`).
+
 ## macOS (Apple Silicon)
 
 Tested on an M5 MacBook Pro (macOS 26). Live mode taps the app with a Core Audio
@@ -170,6 +189,7 @@ Hotkeys use ⌃⌥ where GNOME uses Super (⌘[ and ⌘] are Back and Forward in
 | `⌃⌥\` | bass solo, or back to where you were |
 | `⌃⌥⇧\` | no bass (play-along), or back |
 | `⌃⌥B` | start / stop |
+| `⌃⌥L` | loop the last 4 bars, or back to live |
 
 ### Control socket
 
@@ -194,6 +214,7 @@ A top-bar menu to start/stop stemflow and move the mix, plus hotkeys:
 | `Super+\` | bass solo, or back to where you were |
 | `Super+Shift+\` | no bass (play-along), or back |
 | `Super+Alt+B` | start / stop |
+| `Super+Alt+L` | loop the last 4 bars, or back to live |
 
 Scrolling on the icon moves the mix too. "Separate sliders" in the menu gives the
 bass and the band a slider each. stemflow also serves `org.stemflow.Control` on the
