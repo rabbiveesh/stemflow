@@ -123,7 +123,18 @@ cargo build --release
   44.1 kHz around the pipeline.
 - `--device coreml` hands what Core ML can run to the GPU / Neural Engine. The first
   load compiles the model and caches it next to the `.onnx` file. On an M5, htdemucs_ft
-  takes 0.35 s per 7.8 s window this way (1.7 s on the CPU).
+  takes 0.35 s per 7.8 s window this way (1.7 s on the CPU), but part of it stays on
+  the CPU (~75% of a core live).
+- Converted straight to Core ML, Demucs runs entirely on the GPU: 0.12 s per window,
+  a tenth of the CPU time and about an eighth of the energy of the route above, at
+  53 dB SDR against the CPU output. stemflow uses the package when it's there:
+
+  ```bash
+  (cd tools && .venv/bin/python -I export_htdemucs_coreml.py ../models bass)
+  ```
+
+  It's pinned to the GPU: with the Neural Engine allowed, Core ML garbles the fp16
+  model. `STEMFLOW_COREML_UNITS=gpu|ane|all` overrides the choice for experiments.
 - BS-RoFormer needs a Core ML package of its own: ONNX Runtime's Core ML route runs it
   slower than the CPU (2.5 s per 3 s window, too slow for live). Converted directly
   and run on the GPU it takes 0.32 s (p99 0.52 s) on an M5, within 0.1% of the CPU
