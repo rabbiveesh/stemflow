@@ -12,7 +12,9 @@ app="${STEMFLOW_APP:-$HOME/Applications/Stemflow.app}"
 
 pkill -x Stemflow 2>/dev/null || true
 rm -rf "$app"
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+# The GNOME extension's icon: the clef (recoloured by the app) and its accents.
+cp "$root/gnome/stemflow@veesh/icons/"stemflow-{clef-symbolic,accents}.svg "$app/Contents/Resources/"
 swiftc -O -o "$app/Contents/MacOS/Stemflow" "$here/StemflowBar/main.swift"
 cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

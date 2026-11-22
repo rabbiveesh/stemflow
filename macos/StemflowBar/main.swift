@@ -107,6 +107,39 @@ func stemOf(_ id: String) -> String {
 
 func cap(_ s: String) -> String { s.prefix(1).uppercased() + s.dropFirst() }
 
+// MARK: - The icon: GNOME's clef, recoloured, with the leaf and drops on top
+
+let clefImage = Bundle.main.url(forResource: "stemflow-clef-symbolic", withExtension: "svg")
+    .flatMap { NSImage(contentsOf: $0) }
+let accentsImage = Bundle.main.url(forResource: "stemflow-accents", withExtension: "svg")
+    .flatMap { NSImage(contentsOf: $0) }
+let clefOn = NSColor(red: 0x5a / 255.0, green: 0xa9 / 255.0, blue: 0xe0 / 255.0, alpha: 1) // water-blue
+let clefWarn = NSColor(red: 0xf6 / 255.0, green: 0xd3 / 255.0, blue: 0x2d / 255.0, alpha: 1) // falling behind
+
+/// `tint` nil: the menu bar's own text colour (off). `alpha` < 1: starting up.
+func statusIcon(tint: NSColor?, alpha: CGFloat = 1) -> NSImage {
+    guard let clef = clefImage, let accents = accentsImage else {
+        let i = NSImage(systemSymbolName: "music.quarternote.3", accessibilityDescription: "stemflow")!
+        i.isTemplate = tint == nil
+        return i
+    }
+    let size = NSSize(width: 20, height: 20)
+    let img = NSImage(size: size, flipped: false) { r in
+        let colour = tint ?? .labelColor // resolved when drawn, so it follows the bar
+        let tinted = NSImage(size: size, flipped: false) { rr in
+            clef.draw(in: rr)
+            colour.set()
+            rr.fill(using: .sourceAtop)
+            return true
+        }
+        tinted.draw(in: r, from: .zero, operation: .sourceOver, fraction: alpha)
+        accents.draw(in: r, from: .zero, operation: .sourceOver, fraction: alpha)
+        return true
+    }
+    img.accessibilityDescription = "stemflow"
+    return img
+}
+
 // MARK: - Menu rows
 
 /// [label  ───○───  value], live while dragging.
@@ -349,8 +382,7 @@ final class Controller: NSObject, NSMenuDelegate {
     var isOnOrStarting: Bool { state != nil || starting != nil }
 
     func setup() {
-        item.button?.image = NSImage(systemSymbolName: "music.quarternote.3", accessibilityDescription: "stemflow")
-        item.button?.image?.isTemplate = true
+        item.button?.image = statusIcon(tint: nil)
         item.menu = menu
         menu.delegate = self
         menu.autoenablesItems = false
@@ -611,8 +643,7 @@ final class Controller: NSObject, NSMenuDelegate {
 
         let button = item.button
         guard let s = state else {
-            button?.contentTintColor = nil
-            button?.alphaValue = starting != nil ? 0.5 : 1
+            button?.image = starting != nil ? statusIcon(tint: clefOn, alpha: 0.5) : statusIcon(tint: nil)
             switchItem.title = "Bass isolation"
             desc.isHidden = starting == nil && startError.isEmpty
             if let st = starting {
@@ -623,9 +654,8 @@ final class Controller: NSObject, NSMenuDelegate {
             }
             return
         }
-        button?.alphaValue = 1
         let over = s["overruns"] as? Int ?? 0
-        button?.contentTintColor = over > 0 ? .systemYellow : NSColor(red: 0.35, green: 0.66, blue: 0.88, alpha: 1)
+        button?.image = statusIcon(tint: over > 0 ? clefWarn : clefOn)
 
         let secondStem = s["second"] as? String ?? ""
         let three = !secondStem.isEmpty
