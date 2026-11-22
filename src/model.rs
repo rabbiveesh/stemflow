@@ -69,7 +69,8 @@ pub const HTDEMUCS_SEGMENT: usize = 343_980; // int(7.8 s * 44100)
 pub enum Device {
     Cpu,
     Cuda,
-    /// Core ML (macOS): ONNX Runtime hands what it can to the GPU / Neural Engine.
+    /// Core ML (macOS): ONNX Runtime hands what it can to the GPU / Neural Engine;
+    /// BS-RoFormer runs its own Core ML package on the GPU instead.
     Coreml,
 }
 

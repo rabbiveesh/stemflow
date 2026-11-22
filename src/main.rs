@@ -170,7 +170,8 @@ struct Opts {
     #[arg(long)]
     stereo_in: bool,
     /// BS-RoFormer context window, seconds (trained at 13.35). 3 keeps up live on an
-    /// 8 GB laptop GPU; longer needs more VRAM and compute but not more latency.
+    /// 8 GB laptop GPU; longer needs more VRAM and compute but not more latency. With
+    /// Core ML, each window length needs its own package (tools/export_bsrofo_coreml.py).
     #[arg(long, default_value_t = 3.0)]
     window: f32,
     /// Ensemble weight of SCNet (Demucs gets 1 - this).
