@@ -153,7 +153,15 @@ fn blocking_sync() {
     });
 }
 
-fn session(path: &Path, device: Device, threads: usize, gpu_mem_mb: usize) -> Result<Session> {
+/// `dims`: values for the graph's named dynamic axes. Core ML can't compile
+/// unbounded dimensions, so with `Device::Coreml` they're fixed to these.
+fn session(
+    path: &Path,
+    device: Device,
+    threads: usize,
+    gpu_mem_mb: usize,
+    dims: &[(&str, usize)],
+) -> Result<Session> {
     let _ = gpu_mem_mb; // unused without the cuda feature
     let env = runtime(device)?;
     let mut b = Session::builder(env)?
@@ -189,8 +197,18 @@ fn session(path: &Path, device: Device, threads: usize, gpu_mem_mb: usize) -> Re
         #[cfg(target_os = "macos")]
         {
             use ort::ep::coreml::{ComputeUnits, ModelFormat};
+            for &(name, n) in dims {
+                b = b
+                    .with_dimension_override(name, n as i64)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
             // Compiling for Core ML takes a while; keep the result next to the model.
-            let cache = path.with_extension("coreml");
+            let mut cache = path.as_os_str().to_owned();
+            for &(name, n) in dims {
+                cache.push(format!(".{name}{n}"));
+            }
+            cache.push(".coreml");
+            let cache = std::path::PathBuf::from(cache);
             std::fs::create_dir_all(&cache)?;
             b = b
                 .with_execution_providers([ort::ep::CoreML::default()
@@ -202,7 +220,10 @@ fn session(path: &Path, device: Device, threads: usize, gpu_mem_mb: usize) -> Re
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         #[cfg(not(target_os = "macos"))]
-        anyhow::bail!("--device coreml is macOS only");
+        {
+            let _ = dims;
+            anyhow::bail!("--device coreml is macOS only");
+        }
     }
     b.commit_from_file(path).with_context(|| {
         format!(
@@ -214,7 +235,7 @@ fn session(path: &Path, device: Device, threads: usize, gpu_mem_mb: usize) -> Re
 
 impl HtDemucs {
     pub fn load(path: &Path, device: Device, threads: usize) -> Result<Self> {
-        let session = session(path, device, threads, gpu_mem_mb())?;
+        let session = session(path, device, threads, gpu_mem_mb(), &[])?;
         let seg = HTDEMUCS_SEGMENT;
         let mut m = HtDemucs {
             session,
@@ -299,7 +320,7 @@ impl ScNet {
             padding += HOP;
         }
         let mut m = ScNet {
-            session: session(path, device, threads, gpu_mem_mb())?,
+            session: session(path, device, threads, gpu_mem_mb(), &[])?,
             stft: PlainStft::new(),
             seg,
             padding,
@@ -376,7 +397,13 @@ pub struct BsRoformer {
 impl BsRoformer {
     pub fn load(path: &Path, device: Device, threads: usize, seg: usize) -> Result<Self> {
         let mut m = BsRoformer {
-            session: session(path, device, threads, gpu_mem_mb())?,
+            session: session(
+                path,
+                device,
+                threads,
+                gpu_mem_mb(),
+                &[("frames", HannStft::new(2048, 512).frames_for(seg))],
+            )?,
             stft: HannStft::new(2048, 512),
             seg,
             stems: 1,

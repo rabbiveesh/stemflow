@@ -9,8 +9,10 @@
 //! back without any clean-up.
 //!
 //! Recording another app's audio needs the "System Audio Recording" permission,
-//! which macOS gives to the app stemflow was started from (Terminal, iTerm, ...).
-//! Without it the tap opens fine and hears silence; `regrab` notices that.
+//! which macOS gives to the app stemflow was started from (Terminal, iTerm, ...;
+//! over ssh, `sshd-keygen-wrapper`, and there it can't prompt). Without it the tap
+//! and the device open fine, but the device never runs (macOS 26), or the tap
+//! hears only silence; `Cap::read` and `regrab` notice each and say what to allow.
 
 use super::{Capture, Io, Playback};
 use crate::model::SAMPLE_RATE;
@@ -411,26 +413,62 @@ struct Cap {
     stats: Arc<Stats>,
     /// Said once that nothing arrives.
     told: bool,
+    /// When audio last arrived (or we started).
+    since: std::time::Instant,
+}
+
+/// What to allow in System Settings when the tap gets nothing, naming the app
+/// macOS holds responsible for us.
+fn permission_hint() -> String {
+    let who = if std::env::var_os("SSH_CONNECTION").is_some() {
+        "/usr/libexec/sshd-keygen-wrapper (this is an ssh session, where macOS can't ask)".into()
+    } else {
+        match std::env::var("TERM_PROGRAM").as_deref() {
+            Ok("Apple_Terminal") => "Terminal".to_string(),
+            Ok(t) => t.to_string(),
+            Err(_) => "the app you started stemflow from".to_string(),
+        }
+    };
+    format!(
+        "Allow audio recording for {who}: System Settings > Privacy & Security > Screen & \
+         System Audio Recording, the \"System Audio Recording Only\" list (+, then Cmd-Shift-G \
+         for a path). Then restart stemflow."
+    )
 }
 
 impl Capture for Cap {
+    /// Returns an empty buffer after 100 ms without audio, so callers keep their
+    /// own timers (regrab, --seconds) going while the device is stalled.
     fn read(&mut self) -> Result<Vec<f32>> {
+        let t = std::time::Instant::now();
         loop {
-            let t = std::time::Instant::now();
             while self.rx.slots() < 2 * self.chunk {
                 std::thread::sleep(Duration::from_millis(5));
-                if !self.told && t.elapsed() > Duration::from_secs(3) {
+                if !self.told && self.since.elapsed() > Duration::from_secs(3) {
                     self.told = true;
-                    let shape = self.stats.input_shape.load(Ordering::Relaxed);
-                    eprintln!(
-                        "stemflow: no audio from the tap after 3 s ({} device callbacks; last \
-                         input: {} buffer(s), {} channel(s) in the last)",
-                        self.stats.callbacks.load(Ordering::Relaxed),
-                        shape >> 16,
-                        shape & 0xffff
-                    );
+                    let calls = self.stats.callbacks.load(Ordering::Relaxed);
+                    if calls == 0 {
+                        // macOS 26 without the permission: the device never starts.
+                        eprintln!(
+                            "stemflow: the audio device hasn't run once in 3 s, which is what \
+                             macOS does without the recording permission. {}",
+                            permission_hint()
+                        );
+                    } else {
+                        let shape = self.stats.input_shape.load(Ordering::Relaxed);
+                        eprintln!(
+                            "stemflow: no audio from the tap after 3 s ({calls} device callbacks; \
+                             last input: {} buffer(s), {} channel(s) in the last)",
+                            shape >> 16,
+                            shape & 0xffff
+                        );
+                    }
+                }
+                if t.elapsed() > Duration::from_millis(100) {
+                    return Ok(Vec::new());
                 }
             }
+            self.since = std::time::Instant::now();
             let c = self.rx.read_chunk(2 * self.chunk)?;
             let (a, b) = c.as_slices();
             let v = [a, b].concat();
@@ -676,10 +714,8 @@ pub fn open(grab: &str, output: Option<String>, _name: &str, play_frames: usize)
         if quiet == 3 && !warned {
             warned = true;
             eprintln!(
-                "stemflow: `{needle}` is playing but the tap hears only silence. Allow \
-                 recording for the app you started stemflow from: System Settings > Privacy & \
-                 Security > Screen & System Audio Recording (the \"System Audio Recording \
-                 Only\" list), then restart stemflow."
+                "stemflow: `{needle}` is playing but the tap hears only silence. {}",
+                permission_hint()
             );
         }
         let d = stats.dropped.load(Ordering::Relaxed);
@@ -704,6 +740,7 @@ pub fn open(grab: &str, output: Option<String>, _name: &str, play_frames: usize)
             chunk: rate as usize / 50,
             stats: stats_cap,
             told: false,
+            since: std::time::Instant::now(),
         }),
         playback: Box::new(Play {
             tx: play_tx,

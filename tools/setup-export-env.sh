@@ -12,5 +12,6 @@ uv pip install -q -p .venv/bin/python \
   --extra-index-url https://pypi.org/simple \
   --index-strategy unsafe-best-match \
   "torch==2.5.1$cpu" "torchaudio==2.5.1$cpu" 'demucs==4.0.1' \
-  'onnx==1.17.0' 'onnxruntime==1.20.1' 'numpy==1.26.4' soundfile
+  'onnx==1.17.0' 'onnxruntime==1.20.1' 'numpy==1.26.4' soundfile \
+  beartype rotary-embedding-torch librosa  # for export_bsrofo.py / export_scnet.py (MSST)
 .venv/bin/python -I -c "import torch, demucs; print('export env ready, torch', torch.__version__)"
