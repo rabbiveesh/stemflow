@@ -54,6 +54,7 @@ const IFACE = `
     <property name="LoopState" type="s" access="read"/>
     <method name="Loop"><arg type="s" direction="in"/></method>
     <method name="LoopView"><arg type="u" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="LoopBookmarks"><arg type="s" direction="out"/></method>
     <method name="Nudge"><arg type="d" direction="in"/><arg type="d" direction="out"/></method>
     <method name="Snap"><arg type="s" direction="in"/><arg type="d" direction="out"/></method>
   </interface>
@@ -270,6 +271,17 @@ class StemflowIndicator extends PanelMenu.Button {
                     } catch (e) {}
                     cb(pic);
                 });
+            },
+            cb => {
+                if (!this._proxy)
+                    return cb([]);
+                this._proxy.LoopBookmarksRemote((res, err) => {
+                    let list = [];
+                    try {
+                        list = err ? [] : JSON.parse(res[0]);
+                    } catch (e) {}
+                    cb(list);
+                });
             });
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
@@ -298,7 +310,7 @@ class StemflowIndicator extends PanelMenu.Button {
         this.menu.connect('open-state-changed', (_m, open) => {
             if (open) {
                 this._refreshStats();
-                this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, () => {
+                this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
                     this._refreshStats();
                     return GLib.SOURCE_CONTINUE;
                 });
@@ -473,6 +485,12 @@ class StemflowIndicator extends PanelMenu.Button {
                     const over = v('Overruns');
                     if (props.Models)
                         this._fillModels(v('Models'), v('Model'));
+                    // the song position isn't announced: read it while showing it
+                    if (props.LoopState) {
+                        try {
+                            this._loopSec.sync(JSON.parse(v('LoopState')), v('Meter'), v('Feel'));
+                        } catch (e) {}
+                    }
                     this._status.label.text =
                         `${v('App')} · ${v('Latency').toFixed(1)} s behind · ` +
                         `GPU ${v('Compute').toFixed(2)} s of ${v('Hop').toFixed(1)} s` +

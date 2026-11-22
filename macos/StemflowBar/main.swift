@@ -59,7 +59,10 @@ let logURL = home.appendingPathComponent("Library/Logs/stemflow.log")
 // MARK: - Control socket
 
 /// One request, one JSON line back (the whole state). nil when stemflow isn't there.
-func request(_ line: String) -> [String: Any]? {
+func request(_ line: String) -> [String: Any]? { requestAny(line) as? [String: Any] }
+
+/// One request, its JSON reply as parsed (`loop bookmarks` gives an array).
+func requestAny(_ line: String) -> Any? {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else { return nil }
     defer { close(fd) }
@@ -86,7 +89,7 @@ func request(_ line: String) -> [String: Any]? {
         if n <= 0 { break }
         data.append(buf, count: n)
     }
-    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    return try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
 }
 
 // MARK: - Stems (as src/models.rs knows them)
@@ -634,6 +637,14 @@ final class Controller: NSObject, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         menuOpen = true
         poll()
+        loadBookmarks()
+    }
+
+    func loadBookmarks() {
+        queue.async {
+            let list = requestAny("loop bookmarks") as? [[String: Any]]
+            DispatchQueue.main.async { self.loopSec.fillBookmarks(list ?? []) }
+        }
     }
 
     func menuDidClose(_ menu: NSMenu) { menuOpen = false }

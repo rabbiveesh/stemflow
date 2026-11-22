@@ -4,6 +4,34 @@
 const { GObject, St, GLib, Clutter } = imports.gi;
 const PopupMenu = imports.ui.popupMenu;
 const Slider = imports.ui.slider;
+const ModalDialog = imports.ui.modalDialog;
+
+function mmss(ms) {
+    const s = Math.floor(ms / 1000);
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+/* Ask for a name: `done(name)` unless cancelled. */
+function askName(title, value, done) {
+    const d = new ModalDialog.ModalDialog();
+    d.contentLayout.add_child(new St.Label({ text: title, style: 'font-weight: bold; padding-bottom: 8px;' }));
+    const entry = new St.Entry({ text: value, can_focus: true, style: 'min-width: 280px;' });
+    d.contentLayout.add_child(entry);
+    const ok = () => {
+        const name = entry.get_text().trim();
+        d.close();
+        if (name)
+            done(name);
+    };
+    entry.clutter_text.connect('activate', ok);
+    d.setButtons([
+        { label: 'Cancel', action: () => d.close(), key: Clutter.KEY_Escape },
+        { label: 'Save', action: ok, default: true },
+    ]);
+    d.open();
+    entry.grab_key_focus();
+    entry.clutter_text.set_selection(0, value.length);
+}
 
 const GREEN = [0x79 / 255, 0xc2 / 255, 0x67 / 255];
 const WAVE = [159 / 255, 182 / 255, 198 / 255];
@@ -250,15 +278,29 @@ const FEELS = [1, 0.5, 2];
 /* The section: `send(cmd)` runs a loop command, `setBeat(prop, v)` sets Meter/Feel,
  * `fetchView(bins, cb)` asks for the loop view. */
 var LoopSection = class {
-    constructor(menu, send, setBeat, fetchView) {
+    constructor(menu, send, setBeat, fetchView, fetchBookmarks) {
         this._send = send;
         this._fetchView = fetchView;
+        this._fetchBookmarks = fetchBookmarks;
+        this._marks = [];
         this.unit = 0; // what edits step by: 0 a beat, 1 a bar, 2 a phrase
         this.loop = null;
         this._timer = 0;
         this._busy = false;
 
         this.sep = new PopupMenu.PopupSeparatorMenuItem();
+        // The player: what plays, play/pause it, save the loop; the saved loops.
+        this.now = new PopupMenu.PopupMenuItem('', { reactive: false });
+        this.now.label.style = 'font-size: smaller;';
+        this._playPause = btn('Pause', () => send('playpause'));
+        this._save = btn('Save…', () => this._saveLoop());
+        this.strip = holder(box([this._playPause, this._save]));
+        this.bookmarks = new PopupMenu.PopupSubMenuMenuItem('Bookmarks');
+        this._search = new St.Entry({ hint_text: 'Search songs and loops', can_focus: true, x_expand: true });
+        this._search.clutter_text.connect('text-changed', () => this._fillBookmarks(this._marks));
+        const searchRow = holder(this._search);
+        this.bookmarks.menu.addMenuItem(searchRow);
+        this._markItems = [];
         this.info = new PopupMenu.PopupMenuItem('', { reactive: false });
         this.info.label.style = 'font-weight: bold;';
         this.hint = new PopupMenu.PopupMenuItem('', { reactive: false });
@@ -319,15 +361,22 @@ var LoopSection = class {
                 send('speed 1');
                 send('pitch 0');
             }),
-            btn('From the top', () => send('top')),
         ], 'spacing: 4px;'));
+        // From the top; Repair plays the loop's part of the song again and lays the
+        // loop on that (for a glitch in it).
+        this.actions = holder(box([btn('From the top', () => send('top')), btn('Repair', () => send('repair'))]));
+        this.stemsOnly = new PopupMenu.PopupSwitchMenuItem('Stems only when looping', false);
+        this.stemsOnly.activate = () => send(`stems_only ${this.loop?.stems_only ? 'off' : 'on'}`);
 
-        this.items = [this.sep, this.info, this.hint, this.grab, this.viewItem, this.units, this.edit,
-            this.meters, this.feels, this.speed, this.pitch, this.chips];
+        this.items = [this.sep, this.now, this.strip, this.bookmarks, this.info, this.hint, this.grab,
+            this.viewItem, this.units, this.edit, this.meters, this.feels, this.speed, this.pitch, this.chips,
+            this.actions, this.stemsOnly];
         for (const i of this.items)
             menu.addMenuItem(i);
 
         menu.connect('open-state-changed', (_m, open) => {
+            if (open)
+                this.loadBookmarks();
             if (open && !this._timer) {
                 this._timer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 50, () => {
                     this._poll();
@@ -338,6 +387,68 @@ var LoopSection = class {
                 this._timer = 0;
             }
         });
+    }
+
+    loadBookmarks() {
+        this._fetchBookmarks(list => this._fillBookmarks(list || []));
+    }
+
+    _saveLoop() {
+        const l = this.loop || {};
+        const guess = l.title ? (l.loop_from >= 0 ? `${l.title} ${mmss(l.loop_from)}` : l.title) : 'Loop';
+        askName('Save this loop', guess, name => {
+            this._send(`save ${name}`);
+            this.loadBookmarks();
+        });
+    }
+
+    /* The saved loops by recording, newest first; each plays, renames or deletes. */
+    _fillBookmarks(list) {
+        this._marks = list;
+        for (const i of this._markItems)
+            i.destroy();
+        this._markItems = [];
+        const add = i => {
+            this.bookmarks.menu.addMenuItem(i);
+            this._markItems.push(i);
+        };
+        this.bookmarks.label.text = list.length ? `Bookmarks (${list.length})` : 'Bookmarks';
+        const q = this._search.get_text().toLowerCase();
+        const shown = list.filter(b => !q || ['name', 'title', 'artist'].some(k => (b[k] || '').toLowerCase().includes(q)));
+        if (!shown.length) {
+            add(new PopupMenu.PopupMenuItem(list.length ? 'Nothing matches' : 'Save a loop (Save…) to come back to it later',
+                { reactive: false }));
+            return;
+        }
+        const groups = new Map();
+        for (const b of shown.sort((x, y) => y.created - x.created)) {
+            const key = `${b.title} — ${b.artist}`;
+            if (!groups.has(key))
+                groups.set(key, []);
+            groups.get(key).push(b);
+        }
+        for (const [key, marks] of groups) {
+            const h = new PopupMenu.PopupMenuItem(key, { reactive: false });
+            h.label.style = 'font-weight: bold; font-size: smaller;';
+            add(h);
+            for (const b of marks.sort((x, y) => x.start - y.start)) {
+                const play = new St.Button({
+                    label: `${b.name}  ·  ${b.bars} bar${b.bars === 1 ? '' : 's'} · ${mmss(b.start)}`,
+                    style_class: 'button', x_expand: true, can_focus: true,
+                });
+                play.connect('clicked', () => this._send(`recall ${b.created}`));
+                const rename = btn('✎', () => askName('Rename the loop', b.name, n => {
+                    this._send(`rename ${b.created} ${n}`);
+                    this.loadBookmarks();
+                }));
+                const del = btn('✕', () => {
+                    this._send(`delete ${b.created}`);
+                    this.loadBookmarks();
+                });
+                rename.x_expand = del.x_expand = false;
+                add(holder(box([play, rename, del], 'spacing: 4px;')));
+            }
+        }
     }
 
     _poll() {
@@ -369,8 +480,19 @@ var LoopSection = class {
             return;
         const m = Math.max(l.meter || 4, 1);
         const beats = l.beats || 0;
-        for (const i of [this.viewItem, this.units, this.edit, this.chips])
+        for (const i of [this.viewItem, this.units, this.edit, this.chips, this.actions])
             i.visible = l.playing;
+        // the player
+        if (!l.title)
+            this.now.label.text = "The player doesn't say what's playing";
+        else if (l.playing && l.loop_from >= 0)
+            this.now.label.text = `${l.title} — ${l.artist} · looping ${mmss(l.loop_from)}–${mmss(l.loop_to)}`;
+        else
+            this.now.label.text = `${l.title} — ${l.artist} · ${mmss(l.song_ms)}${l.song_playing ? '' : ' · paused'}`;
+        this._playPause.label = l.song_playing ? 'Pause' : 'Play';
+        this._playPause.reactive = !!l.title && !l.playing;
+        this._save.reactive = l.playing;
+        this.stemsOnly.setToggleState(!!l.stems_only);
         for (const [n, b] of Object.entries(this._grabs))
             b.set_checked(l.playing && Number(n) === l.bars);
         this._live.reactive = l.playing || l.tail || l.finding;
@@ -380,6 +502,8 @@ var LoopSection = class {
             info = `Looping ${whole} bar${whole === 1 ? '' : 's'}` +
                 (extra ? ` + ${extra} beat${extra === 1 ? '' : 's'}` : '') +
                 ` of ${m}/4 · ${Math.round(l.bpm)} bpm · ${l.length.toFixed(1)} s`;
+        } else if (l.recalling) {
+            info = 'Going back to a bookmark…';
         } else if (l.finding) {
             info = 'Finding the bars…';
         } else if (l.tail) {

@@ -152,7 +152,8 @@ pub fn live(
 
     // capture -> worker -> playback, each on its own thread.
     let (tx_in, rx_in) = mpsc::channel::<Vec<f32>>();
-    let (tx_out, rx_out) = mpsc::channel::<Stems>();
+    // stems, and whether they are the plain mix (stems only when looping)
+    let (tx_out, rx_out) = mpsc::channel::<(Stems, bool)>();
     let r = running.clone();
     std::thread::spawn(move || {
         while r.load(Ordering::Relaxed) {
@@ -218,7 +219,7 @@ pub fn live(
                         Err(TryRecvError::Disconnected) => return Ok(()),
                     }
                 };
-                if let Some(st) = next {
+                if let Some((st, plain)) = next {
                     // every live block goes into the loop buffer, played or not
                     if let Some(d) = &pdeck {
                         d.looper.push(
@@ -226,6 +227,9 @@ pub fn live(
                             &st.band,
                             st.extra.first().map_or(&[][..], |v| &v[..]),
                         );
+                        if plain {
+                            d.looper.mark_plain(st.band.len() / 2);
+                        }
                     }
                     bass.drain(..2 * pos);
                     band.drain(..2 * pos);
@@ -240,12 +244,19 @@ pub fn live(
                 }
             }
             let avail = bass.len() / 2 - pos;
-            let target = pctl.gains3();
+            let mut target = pctl.gains3();
             let src = pdeck.as_ref().and_then(|d| {
                 d.looper
                     .read(&mut lb, &mut lr, &mut ls, &mut lc, 2 * block, block)
             });
             looping = src.is_some();
+            // The plain mix (not separated: stems only when looping) plays as it is,
+            // from the band's place.
+            if let Some(d) = &pdeck {
+                if (looping && d.looper.plain_now()) || (!looping && d.stems_only()) {
+                    target = (0.0, 1.0, 0.0);
+                }
+            }
             if let (Some(at), Some(d)) = (src, &pdeck) {
                 // A loop (or the music playing on after one): from the buffer, at
                 // the same levels. Live blocks are used up at the same pace.
@@ -297,9 +308,14 @@ pub fn live(
     let hop_s = hop as f32 / SAMPLE_RATE as f32;
     let mut pending: Vec<f32> = Vec::new();
     let mut last_grab = Instant::now();
+    let mut out_frames = 0i64; // stem frames sent to the player: the buffer's frames
+    let mut capturing = false; // sending the plain mix (stems only when looping)
     for v in &rx_in {
         pending.extend(v);
         if let Some(id) = ctl.take_request() {
+            if let Some(d) = &deck {
+                d.cut("model switch");
+            }
             let prev = ctl.model();
             eprintln!("stemflow: switching to {id}");
             drop(st.take()); // free the GPU before loading the next one
@@ -331,6 +347,35 @@ pub fn live(
             pending.drain(..pending.len() - keep);
         }
         let Some(st) = st.as_mut() else { continue };
+        if let Some(d) = &deck {
+            let plain = d.stems_only();
+            // A loop to separate: the parts of it still the plain mix.
+            if plain && d.looper.restem_range(false).is_some() {
+                let t = Instant::now();
+                match crate::looper::restem(&d.looper, st, false) {
+                    Ok(_) => eprintln!(
+                        "stemflow: loop separated in {:.2}s",
+                        t.elapsed().as_secs_f32()
+                    ),
+                    Err(e) => eprintln!("stemflow: couldn't separate the loop: {e:#}"),
+                }
+            }
+            if plain != capturing {
+                // the separator's held-back frames are dropped (or start afresh)
+                capturing = plain;
+                d.cut(if plain {
+                    "separating -> capture only"
+                } else {
+                    "capture only -> separating"
+                });
+                st.reset();
+                delay.store(if plain { 0 } else { st.delay() }, Ordering::Relaxed);
+            }
+            // where the player is now: the newest input, whose stems land `delay`
+            // frames later in the buffer
+            let lag = if capturing { 0 } else { st.delay() };
+            d.set_input(out_frames + (pending.len() / 2 + lag) as i64);
+        }
         while pending.len() >= 2 * hop {
             let backlog = pending.len() as f32 / 2.0 / SAMPLE_RATE as f32;
             if backlog > 2.0 * hop_s {
@@ -343,6 +388,19 @@ pub fn live(
             if let Some(tr) = &beats {
                 tr.push(&chunk);
             }
+            out_frames += hop as i64;
+            if capturing {
+                // capture only: the chunk to the buffer and the speakers as it is
+                let stems = Stems {
+                    bass: vec![0f32; 2 * hop],
+                    band: chunk,
+                    extra: Vec::new(),
+                };
+                if tx_out.send((stems, true)).is_err() {
+                    return player.join().unwrap();
+                }
+                continue;
+            }
             // The app is paused (or between songs): silence, and leave the GPU alone.
             // Exact zeros also tell the looper's tail where a pause is, to skip it.
             if chunk.iter().all(|x| x.abs() < 1e-4) {
@@ -352,7 +410,7 @@ pub fn live(
                     band: z,
                     extra: Vec::new(),
                 };
-                if tx_out.send(stems).is_err() {
+                if tx_out.send((stems, false)).is_err() {
                     return player.join().unwrap();
                 }
                 continue;
@@ -365,7 +423,7 @@ pub fn live(
                 ctl.overruns.fetch_add(1, Ordering::Relaxed);
                 eprintln!("warning: run took {dt:.2}s > hop {hop_s:.2}s");
             }
-            if tx_out.send(out).is_err() {
+            if tx_out.send((out, false)).is_err() {
                 return player.join().unwrap();
             }
         }

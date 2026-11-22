@@ -13,6 +13,9 @@
 //!                            shift <beats>, edges <a> <b>, bar1 <beat>, click on|off,
 //!                            speed <x>, pitch <semitones>, keep_pitch on|off)
 //! loop view 300              -> the loop for drawing (beats, peaks), not the state
+//! loop bookmarks             -> the saved loops, not the state (also loop save <name>,
+//!                            recall|delete <created>, rename <created> <name>, repair,
+//!                            playpause, stems_only on|off)
 //! quit                       stop stemflow (as Ctrl-C would), after replying
 //! ```
 //!
@@ -87,6 +90,12 @@ fn handle(conn: UnixStream, ctl: &Control, info: &Info) -> Result<()> {
     let mut out = conn.try_clone()?;
     for line in BufReader::new(conn).lines() {
         let line = line?;
+        // `loop bookmarks`: the saved loops, instead of the state
+        if line.trim() == "loop bookmarks" {
+            out.write_all(crate::bookmarks::list_json().as_bytes())?;
+            out.write_all(b"\n")?;
+            continue;
+        }
         // `loop view <bins>`: the loop for drawing, instead of the state
         if let Some(n) = line.trim().strip_prefix("loop view") {
             let bins = n.trim().parse().unwrap_or(200);

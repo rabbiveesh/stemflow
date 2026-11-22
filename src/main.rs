@@ -1,5 +1,6 @@
 mod audio;
 mod beats;
+mod bookmarks;
 mod control;
 #[cfg(target_os = "macos")]
 mod coreml;
@@ -8,6 +9,7 @@ mod looper;
 mod model;
 mod models;
 mod socket;
+mod songmap;
 mod source;
 mod spec;
 mod stream;
@@ -427,6 +429,11 @@ fn main() -> Result<()> {
                             Box::new(move || c.touch()),
                         );
                         let _ = ctl.deck.set(d.clone());
+                        // the player's song position, for the song map (osascript is
+                        // slower to ask than D-Bus)
+                        d.watch(std::time::Duration::from_millis(
+                            if cfg!(target_os = "macos") { 1000 } else { 500 },
+                        ));
                         Some(d)
                     }
                     Err(e) => {

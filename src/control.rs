@@ -682,6 +682,11 @@ impl Service {
         self.ctl.loop_view(bins as usize)
     }
 
+    /// The saved loops as a JSON array (`bookmarks::list_json`).
+    fn loop_bookmarks(&self) -> String {
+        crate::bookmarks::list_json()
+    }
+
     /// Move the one-slider balance by `step` (e.g. ±0.1); returns the new balance.
     async fn nudge(
         &mut self,

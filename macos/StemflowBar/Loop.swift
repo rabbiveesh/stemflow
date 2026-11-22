@@ -187,7 +187,7 @@ func smallLabel(_ s: String, size: CGFloat = 10, color: NSColor = .secondaryLabe
     return l
 }
 
-final class LoopSection {
+final class LoopSection: NSObject {
     let send: (String) -> Void
     let sep = NSMenuItem.separator()
     let info = textItem()
@@ -206,6 +206,16 @@ final class LoopSection {
     var speedItem: NSMenuItem!, pitchItem: NSMenuItem!
     var keep: NSButton!, click: NSButton!
     var chipsItem: NSMenuItem!
+    var actionsItem: NSMenuItem!
+    // the player: what plays, play/pause, save; bookmarks
+    let nowItem = textItem()
+    var playPause: NSButton!, save: NSButton!
+    var stripItem: NSMenuItem!
+    let bookmarksItem = NSMenuItem(title: "Bookmarks", action: nil, keyEquivalent: "")
+    let stemsOnly = ClosureItem("Stems only when looping") {}
+    var marks: [[String: Any]] = []
+    var search = ""
+    let searchField = NSSearchField(frame: NSRect(x: 0, y: 0, width: 260, height: 22))
     /// What the edits step by: 0 a beat, 1 a bar, 2 a phrase (the loop's length).
     var unit = 0
     var loop: [String: Any]? // the state's "loop"
@@ -213,11 +223,13 @@ final class LoopSection {
     var feelValues = [1.0, 0.5, 2.0]
 
     var items: [NSMenuItem] {
-        [sep, info, hint, grabItem, viewItem_, unitsItem, editItem, beatItem, speedItem, pitchItem, chipsItem]
+        [sep, nowItem, stripItem, bookmarksItem, info, hint, grabItem, viewItem_, unitsItem, editItem, beatItem,
+         speedItem, pitchItem, chipsItem, actionsItem, stemsOnly]
     }
 
     init(send: @escaping (String) -> Void) {
         self.send = send
+        super.init()
         let grabRow = NSStackView()
         grabRow.distribution = .fillEqually
         grabRow.spacing = 6
@@ -295,10 +307,128 @@ final class LoopSection {
             smallButton("50%") { send("loop speed 0.5") },
             keep, click,
             smallButton("Reset") { send("loop speed 1"); send("loop pitch 0") },
-            smallButton("From the top") { send("loop top") },
         ])
         chips.spacing = 4
-        chipsItem = viewItem(padded(chips, height: 30, width: 400))
+        chipsItem = viewItem(padded(chips, height: 30))
+        // From the top; Repair plays the loop's part of the song again and lays the
+        // loop on that (for a glitch in it).
+        let actions = NSStackView(views: [smallButton("From the top") { send("loop top") },
+                                          smallButton("Repair") { send("loop repair") }])
+        actions.distribution = .fillEqually
+        actions.spacing = 6
+        actionsItem = viewItem(padded(actions, height: 30))
+
+        // The player: play/pause it, and save the loop as a bookmark.
+        playPause = smallButton("Pause") { send("loop playpause") }
+        save = smallButton("Save…") { [unowned self] in saveLoop() }
+        let strip = NSStackView(views: [playPause, save])
+        strip.distribution = .fillEqually
+        strip.spacing = 6
+        stripItem = viewItem(padded(strip, height: 30))
+        bookmarksItem.submenu = NSMenu()
+        searchField.placeholderString = "Search songs and loops"
+        searchField.sendsSearchStringImmediately = true
+        searchField.target = self
+        searchField.action = #selector(searched)
+        stemsOnly.handler = { [unowned self] in
+            send("loop stems_only \((loop?["stems_only"] as? Bool ?? false) ? "off" : "on")")
+        }
+        stemsOnly.toolTip = "Hear the plain mix and save power; a loop is separated when you make it"
+    }
+
+    @objc func searched() {
+        search = searchField.stringValue
+        fillBookmarks(marks)
+    }
+
+    /// A name from the person (nil: cancelled).
+    func ask(_ title: String, _ text: String, value: String) -> String? {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        a.addButton(withTitle: "Save")
+        a.addButton(withTitle: "Cancel")
+        let f = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        f.stringValue = value
+        a.accessoryView = f
+        a.window.initialFirstResponder = f
+        guard a.runModal() == .alertFirstButtonReturn else { return nil }
+        let name = f.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+
+    func saveLoop() {
+        let title = loop?["title"] as? String ?? ""
+        let from = loop?["loop_from"] as? Int ?? -1
+        let guess = title.isEmpty ? "Loop" : from >= 0 ? "\(title) \(mmss(from))" : title
+        // after the menu has closed
+        DispatchQueue.main.async { [self] in
+            guard let name = ask("Save this loop", "Name it to come back to it later.", value: guess) else { return }
+            send("loop save \(name)")
+            Controller.shared.loadBookmarks()
+        }
+    }
+
+    /// The saved loops, by recording; each one recalls, renames or deletes.
+    func fillBookmarks(_ list: [[String: Any]]) {
+        marks = list
+        let m = bookmarksItem.submenu!
+        // keep the search field (and its focus) while typing
+        while m.items.count > 1 { m.removeItem(at: m.items.count - 1) }
+        if m.items.isEmpty {
+            let sf = NSView(frame: NSRect(x: 0, y: 0, width: 290, height: 30))
+            searchField.frame = NSRect(x: 14, y: 4, width: 262, height: 22)
+            sf.addSubview(searchField)
+            m.addItem(viewItem(sf))
+        }
+        let q = search.lowercased()
+        let shown = list.filter { b in
+            q.isEmpty || ["name", "title", "artist"].contains { (b[$0] as? String ?? "").lowercased().contains(q) }
+        }
+        bookmarksItem.title = list.isEmpty ? "Bookmarks" : "Bookmarks (\(list.count))"
+        if shown.isEmpty {
+            let t = textItem()
+            t.title = list.isEmpty ? "Save a loop (Save…) to come back to it later" : "Nothing matches"
+            m.addItem(t)
+            return
+        }
+        // by recording, the newest saved first
+        var order: [String] = []
+        var groups: [String: [[String: Any]]] = [:]
+        for b in shown.sorted(by: { ($0["created"] as? Int ?? 0) > ($1["created"] as? Int ?? 0) }) {
+            let key = "\(b["title"] as? String ?? "") — \(b["artist"] as? String ?? "")"
+            if groups[key] == nil { order.append(key) }
+            groups[key, default: []].append(b)
+        }
+        for key in order {
+            m.addItem(.separator())
+            let h = textItem()
+            h.title = key
+            m.addItem(h)
+            for b in groups[key]!.sorted(by: { ($0["start"] as? Int ?? 0) < ($1["start"] as? Int ?? 0) }) {
+                let created = b["created"] as? Int ?? 0
+                let name = b["name"] as? String ?? "Loop"
+                let bars = b["bars"] as? Int ?? 0
+                let i = NSMenuItem(title: "\(name)  ·  \(bars) bar\(bars == 1 ? "" : "s") · \(mmss(b["start"] as? Int ?? 0))",
+                                   action: nil, keyEquivalent: "")
+                let sub = NSMenu()
+                sub.addItem(ClosureItem("Play it") { [unowned self] in send("loop recall \(created)") })
+                sub.addItem(ClosureItem("Rename…") { [unowned self] in
+                    DispatchQueue.main.async { [self] in
+                        guard let n = ask("Rename the loop", "", value: name) else { return }
+                        send("loop rename \(created) \(n)")
+                        Controller.shared.loadBookmarks()
+                    }
+                })
+                sub.addItem(ClosureItem("Delete") { [unowned self] in
+                    send("loop delete \(created)")
+                    Controller.shared.loadBookmarks()
+                })
+                i.submenu = sub
+                m.addItem(i)
+            }
+        }
     }
 
     /// The step for an edit, in beats.
@@ -331,7 +461,22 @@ final class LoopSection {
         let m = max(l["meter"] as? Int ?? 4, 1)
         let beats = l["beats"] as? Int ?? 0
         let status = l["status"] as? String ?? ""
-        for r in [viewItem_, unitsItem, editItem, chipsItem] { r!.isHidden = !playing }
+        for r in [viewItem_, unitsItem, editItem, chipsItem, actionsItem] { r!.isHidden = !playing }
+        // the player
+        let title = l["title"] as? String ?? "", artist = l["artist"] as? String ?? ""
+        let songPlaying = l["song_playing"] as? Bool ?? false
+        let from = l["loop_from"] as? Int ?? -1, to = l["loop_to"] as? Int ?? -1
+        if title.isEmpty {
+            nowItem.title = "The player doesn't say what's playing"
+        } else if playing && from >= 0 {
+            nowItem.title = "\(title) — \(artist) · looping \(mmss(from))–\(mmss(to))"
+        } else {
+            nowItem.title = "\(title) — \(artist) · \(mmss(l["song_ms"] as? Int ?? 0))\(songPlaying ? "" : " · paused")"
+        }
+        playPause.title = songPlaying ? "Pause" : "Play"
+        playPause.isEnabled = !title.isEmpty && !playing
+        save.isEnabled = playing
+        stemsOnly.state = (l["stems_only"] as? Bool ?? false) ? .on : .off
         for (n, b) in grabs { b.state = playing && n == bars ? .on : .off }
         live.isEnabled = playing || tail || finding
         if playing {
@@ -339,6 +484,8 @@ final class LoopSection {
             info.title = "Looping \(whole) bar\(whole == 1 ? "" : "s")"
                 + (extra > 0 ? " + \(extra) beat\(extra == 1 ? "" : "s")" : "") + " of \(m)/4"
                 + String(format: " · %.0f bpm · %.1f s", l["bpm"] as? Double ?? 0, l["length"] as? Double ?? 0)
+        } else if l["recalling"] as? Bool ?? false {
+            info.title = "Going back to a bookmark…"
         } else if finding {
             info.title = "Finding the bars…"
         } else if tail {
@@ -361,3 +508,6 @@ final class LoopSection {
         if !playing { view.pic = nil }
     }
 }
+
+/// `m:ss`
+func mmss(_ ms: Int) -> String { String(format: "%d:%02d", ms / 60000, ms / 1000 % 60) }

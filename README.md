@@ -111,6 +111,19 @@ the bars, from the Loop section of the menu (Mac and GNOME, as on Android):
   loop, same length) and **End** move earlier ◀ or later ▶ by that much.
 - **Meter** and **feel** re-find the bars; **Speed** (40–120%), **Pitch** (±12
   semitones), **Keep pitch**, **Click**, and **From the top**.
+- With the player's song position (MPRIS on Linux; Spotify or Music over AppleScript
+  on macOS), stemflow maps the buffer to song time, as the Android app does:
+  - the song plays on, unheard, until the next phrase is buffered, then pauses, so
+    moving the loop into it is instant;
+  - moving or extending the loop past what was buffered seeks the player there and
+    plays it through (the old loop keeps playing meanwhile);
+  - **Repair** plays the loop's part of the song again and lays the loop on that;
+  - **Save…** keeps the loop as a bookmark (`~/.local/state/stemflow/bookmarks.json`,
+    the Android app's format), and **Bookmarks** lists them by song, with search:
+    pick one to go back there (the player seeks a few seconds before it and the loop
+    comes back with its bars), or rename or delete it.
+- **Stems only when looping** plays the plain mix while live and separates only
+  what you loop, to save power.
 
 While a loop plays stemflow pauses the app it captures (MPRIS on Linux; Spotify or
 Music over AppleScript on macOS, which asks once whether stemflow may control it), so
