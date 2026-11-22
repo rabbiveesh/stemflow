@@ -67,6 +67,30 @@ Latency is roughly lookahead + hop + 0.3 s of buffer, so about 2.8 s by default.
 Level changes are applied as audio leaves for the speakers, so they're heard within
 about 0.1 s. The last levels are remembered in `~/.local/state/stemflow/levels`.
 
+### Spotify Connect (no capture)
+
+```bash
+./target/release/stemflow live --device cuda --connect
+```
+
+stemflow shows up as a speaker called "stemflow" in Spotify's device list (the
+speaker icon in any Spotify app on the same network). Pick it and the music plays
+through stemflow, decoded by [librespot](https://github.com/librespot-org/librespot)
+inside stemflow, with no app to grab and no null sink. Play, pause, skip and the
+volume slider work from the Spotify app as usual.
+
+- The first pick pairs your account and stemflow remembers it
+  (`~/.cache/stemflow/spotify`, credentials and volume only, no audio). After that
+  it logs in by itself and is listed on every device on the account, on any network.
+- Not on the same network as a Spotify app (zeroconf blocked, a VPN)? `--spotify-login`
+  logs in once through the browser instead.
+- `--connect-name NAME` renames the speaker.
+- Needs Spotify Premium. librespot is unofficial: Spotify can break it, and some
+  accounts (often newer ones) currently fail with "audio key error"
+  (librespot-org/librespot#1649). If tracks get skipped with that error, use
+  grabbing (the default) instead.
+- `cargo build --no-default-features` leaves it out.
+
 ### Karaoke and other stems
 
 `--target vocals` swaps BS-RoFormer SW's bass head for its vocals head. Everything

@@ -19,9 +19,14 @@ libpulse-simple-binding = "2"
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
 realfft = "3"
 zbus = "5"
+# Spotify Connect input (`live --connect`). Our own sink, so no audio backend features.
+librespot = { version = "0.8", default-features = false, features = ["with-libmdns", "rustls-tls-webpki-roots"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true }
 
 [features]
-default = []
+default = ["connect"]
+connect = ["dep:librespot", "dep:tokio", "dep:futures-util"]
 cuda = ["ort/cuda"]
 
 [profile.release]
