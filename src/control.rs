@@ -111,6 +111,13 @@ impl Control {
         d.command(cmd, self.beat_settings())
     }
 
+    /// The loop for drawing (`loopdeck::Deck::view_json`), or `null`.
+    pub fn loop_view(&self, bins: usize) -> String {
+        self.deck
+            .get()
+            .map_or_else(|| "null".into(), |d| d.view_json(bins))
+    }
+
     /// The loop's state as JSON, or `null` without looping.
     pub fn loop_json(&self) -> String {
         self.deck
@@ -154,6 +161,7 @@ impl Control {
         }
     }
     pub fn set_beat_options(&self, click: bool, meter: u32, feel: f32) {
+        let old = (self.meter(), self.feel());
         self.click.store(click, Ordering::Relaxed);
         self.meter.store(meter.min(12), Ordering::Relaxed);
         let feel = if feel == 0.5 || feel == 2.0 {
@@ -163,6 +171,14 @@ impl Control {
         };
         self.feel.store(feel.to_bits(), Ordering::Relaxed);
         save_beat_options(self);
+        // A loop playing takes the new bars too.
+        if old != (self.meter(), self.feel()) {
+            if let Some(d) = self.deck.get() {
+                if d.looper.playing() {
+                    let _ = d.command("meter", self.beat_settings());
+                }
+            }
+        }
     }
     pub fn beats(&self) -> String {
         self.beats.lock().unwrap().clone()
@@ -658,6 +674,12 @@ impl Service {
             .map_err(|e| zbus::fdo::Error::InvalidArgs(format!("{e:#}")))?;
         let _ = self.loop_state_changed(&em).await;
         Ok(())
+    }
+
+    /// The loop for drawing (`loopdeck::Deck::view_json`) with `bins` peaks, or
+    /// `null`. Read it while showing it; it isn't announced.
+    fn loop_view(&self, bins: u32) -> String {
+        self.ctl.loop_view(bins as usize)
     }
 
     /// Move the one-slider balance by `step` (e.g. ±0.1); returns the new balance.

@@ -194,6 +194,9 @@ pub fn live(
             vec![0f32; 2 * block],
         );
         let mut looping = false; // the last block came from the looper
+        if let Some(d) = &pdeck {
+            d.set_lag(DEVICE_LAG as i64);
+        }
         loop {
             // Take whatever the worker has finished. Wait only when the live stream is
             // what plays and it's starved: a loop never waits for the separator (a

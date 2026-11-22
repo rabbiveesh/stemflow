@@ -212,32 +212,6 @@ final class SnapRow: NSView {
     required init?(coder: NSCoder) { fatalError() }
 }
 
-/// A row of small buttons sharing the width.
-final class ButtonRow: NSView {
-    var buttons: [NSButton] = []
-    init(_ specs: [(String, () -> Void)]) {
-        super.init(frame: NSRect(x: 0, y: 0, width: 340, height: 30))
-        let stack = NSStackView()
-        stack.distribution = .fillEqually
-        stack.spacing = 6
-        for (label, act) in specs {
-            let b = ClosureButton(title: label, handler: act)
-            b.bezelStyle = .rounded
-            b.controlSize = .small
-            stack.addArrangedSubview(b)
-            buttons.append(b)
-        }
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
-            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
-            stack.centerYAnchor.constraint(equalTo: centerYAnchor),
-        ])
-    }
-    required init?(coder: NSCoder) { fatalError() }
-}
-
 final class ClosureButton: NSButton {
     var handler: () -> Void = {}
     convenience init(title: String, handler: @escaping () -> Void) {
@@ -404,16 +378,11 @@ final class Controller: NSObject, NSMenuDelegate {
     let expItem = ClosureItem("Experiments") { Controller.shared.flip("experiments") }
     let advItem = ClosureItem("Separate sliders") { Controller.shared.flip("advanced") }
     var modelsKey = ""
-    // looping (state["loop"], src/loopdeck.rs)
-    let loopSep = NSMenuItem.separator()
-    let loopHead = textItem()
-    var loopBars: ButtonRow!, loopBarsItem: NSMenuItem!
-    var loopEdit: ButtonRow!, loopEditItem: NSMenuItem!
-    var loopSpeed: SliderRow!, loopSpeedItem: NSMenuItem!
-    let loopClick = ClosureItem("Click in the loop") {
-        let c = Controller.shared
-        c.send("loop click \((c.loopState?["click"] as? Bool ?? false) ? "off" : "on")")
-    }
+    // looping (state["loop"], src/loopdeck.rs; Loop.swift)
+    let loopSec = LoopSection { Controller.shared.send($0) }
+    var menuOpen = false
+    let viewQueue = DispatchQueue(label: "stemflow.loopview")
+    var viewBusy = false
     var loopState: [String: Any]? { state?["loop"] as? [String: Any] }
 
     var isOn: Bool { state != nil }
@@ -455,27 +424,16 @@ final class Controller: NSObject, NSMenuDelegate {
         }
         beatOpts.submenu = meters
 
-        // Loop the last bars heard; while a loop plays the same buttons resize it.
-        loopBars = ButtonRow([1, 2, 4, 8].map { n in (n == 1 ? "1 bar" : "\(n) bars", { Controller.shared.loop("\(n)") }) }
-            + [("Live", { Controller.shared.loop("live") })])
-        // Move either end a beat, or play it again from the top.
-        loopEdit = ButtonRow([("◂ Start", "move -1 0"), ("Start ▸", "move 1 0"), ("◂ End", "move 0 -1"),
-                              ("End ▸", "move 0 1"), ("Again", "again")].map { l, c in (l, { Controller.shared.loop(c) }) })
-        // 0.5x .. 1.5x, with a detent at 1.
-        loopSpeed = SliderRow("Speed") { [unowned self] v in
-            var x = 0.5 + v
-            if abs(x - 1) < 0.03 { x = 1 }
-            loop("speed \(x)")
-        }
-        (loopBarsItem, loopEditItem, loopSpeedItem) = (viewItem(loopBars), viewItem(loopEdit), viewItem(loopSpeed))
         stemsItem.submenu = NSMenu()
         modelsItem.submenu = NSMenu()
 
         for i in [switchItem, desc, oneItem, boostItem, bassItem, secondItem, bandItem, snapsItem, sep1, status,
-                  clickItem, beatOpts, loopSep, loopHead, loopBarsItem, loopEditItem, loopSpeedItem, loopClick,
-                  stemsItem, modelsItem, expItem, advItem] {
+                  clickItem, beatOpts] {
             menu.addItem(i!)
         }
+        for i in loopSec.items { menu.addItem(i) }
+        menu.addItem(.separator())
+        for i in [stemsItem, modelsItem, expItem, advItem] { menu.addItem(i) }
         menu.addItem(.separator())
         menu.addItem(ClosureItem("Open log") { NSWorkspace.shared.open(logURL) })
         menu.addItem(ClosureItem("Quit") { Controller.shared.quit() })
@@ -490,6 +448,9 @@ final class Controller: NSObject, NSMenuDelegate {
 
         let t = Timer(timeInterval: 1, repeats: true) { _ in self.poll() }
         RunLoop.main.add(t, forMode: .common) // keeps ticking while the menu is open
+        // The loop view moves with the playhead while the menu shows it.
+        let v = Timer(timeInterval: 0.05, repeats: true) { _ in self.pollView() }
+        RunLoop.main.add(v, forMode: .common)
         registerHotkeys()
         poll()
     }
@@ -505,6 +466,19 @@ final class Controller: NSObject, NSMenuDelegate {
         queue.async {
             let s = request("state")
             DispatchQueue.main.async { self.got(s) }
+        }
+    }
+
+    func pollView() {
+        guard menuOpen, loopSec.hasLoop, !viewBusy else { return }
+        viewBusy = true
+        let bins = Int(loopSec.view.bounds.width / 2)
+        viewQueue.async {
+            let j = request("loop view \(bins)")
+            DispatchQueue.main.async {
+                self.viewBusy = false
+                self.loopSec.view.pic = LoopPic(j)
+            }
         }
     }
 
@@ -657,7 +631,12 @@ final class Controller: NSObject, NSMenuDelegate {
 
     // MARK: menu contents
 
-    func menuWillOpen(_ menu: NSMenu) { poll() }
+    func menuWillOpen(_ menu: NSMenu) {
+        menuOpen = true
+        poll()
+    }
+
+    func menuDidClose(_ menu: NSMenu) { menuOpen = false }
 
     func fillModels(_ models: [[String]], current: String) {
         if !current.isEmpty { lastModelFor[stemOf(current)] = current }
@@ -709,9 +688,9 @@ final class Controller: NSObject, NSMenuDelegate {
         expItem.state = exp ? .on : .off
         advItem.state = adv ? .on : .off
         let rows: [NSMenuItem] = [desc, oneItem, boostItem, bassItem, bandItem, secondItem, snapsItem, sep1, status,
-                                  modelsItem, stemsItem, clickItem, beatOpts, loopSep, loopHead, loopBarsItem,
-                                  loopEditItem, loopSpeedItem, loopClick]
+                                  modelsItem, stemsItem, clickItem, beatOpts]
         for r in rows { r.isHidden = !on }
+        if !on { loopSec.sync(nil, meter: 0, feel: 1) }
 
         let button = item.button
         guard let s = state else {
@@ -781,7 +760,7 @@ final class Controller: NSObject, NSMenuDelegate {
         beatOpts.title = "Meter and feel: \(meter > 0 ? "\(meter)/bar" : "auto meter")"
             + (feel == 0.5 ? " · half time" : feel == 2 ? " · double time" : "")
 
-        syncLoop()
+        loopSec.sync(loopState, meter: meter, feel: feel)
 
         let loading = statusText.hasPrefix("Loading")
         if wasLoading && !loading { pending = nil }
@@ -791,38 +770,6 @@ final class Controller: NSObject, NSMenuDelegate {
         stemsItem.isHidden = model.isEmpty
         modelsItem.isHidden = !exp || model.isEmpty
         if !model.isEmpty { fillModels(models, current: model) }
-    }
-}
-
-extension Controller {
-    func syncLoop() {
-        guard let l = loopState else {
-            for r in [loopSep, loopHead, loopBarsItem, loopEditItem, loopSpeedItem, loopClick] { r!.isHidden = true }
-            return
-        }
-        let playing = l["playing"] as? Bool ?? false
-        let finding = l["finding"] as? Bool ?? false
-        let tail = l["tail"] as? Bool ?? false
-        let bars = l["bars"] as? Int ?? 0
-        let speed = l["speed"] as? Double ?? 1
-        let msg = l["status"] as? String ?? ""
-        loopEditItem.isHidden = !playing
-        loopBars.buttons.last?.isEnabled = playing || tail || finding
-        if playing {
-            let bpm = l["bpm"] as? Double ?? 0, meter = l["meter"] as? Int ?? 0, len = l["length"] as? Double ?? 0
-            loopHead.title = String(format: "Looping %d bar%@ · %.0f bpm · %d/bar · %.1f s",
-                                    bars, bars == 1 ? "" : "s", bpm, meter, len)
-                + (speed != 1 ? String(format: " · %.2f×", speed) : "")
-        } else if finding {
-            loopHead.title = "Finding the bars…"
-        } else if tail {
-            loopHead.title = "Catching up with the song"
-        } else {
-            loopHead.title = "Loop the last…"
-        }
-        if !msg.isEmpty && !finding { loopHead.title = msg }
-        loopSpeed.set(speed - 0.5, String(format: "%.2f×", speed))
-        loopClick.state = (l["click"] as? Bool ?? false) ? .on : .off
     }
 }
 

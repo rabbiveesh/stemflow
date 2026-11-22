@@ -9,8 +9,10 @@
 //! nudge 0.1
 //! snap solo|full|nobass|novocals
 //! loop 4                     loop the last 4 bars (or resize the loop playing)
-//! loop live                  back to the live stream (also again, move <da> <db>,
-//!                            shift <beats>, click on|off, speed <x>, pitch <semitones>)
+//! loop live                  back to the live stream (also again/top, move <da> <db>,
+//!                            shift <beats>, edges <a> <b>, bar1 <beat>, click on|off,
+//!                            speed <x>, pitch <semitones>, keep_pitch on|off)
+//! loop view 300              -> the loop for drawing (beats, peaks), not the state
 //! quit                       stop stemflow (as Ctrl-C would), after replying
 //! ```
 //!
@@ -85,6 +87,13 @@ fn handle(conn: UnixStream, ctl: &Control, info: &Info) -> Result<()> {
     let mut out = conn.try_clone()?;
     for line in BufReader::new(conn).lines() {
         let line = line?;
+        // `loop view <bins>`: the loop for drawing, instead of the state
+        if let Some(n) = line.trim().strip_prefix("loop view") {
+            let bins = n.trim().parse().unwrap_or(200);
+            out.write_all(ctl.loop_view(bins).as_bytes())?;
+            out.write_all(b"\n")?;
+            continue;
+        }
         let reply = match request(line.trim(), ctl, info) {
             Ok(()) => state(ctl, info, None),
             Err(e) => state(ctl, info, Some(&format!("{e:#}"))),

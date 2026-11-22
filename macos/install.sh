@@ -15,7 +15,7 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 # The GNOME extension's icon: the clef (recoloured by the app) and its accents.
 cp "$root/gnome/stemflow@veesh/icons/"stemflow-{clef-symbolic,accents}.svg "$app/Contents/Resources/"
-swiftc -O -o "$app/Contents/MacOS/Stemflow" "$here/StemflowBar/main.swift"
+swiftc -O -o "$app/Contents/MacOS/Stemflow" "$here"/StemflowBar/*.swift
 cat > "$app/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

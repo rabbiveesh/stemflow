@@ -53,6 +53,9 @@ pub struct Deck {
     speed: Mutex<(f32, f32, bool)>,
     /// Called after anything a UI shows changed.
     notify: Box<dyn Fn() + Send + Sync>,
+    /// Frames between the looper's read position and the speakers, so a drawn
+    /// playhead follows the ears.
+    lag: AtomicI64,
 }
 
 /// What a UI shows of the loop.
@@ -67,12 +70,17 @@ pub struct State {
     pub bpm: f32,
     pub meter: usize,
     pub bars: usize,
+    /// The loop's ends, as beat indices, and its length in beats (`b - a`).
+    pub a: usize,
+    pub b: usize,
+    pub beats: usize,
     /// Loop length, seconds (at speed 1).
     pub length: f32,
     /// Playhead, 0..1 of the loop.
     pub pos: f32,
     pub speed: f32,
     pub semis: f32,
+    pub keep_pitch: bool,
     pub click: bool,
     pub status: String,
 }
@@ -95,12 +103,18 @@ impl Deck {
             click: AtomicBool::new(false),
             speed: Mutex::new((1.0, 0.0, true)),
             notify,
+            lag: AtomicI64::new(0),
         })
     }
 
     /// The player: buffer frame `frame` is what the speakers play now.
     pub fn set_heard(&self, frame: i64) {
         self.heard.store(frame, Ordering::Relaxed);
+    }
+
+    /// The player: how many frames the speakers trail what it reads.
+    pub fn set_lag(&self, frames: i64) {
+        self.lag.store(frames, Ordering::Relaxed);
     }
 
     fn say(&self, s: impl Into<String>) {
@@ -170,8 +184,10 @@ impl Deck {
     }
 
     /// Run a text command (the control socket's and D-Bus's `loop ...`):
-    /// `<bars>`, `live`, `again`, `move <da> <db>` (beats), `shift <beats>`,
-    /// `click on|off`, `speed <x>`, `pitch <semitones>`, `keep_pitch on|off`.
+    /// `<bars>`, `live`, `again` (or `top`: from the top), `move <da> <db>` (beats),
+    /// `shift <beats>`, `edges <a> <b>` (beat indices), `bar1 <beat index>`,
+    /// `click on|off`, `meter`/`feel` (re-decode with the settings now set),
+    /// `speed <x>`, `pitch <semitones>`, `keep_pitch on|off`.
     pub fn command(self: &Arc<Self>, cmd: &str, s: Settings) -> Result<()> {
         let mut w = cmd.split_whitespace();
         let verb = w.next().context("loop what?")?;
@@ -184,7 +200,7 @@ impl Deck {
         let on = |v: Option<&str>| matches!(v, Some("1" | "true" | "on"));
         match verb {
             "live" => self.live(),
-            "again" => {
+            "again" | "top" => {
                 self.looper.play();
                 if self.looper.playing()
                     && !self.paused.load(Ordering::Relaxed)
@@ -206,6 +222,23 @@ impl Deck {
                 self.looper.shift(int()? as i32);
                 (self.notify)();
             }
+            "edges" => {
+                let (a, b) = (int()?, int()?);
+                if a < 0 || b <= a {
+                    bail!("the start has to come before the end");
+                }
+                let before = self.looper.view(1).map(|v| (v.a, v.b));
+                self.looper.set_edges(a as usize, b as usize);
+                if self.looper.view(1).map(|v| (v.a, v.b)) == before {
+                    self.say("The loop can't go there: not heard yet, or across a pause");
+                } else {
+                    self.say("");
+                }
+            }
+            "bar1" => {
+                self.looper.bar_one(int()?.max(0) as usize);
+                (self.notify)();
+            }
             "click" => {
                 let v = on(cmd.split_whitespace().nth(1));
                 self.click.store(v, Ordering::Relaxed);
@@ -213,9 +246,13 @@ impl Deck {
                 (self.notify)();
             }
             "meter" | "feel" => {
-                // re-decode the bars with the beat options now set
-                self.looper.redecode(s.meter, s.feel);
-                (self.notify)();
+                // re-decode the bars with the beat options now set (this can run the
+                // beat network, so not on the caller's thread)
+                let me = self.clone();
+                std::thread::spawn(move || {
+                    me.looper.redecode(s.meter, s.feel);
+                    (me.notify)();
+                });
             }
             "speed" | "pitch" | "keep_pitch" => {
                 let v = cmd.split_whitespace().nth(1).context("missing value")?;
@@ -238,13 +275,14 @@ impl Deck {
     }
 
     pub fn state(&self) -> State {
-        let (speed, semis, _) = *self.speed.lock().unwrap();
+        let (speed, semis, keep_pitch) = *self.speed.lock().unwrap();
         let mut s = State {
             playing: self.looper.playing(),
             finding: self.looper.finding(),
             tail: self.looper.tail_playing(),
             speed,
             semis,
+            keep_pitch,
             click: self.click.load(Ordering::Relaxed),
             status: self.status.lock().unwrap().clone(),
             ..Default::default()
@@ -253,6 +291,7 @@ impl Deck {
             s.bpm = v.bpm;
             s.meter = v.meter;
             s.bars = v.bars;
+            (s.a, s.b, s.beats) = (v.a, v.b, v.b - v.a);
             let len = v.end - v.start;
             s.length = (len / RATE) as f32;
             if len > 0.0 {
@@ -260,6 +299,48 @@ impl Deck {
             }
         }
         s
+    }
+
+    /// The loop for drawing, as JSON (`null` without one): its ends and the
+    /// playhead as heard, a bar either side, the beats in view as
+    /// `[frame, bar line 0|1, beat index]` and `bins` peak levels across the view.
+    /// Frames count from the view's left edge, at 44.1 kHz.
+    pub fn view_json(&self, bins: usize) -> String {
+        let Some(v) = self.looper.view(bins.clamp(1, 2000)) else {
+            return "null".into();
+        };
+        let rel = |f: f64| (f - v.from).round() as i64;
+        let len = v.end - v.start;
+        let speed = self.speed.lock().unwrap().0 as f64;
+        // what's heard: the lag back from where the looper reads, wrapped into the loop
+        let back = self.lag.load(Ordering::Relaxed) as f64 * speed;
+        let heard = if len > 0.0 {
+            v.start + (v.playhead - v.start - back).rem_euclid(len)
+        } else {
+            v.playhead
+        };
+        let beats: Vec<String> = v
+            .beats
+            .iter()
+            .map(|(f, bar, i)| format!("[{},{},{}]", rel(*f), *bar as u8, i))
+            .collect();
+        let peaks: Vec<String> = v.peaks.iter().map(|p| format!("{:.3}", p)).collect();
+        format!(
+            "{{\"playing\":{},\"bpm\":{:.1},\"meter\":{},\"bars\":{},\"a\":{},\"b\":{},\
+             \"to\":{},\"start\":{},\"end\":{},\"playhead\":{},\"beats\":[{}],\"peaks\":[{}]}}",
+            v.playing,
+            v.bpm,
+            v.meter,
+            v.bars,
+            v.a,
+            v.b,
+            rel(v.to),
+            rel(v.start),
+            rel(v.end),
+            rel(heard),
+            beats.join(","),
+            peaks.join(","),
+        )
     }
 }
 
@@ -278,17 +359,22 @@ impl State {
             .collect();
         format!(
             "{{\"playing\":{},\"finding\":{},\"tail\":{},\"bpm\":{:.1},\"meter\":{},\"bars\":{},\
-             \"length\":{:.3},\"pos\":{:.3},\"speed\":{},\"semis\":{},\"click\":{},\"status\":\"{esc}\"}}",
+             \"a\":{},\"b\":{},\"beats\":{},\"length\":{:.3},\"pos\":{:.3},\"speed\":{},\"semis\":{},\
+             \"keep_pitch\":{},\"click\":{},\"status\":\"{esc}\"}}",
             self.playing,
             self.finding,
             self.tail,
             self.bpm,
             self.meter,
             self.bars,
+            self.a,
+            self.b,
+            self.beats,
             self.length,
             self.pos,
             self.speed,
             self.semis,
+            self.keep_pitch,
             self.click,
         )
     }
@@ -330,6 +416,8 @@ mod tests {
             "{}",
             st.json()
         );
+        assert_eq!(d.view_json(10), "null");
+        assert!(d.command("edges 3 1", s).is_err());
         d.live();
         assert_eq!(d.state().status, "");
     }
