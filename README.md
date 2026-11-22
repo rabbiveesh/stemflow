@@ -122,7 +122,11 @@ cargo build --release
 - Audio runs at the output device's rate (often 48 kHz) and is resampled to and from
   44.1 kHz around the pipeline.
 - `--device coreml` hands what Core ML can run to the GPU / Neural Engine. The first
-  load compiles the model and caches it next to the `.onnx` file.
+  load compiles the model and caches it next to the `.onnx` file. On an M5, htdemucs_ft
+  takes 0.35 s per 7.8 s window this way (1.7 s on the CPU), so on a Mac use
+  `stemflow live --sep demucs --device coreml`. BS-RoFormer takes 2.1 s per 3 s window
+  on the CPU, too slow for live, and is slower still under Core ML (stemflow keeps it
+  on the CPU).
 - There's no menu yet; the D-Bus control only exists where a session bus does.
 
 ## GNOME Shell extension (GNOME 42)

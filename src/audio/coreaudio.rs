@@ -444,20 +444,21 @@ impl Capture for Cap {
         loop {
             while self.rx.slots() < 2 * self.chunk {
                 std::thread::sleep(Duration::from_millis(5));
-                if !self.told && self.since.elapsed() > Duration::from_secs(3) {
+                if !self.told && self.since.elapsed() > Duration::from_secs(10) {
                     self.told = true;
                     let calls = self.stats.callbacks.load(Ordering::Relaxed);
                     if calls == 0 {
-                        // macOS 26 without the permission: the device never starts.
+                        // macOS 26 without the permission: the device never starts. (A
+                        // Bluetooth output can take a few seconds to, hence 10 s.)
                         eprintln!(
-                            "stemflow: the audio device hasn't run once in 3 s, which is what \
+                            "stemflow: the audio device hasn't run once in 10 s, which is what \
                              macOS does without the recording permission. {}",
                             permission_hint()
                         );
                     } else {
                         let shape = self.stats.input_shape.load(Ordering::Relaxed);
                         eprintln!(
-                            "stemflow: no audio from the tap after 3 s ({calls} device callbacks; \
+                            "stemflow: no audio from the tap for 10 s ({calls} device callbacks; \
                              last input: {} buffer(s), {} channel(s) in the last)",
                             shape >> 16,
                             shape & 0xffff

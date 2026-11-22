@@ -396,6 +396,16 @@ pub struct BsRoformer {
 
 impl BsRoformer {
     pub fn load(path: &Path, device: Device, threads: usize, seg: usize) -> Result<Self> {
+        // Measured on an M5 (3 s window): CPU 2.1 s, Core ML 9.4 s on the Neural
+        // Engine and 50-70 s with the GPU. Its transformer doesn't suit Core ML.
+        let device = if device == Device::Coreml {
+            eprintln!(
+                "stemflow: BS-RoFormer runs faster on the CPU than with Core ML; using the CPU"
+            );
+            Device::Cpu
+        } else {
+            device
+        };
         let mut m = BsRoformer {
             session: session(
                 path,
