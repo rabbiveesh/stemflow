@@ -13,3 +13,5 @@ __pycache__/
 /tools/.venv-gpu/
 gnome/*/schemas/gschemas.compiled
 /models/*.coreml/
+/models/*.mlpackage/
+/models/*.mlmodelc/

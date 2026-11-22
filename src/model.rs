@@ -383,11 +383,29 @@ impl Separator for ScNet {
     }
 }
 
+enum Runner {
+    Ort(Session),
+    #[cfg(target_os = "macos")]
+    Coreml(crate::coreml::Model),
+}
+
+/// `bsrofo_sw_bass.onnx` -> `bsrofo_sw_bass.t259.mlpackage` (fp16, else `.t259.fp32`).
+pub fn coreml_package(onnx: &Path, frames: usize) -> Option<std::path::PathBuf> {
+    let stem = onnx.file_stem()?.to_str()?;
+    [
+        format!("{stem}.t{frames}.mlpackage"),
+        format!("{stem}.t{frames}.fp32.mlpackage"),
+    ]
+    .into_iter()
+    .map(|f| onnx.with_file_name(f))
+    .find(|p| p.is_dir())
+}
+
 /// BS-RoFormer SW, bass head, exported by tools/export_bsrofo.py. Its STFT
 /// (n_fft 2048, hop 512, Hann, unnormalized) runs here; the graph's frame axis is
 /// dynamic, so the window length is a free choice (trained at 588800 = 13.35 s).
 pub struct BsRoformer {
-    session: Session,
+    run: Runner,
     stft: HannStft,
     seg: usize,
     /// Output heads in the graph (tools/export_bsrofo.py with several stems).
@@ -396,25 +414,38 @@ pub struct BsRoformer {
 
 impl BsRoformer {
     pub fn load(path: &Path, device: Device, threads: usize, seg: usize) -> Result<Self> {
-        // Measured on an M5 (3 s window): CPU 2.1 s, Core ML 9.4 s on the Neural
-        // Engine and 50-70 s with the GPU. Its transformer doesn't suit Core ML.
-        let device = if device == Device::Coreml {
-            eprintln!(
-                "stemflow: BS-RoFormer runs faster on the CPU than with Core ML; using the CPU"
-            );
-            Device::Cpu
-        } else {
-            device
-        };
-        let mut m = BsRoformer {
-            session: session(
+        let stft = HannStft::new(2048, 512);
+        let frames = stft.frames_for(seg);
+        let run = match device {
+            // ORT's Core ML route is slower than the CPU for this model (M5, 3 s window:
+            // 9.4 s on the Neural Engine, 50-70 s with the GPU, CPU 2.1 s); a package
+            // converted by tools/export_bsrofo_coreml.py runs in 0.31 s on the GPU.
+            Device::Coreml => match coreml_package(path, frames) {
+                #[cfg(target_os = "macos")]
+                Some(pkg) => {
+                    eprintln!("stemflow: BS-RoFormer on Core ML: {}", pkg.display());
+                    Runner::Coreml(crate::coreml::Model::load(&pkg, "spec_in", "spec")?)
+                }
+                _ => {
+                    eprintln!(
+                        "stemflow: no Core ML package for a {frames}-frame window next to {} \
+                         (tools/export_bsrofo_coreml.py); BS-RoFormer runs on the CPU",
+                        path.display()
+                    );
+                    Runner::Ort(session(path, Device::Cpu, threads, 0, &[])?)
+                }
+            },
+            _ => Runner::Ort(session(
                 path,
                 device,
                 threads,
                 gpu_mem_mb(),
-                &[("frames", HannStft::new(2048, 512).frames_for(seg))],
-            )?,
-            stft: HannStft::new(2048, 512),
+                &[("frames", frames)],
+            )?),
+        };
+        let mut m = BsRoformer {
+            run,
+            stft,
             seg,
             stems: 1,
         };
@@ -433,11 +464,20 @@ impl BsRoformer {
 
     fn run(&mut self, spec_in: Vec<f32>) -> Result<Vec<f32>> {
         let (fr, bins) = (self.frames(), self.stft.bins());
-        let outputs = self.session.run(
-            ort::inputs!["spec_in" => Tensor::from_array(([1usize, 4, bins, fr], spec_in))?],
-        )?;
-        let (_, spec) = outputs["spec"].try_extract_tensor::<f32>()?;
-        Ok(spec.to_vec())
+        match &mut self.run {
+            Runner::Ort(session) => {
+                let outputs = session.run(
+                    ort::inputs!["spec_in" => Tensor::from_array(([1usize, 4, bins, fr], spec_in))?],
+                )?;
+                let (_, spec) = outputs["spec"].try_extract_tensor::<f32>()?;
+                Ok(spec.to_vec())
+            }
+            #[cfg(target_os = "macos")]
+            Runner::Coreml(m) => {
+                let mut spec_in = spec_in;
+                m.run(&[1, 4, bins, fr], &mut spec_in)
+            }
+        }
     }
 
     /// Model input: `[4, 1025, frames]` = L re, L im, R re, R im.
