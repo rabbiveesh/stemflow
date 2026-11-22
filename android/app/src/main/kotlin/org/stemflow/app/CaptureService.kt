@@ -61,6 +61,7 @@ import kotlin.math.sqrt
  * Control over adb (same receiver the notification buttons use):
  *   adb shell am broadcast -a org.stemflow.app.CMD -p org.stemflow.app --es snap full
  *   ... --ef balance -0.5     ... --ef bass 1.5 --ef band 0
+ *   ... --ei loop 4   ... --ez live true   ... --es save NAME   ... --es recall NAME
  */
 class CaptureService : Service() {
     companion object {
@@ -218,7 +219,14 @@ class CaptureService : Service() {
          */
         fun recall(c: Context, b: Bookmarks.Bookmark) {
             val h = looper
-            if (h == 0L || !running) { loopStatus = "Switch isolation on first"; return }
+            if (h == 0L || !running) {
+                // switching on (or about to): recalled once the audio flows
+                pendingRecall = b
+                pendingSince = System.currentTimeMillis()
+                loopStatus = "Switching on for ${b.name}…"
+                Log.i(TAG, "recall ${b.name}: once stemflow is on")
+                return
+            }
             val id = ++recallId
             recalling = true
             background("stemflow-recall") {
@@ -237,6 +245,10 @@ class CaptureService : Service() {
                 }
             }
         }
+
+        /** A bookmark tapped while off: recalled when the looper is up and audio flows. */
+        @Volatile var pendingRecall: Bookmarks.Bookmark? = null
+        @Volatile private var pendingSince = 0L
 
         /** A bookmark is on its way back: the music plays live until its loop is laid. */
         @Volatile var recalling = false; private set
@@ -753,6 +765,12 @@ class CaptureService : Service() {
             if (i.hasExtra("loop")) loopLast(c, i.getIntExtra("loop", 4)) // bars
             if (i.getBooleanExtra("live", false)) goLive(c)
             if (i.hasExtra("playpause")) playPause(c)
+            // debugging: save the loop as a bookmark / recall one, by name
+            i.getStringExtra("save")?.let { name -> saveBookmark(c, name)?.let { Log.w(TAG, "save: $it") } }
+            i.getStringExtra("recall")?.let { name ->
+                val b = Bookmarks.all(c).firstOrNull { it.name == name }
+                if (b == null) Log.w(TAG, "recall: no bookmark named $name") else recall(c, b)
+            }
             Control.saveBeats(c)
             i.getStringExtra("source")?.let { pkg -> Sources.select(c, Sources.apps(c).firstOrNull { it.pkg == pkg }) }
             if (i.getBooleanExtra("stop", false)) stopSelf()
@@ -938,6 +956,15 @@ class CaptureService : Service() {
 
     /** Buffer frame `frame` is where the player is now (if it says). */
     private fun markAnchor(frame: Long) {
+        pendingRecall?.let { b ->
+            if (looper != 0L) {
+                pendingRecall = null
+                if (System.currentTimeMillis() - pendingSince < 60_000) {
+                    Log.i(TAG, "recall ${b.name}: stemflow is on")
+                    recall(this, b)
+                } else Log.i(TAG, "recall ${b.name}: dropped, asked for over a minute ago")
+            }
+        }
         val ctl = NowPlaying.controller(this)
         val song = ctl?.let { NowPlaying.song(it) }
         val ms = ctl?.let { NowPlaying.positionMs(it) }
@@ -1351,6 +1378,7 @@ class CaptureService : Service() {
             wasPlaying -> "playing: resume it"
             else -> "paused: leave it"
         }))
+        pendingRecall = null
         running = false
         loading = false
         val error = status.contains("failed") || status.startsWith("No model") || status.contains("disconnected")

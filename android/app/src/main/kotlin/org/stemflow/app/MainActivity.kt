@@ -839,7 +839,12 @@ class MainActivity : Activity() {
             minimumHeight = dp(56)
             isClickable = true
             setBackgroundResource(android.R.drawable.list_selector_background)
-            setOnClickListener { CaptureService.recall(this@MainActivity, b); showTab(1) }
+            setOnClickListener {
+                val off = !CaptureService.running
+                CaptureService.recall(this@MainActivity, b)
+                if (off) start() // switch on; the bookmark is recalled once the audio flows
+                showTab(1)
+            }
             setOnLongClickListener { bookmarkMenu(b); true }
         }
     }
@@ -916,7 +921,7 @@ class MainActivity : Activity() {
     }
 
     private fun start() {
-        if (!notificationsOk()) return
+        if (!notificationsOk()) { CaptureService.pendingRecall = null; return }
         val go = {
             CaptureService.status = "Starting…"
             startForegroundService(Intent(this, CaptureService::class.java)); Unit

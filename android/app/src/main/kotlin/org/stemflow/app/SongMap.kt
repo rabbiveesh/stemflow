@@ -86,7 +86,9 @@ class SongMap {
             }
         }
         val floor = when {
-            cutWhy != null -> cutFloorMs?.takeIf { it <= a.songMs && it >= 0 }
+            // (only if the player has caught up with the seek: a report of the old
+            // place, which comes first sometimes, gets no floor)
+            cutWhy != null -> cutFloorMs?.takeIf { it >= 0 && a.songMs - it in 0..10_000 }
             // the next track, caught near its start: it began at 0
             !p.song.same(a.song) && a.songMs in 0..15_000 -> 0L
             else -> null

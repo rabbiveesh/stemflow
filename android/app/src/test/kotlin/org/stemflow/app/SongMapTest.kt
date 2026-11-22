@@ -82,14 +82,25 @@ class SongMapTest {
         assertNull(m.forSong(songA, 39_000, 43_000))
     }
 
+    @Test fun aStaleReportAfterASeekGetsNoFloor() {
+        val m = SongMap()
+        val end = play(m, songA, 0, 70_000, 5)
+        m.cut("seek", 5_000)
+        // the player still says the old place, then catches up
+        assertNotNull(m.observe(Anchor(end + R / 10, 75_100, songA)))
+        assertNull(m.msOf((end + R / 20).toDouble()))
+        assertNotNull(m.observe(Anchor(end + R, 5_080, songA)))
+        assertNull(m.forSong(songA, 5_000, 5_080))
+    }
+
     @Test fun aSeekTargetNeverReachesIntoTheStretchBefore() {
         val m = SongMap()
         val end = play(m, songA, 0, 100_000, 20)
-        m.cut("seek", 10_000)
-        // anchor says 30 s: 20 s back would be before the last anchor of the old stretch
-        m.observe(Anchor(end + 5 * R, 30_000, songA))
+        m.cut("seek", 20_000)
+        // anchor says 25 s, 2 s of frames on: 5 s back would be before the old stretch's end
+        m.observe(Anchor(end + 2 * R, 25_000, songA))
         assertEquals(100_000L + 20_000L, m.msOf(end.toDouble()))
-        assertEquals(26_000L, m.msOf((end + R).toDouble()))
+        assertEquals(24_000L, m.msOf((end + R).toDouble()))
     }
 
     @Test fun smallJitterIsNoBreakButAPauseIs() {
