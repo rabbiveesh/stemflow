@@ -69,6 +69,8 @@ pub const HTDEMUCS_SEGMENT: usize = 343_980; // int(7.8 s * 44100)
 pub enum Device {
     Cpu,
     Cuda,
+    /// Core ML (macOS): ONNX Runtime hands what it can to the GPU / Neural Engine.
+    Coreml,
 }
 
 /// Load libonnxruntime: $ORT_DYLIB_PATH, else vendor/ort-{cpu,cuda} (tools/fetch-ort.sh).
@@ -108,7 +110,11 @@ pub(crate) fn runtime(device: Device) -> Result<&'static ort::environment::Envir
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("vendor")
                 .join(flavor)
-                .join("lib/libonnxruntime.so")
+                .join(if cfg!(target_os = "macos") {
+                    "lib/libonnxruntime.dylib"
+                } else {
+                    "lib/libonnxruntime.so"
+                })
         });
     let env = ort::init_from(&lib)
         .map_err(|e| anyhow::anyhow!("loading {}: {e} (run tools/fetch-ort.sh)", lib.display()))?
@@ -147,7 +153,15 @@ fn blocking_sync() {
     });
 }
 
-fn session(path: &Path, device: Device, threads: usize, gpu_mem_mb: usize) -> Result<Session> {
+/// `dims`: values for the graph's named dynamic axes. Core ML can't compile
+/// unbounded dimensions, so with `Device::Coreml` they're fixed to these.
+fn session(
+    path: &Path,
+    device: Device,
+    threads: usize,
+    gpu_mem_mb: usize,
+    dims: &[(&str, usize)],
+) -> Result<Session> {
     let _ = gpu_mem_mb; // unused without the cuda feature
     let env = runtime(device)?;
     let mut b = Session::builder(env)?
@@ -179,6 +193,38 @@ fn session(path: &Path, device: Device, threads: usize, gpu_mem_mb: usize) -> Re
         #[cfg(not(feature = "cuda"))]
         anyhow::bail!("built without the `cuda` feature; rebuild with `--features cuda`");
     }
+    if device == Device::Coreml {
+        #[cfg(target_os = "macos")]
+        {
+            use ort::ep::coreml::{ComputeUnits, ModelFormat};
+            for &(name, n) in dims {
+                b = b
+                    .with_dimension_override(name, n as i64)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            // Compiling for Core ML takes a while; keep the result next to the model.
+            let mut cache = path.as_os_str().to_owned();
+            for &(name, n) in dims {
+                cache.push(format!(".{name}{n}"));
+            }
+            cache.push(".coreml");
+            let cache = std::path::PathBuf::from(cache);
+            std::fs::create_dir_all(&cache)?;
+            b = b
+                .with_execution_providers([ort::ep::CoreML::default()
+                    .with_model_format(ModelFormat::MLProgram)
+                    .with_compute_units(ComputeUnits::All)
+                    .with_model_cache_dir(cache.display())
+                    .build()
+                    .error_on_failure()])
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = dims;
+            anyhow::bail!("--device coreml is macOS only");
+        }
+    }
     b.commit_from_file(path).with_context(|| {
         format!(
             "loading model {} (see README: model export)",
@@ -189,7 +235,7 @@ fn session(path: &Path, device: Device, threads: usize, gpu_mem_mb: usize) -> Re
 
 impl HtDemucs {
     pub fn load(path: &Path, device: Device, threads: usize) -> Result<Self> {
-        let session = session(path, device, threads, gpu_mem_mb())?;
+        let session = session(path, device, threads, gpu_mem_mb(), &[])?;
         let seg = HTDEMUCS_SEGMENT;
         let mut m = HtDemucs {
             session,
@@ -274,7 +320,7 @@ impl ScNet {
             padding += HOP;
         }
         let mut m = ScNet {
-            session: session(path, device, threads, gpu_mem_mb())?,
+            session: session(path, device, threads, gpu_mem_mb(), &[])?,
             stft: PlainStft::new(),
             seg,
             padding,
@@ -350,8 +396,24 @@ pub struct BsRoformer {
 
 impl BsRoformer {
     pub fn load(path: &Path, device: Device, threads: usize, seg: usize) -> Result<Self> {
+        // Measured on an M5 (3 s window): CPU 2.1 s, Core ML 9.4 s on the Neural
+        // Engine and 50-70 s with the GPU. Its transformer doesn't suit Core ML.
+        let device = if device == Device::Coreml {
+            eprintln!(
+                "stemflow: BS-RoFormer runs faster on the CPU than with Core ML; using the CPU"
+            );
+            Device::Cpu
+        } else {
+            device
+        };
         let mut m = BsRoformer {
-            session: session(path, device, threads, gpu_mem_mb())?,
+            session: session(
+                path,
+                device,
+                threads,
+                gpu_mem_mb(),
+                &[("frames", HannStft::new(2048, 512).frames_for(seg))],
+            )?,
             stft: HannStft::new(2048, 512),
             seg,
             stems: 1,

@@ -18,6 +18,7 @@
 //! band (everything else) are then three plain levels, and "Band" no longer includes
 //! the vocals. The one-line balance still moves bass against band only.
 
+#[cfg(target_os = "linux")]
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -391,6 +392,7 @@ pub fn save_levels(ctl: &Control) {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct Service {
     ctl: Arc<Control>,
     models: PathBuf,
@@ -399,6 +401,7 @@ struct Service {
     hop: f64,
 }
 
+#[cfg(target_os = "linux")]
 impl Service {
     async fn changed(&self, em: &zbus::object_server::SignalEmitter<'_>) {
         save_levels(&self.ctl);
@@ -421,6 +424,7 @@ impl Service {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[zbus::interface(name = "org.stemflow.Control")]
 impl Service {
     /// One-slider view: -1 = bass solo, 0 = full mix, +1 = no bass.
@@ -628,6 +632,7 @@ impl Service {
     }
 }
 
+#[cfg(target_os = "linux")]
 /// Claim `org.stemflow.Control` on the session bus. Keep the returned connection
 /// alive for as long as the service should exist.
 pub fn serve(

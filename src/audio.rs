@@ -1,79 +1,116 @@
-//! Live I/O through the PulseAudio API (served by pipewire-pulse, or real PulseAudio).
+//! Live mode: capture the target app, separate, and play the stems back.
 //!
-//! We create a null sink called `stemflow`, move the target app's streams into it,
-//! capture its monitor, run the separator, and play the result to the real output.
+//! The platform part (`pulse` on Linux, `coreaudio` on macOS) only moves audio:
+//! it takes the app's sound away from the speakers, hands it to us as 44.1 kHz
+//! stereo, and plays what we give back. Everything else is shared.
+
+#[cfg(target_os = "macos")]
+mod coreaudio;
+#[cfg(target_os = "linux")]
+mod pulse;
+#[cfg(target_os = "macos")]
+use coreaudio as backend;
+#[cfg(target_os = "linux")]
+use pulse as backend;
 
 use crate::control::Control;
 use crate::model::{Separator, SAMPLE_RATE};
 use crate::stream::{Stems, Streamer};
-use anyhow::{bail, Context, Result};
-use libpulse_binding::def::BufferAttr;
-use libpulse_binding::sample::{Format, Spec};
-use libpulse_binding::stream::Direction;
-use libpulse_simple_binding::Simple;
-use std::process::Command;
+use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Instant;
 
-const SINK: &str = "stemflow";
-
-fn pactl(args: &[&str]) -> Result<String> {
-    let out = Command::new("pactl")
-        .args(args)
-        .output()
-        .context("running pactl")?;
-    if !out.status.success() {
-        bail!(
-            "pactl {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+/// Blocking source of interleaved 44.1 kHz stereo, about 20 ms per call.
+pub trait Capture: Send {
+    fn read(&mut self) -> Result<Vec<f32>>;
 }
 
-/// Returns the module index if we created the sink (so we unload it on exit).
-fn ensure_sink() -> Result<Option<String>> {
-    let sinks = pactl(&["list", "short", "sinks"])?;
-    if sinks.lines().any(|l| l.split('\t').nth(1) == Some(SINK)) {
-        return Ok(None);
-    }
-    let idx = pactl(&[
-        "load-module",
-        "module-null-sink",
-        &format!("sink_name={SINK}"),
-        "sink_properties=device.description=stemflow",
-        "rate=44100",
-        "channels=2",
-    ])?;
-    Ok(Some(idx.trim().to_string()))
+/// Blocking sink of interleaved 44.1 kHz stereo: returns once `x` is queued, which
+/// waits while the device buffer (`play_frames` of [`backend::open`]) is full.
+pub trait Playback: Send {
+    fn write(&mut self, x: &[f32]) -> Result<()>;
 }
 
-/// Sink-input ids whose application.name contains `needle` (case-insensitive).
-fn find_streams(needle: &str) -> Result<Vec<String>> {
-    let needle = needle.to_lowercase();
-    let mut ids = Vec::new();
-    let mut cur: Option<String> = None;
-    for line in pactl(&["list", "sink-inputs"])?.lines() {
-        let l = line.trim();
-        if let Some(id) = l.strip_prefix("Sink Input #") {
-            cur = Some(id.to_string());
-        } else if let Some(name) = l.strip_prefix("application.name = ") {
-            if name.to_lowercase().contains(&needle) {
-                ids.extend(cur.clone());
+/// An open route: the app's audio diverted to `capture`, `playback` to the speakers.
+pub struct Io {
+    pub capture: Box<dyn Capture>,
+    pub playback: Box<dyn Playback>,
+    /// Called every 2 s: pick up streams or processes the app opened since.
+    pub regrab: Box<dyn FnMut() + Send>,
+    /// Called from the Ctrl-C handler, just before exiting: give the app its sound back.
+    pub cleanup: Box<dyn Fn() + Send + Sync>,
+    /// What was grabbed, for the start-up line.
+    pub route: String,
+    /// The real output it plays to.
+    pub output: String,
+    /// Printed under the start-up line, e.g. when nothing was grabbed yet.
+    pub hint: Option<String>,
+}
+
+/// Open the platform route for `grab` (an app name, case-insensitive substring).
+pub fn open(grab: &str, output: Option<String>, name: &str) -> Result<Io> {
+    // Keep the device buffer small and the jitter buffer in the player instead, so
+    // the mix levels (applied as samples leave for the device) change within ~0.1 s.
+    backend::open(grab, output, name, 5 * BLOCK)
+}
+
+/// The player's block: 20 ms.
+const BLOCK: usize = SAMPLE_RATE as usize / 50;
+
+/// Exit on Ctrl-C after `cleanup`.
+fn on_ctrlc(running: Arc<AtomicBool>, cleanup: Box<dyn Fn() + Send + Sync>) -> Result<()> {
+    ctrlc::set_handler(move || {
+        running.store(false, Ordering::SeqCst);
+        cleanup();
+        // Skip atexit/static destructors: tearing down CUDA under live audio threads segfaults.
+        unsafe { libc::_exit(0) };
+    })?;
+    Ok(())
+}
+
+/// No model: play the captured app straight back, printing its level every second.
+/// Checks the route (capture, muting the original, playback) on its own.
+pub fn passthrough(grab: &str, output: Option<String>, seconds: Option<f32>) -> Result<()> {
+    let Io {
+        mut capture,
+        mut playback,
+        mut regrab,
+        cleanup,
+        route,
+        output,
+        hint,
+    } = open(grab, output, "passthrough")?;
+    on_ctrlc(Arc::new(AtomicBool::new(true)), cleanup)?;
+    eprintln!("stemflow: {route} -> passthrough -> {output} (Ctrl-C to stop)");
+    if let Some(h) = hint {
+        eprintln!("  {h}");
+    }
+    let (mut n, mut peak, mut total) = (0usize, 0f32, 0usize);
+    let mut last_grab = Instant::now();
+    loop {
+        let v = capture.read()?;
+        peak = v.iter().fold(peak, |m, x| m.max(x.abs()));
+        n += v.len() / 2;
+        playback.write(&v)?;
+        if n >= SAMPLE_RATE as usize {
+            total += n;
+            let db = if peak > 0.0 {
+                format!("{:6.1} dBFS", 20.0 * peak.log10())
+            } else {
+                "silence".into()
+            };
+            eprintln!("{:5.1}s  peak {db}", total as f32 / SAMPLE_RATE as f32);
+            (n, peak) = (0, 0.0);
+            if seconds.is_some_and(|s| total as f32 >= s * SAMPLE_RATE as f32) {
+                return Ok(());
             }
         }
+        if last_grab.elapsed().as_secs() >= 2 {
+            last_grab = Instant::now();
+            regrab();
+        }
     }
-    Ok(ids)
-}
-
-fn bytes_to_f32(b: &[u8], out: &mut Vec<f32>) {
-    out.extend(b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)));
-}
-
-fn f32_to_bytes(x: &[f32]) -> Vec<u8> {
-    x.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
 pub type Live = Streamer<Box<dyn Separator + Send>>;
@@ -89,86 +126,26 @@ pub fn live(
     load: impl Fn(&str) -> Result<(Live, &'static str, Option<&'static str>)>,
 ) -> Result<()> {
     let mut st = Some(st);
-    let output = match output {
-        Some(o) => o,
-        None => pactl(&["get-default-sink"])?.trim().to_string(),
-    };
-    if output == SINK {
-        bail!("default sink is `{SINK}` itself; pass --output <real sink> (see `pactl list short sinks`)");
-    }
-    let module = ensure_sink()?;
+    let Io {
+        mut capture,
+        mut playback,
+        mut regrab,
+        cleanup,
+        route,
+        output,
+        hint,
+    } = open(grab, output, ctl.target())?;
     let running = Arc::new(AtomicBool::new(true));
-    {
-        let (r, module) = (running.clone(), module.clone());
-        ctrlc::set_handler(move || {
-            r.store(false, Ordering::SeqCst);
-            // Unloading the sink makes PipeWire move grabbed streams back to the default.
-            if let Some(m) = &module {
-                let _ = pactl(&["unload-module", m]);
-            }
-            // Skip atexit/static destructors: tearing down CUDA under live audio threads segfaults.
-            unsafe { libc::_exit(0) };
-        })?;
-    }
-
-    let spec = Spec {
-        format: Format::F32le,
-        channels: 2,
-        rate: SAMPLE_RATE,
-    };
-    let frame = 8usize; // bytes per stereo f32 frame
-    let rec = Simple::new(
-        None,
-        "stemflow",
-        Direction::Record,
-        Some(&format!("{SINK}.monitor")),
-        "capture",
-        &spec,
-        None,
-        Some(&BufferAttr {
-            maxlength: u32::MAX,
-            tlength: u32::MAX,
-            prebuf: u32::MAX,
-            minreq: u32::MAX,
-            fragsize: (SAMPLE_RATE as usize / 50 * frame) as u32, // 20 ms
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("opening capture: {e}"))?;
+    on_ctrlc(running.clone(), cleanup)?;
     let hop = st.as_ref().unwrap().hop;
-    // Keep the device buffer small and the jitter buffer here instead, so the mix
-    // levels (applied as samples leave for the device) change within ~0.1 s.
-    let block = SAMPLE_RATE as usize / 50; // 20 ms
-    let play_buf = (5 * block * frame) as u32;
-    let play = Simple::new(
-        None,
-        "stemflow",
-        Direction::Playback,
-        Some(&output),
-        ctl.target(),
-        &spec,
-        None,
-        Some(&BufferAttr {
-            maxlength: u32::MAX,
-            tlength: play_buf,
-            prebuf: u32::MAX,
-            minreq: u32::MAX,
-            fragsize: u32::MAX,
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("opening playback on {output}: {e}"))?;
-
-    let grabbed = find_streams(grab)?;
-    for id in &grabbed {
-        pactl(&["move-sink-input", id, SINK])?;
-    }
+    let block = BLOCK;
     eprintln!(
-        "stemflow: {} `{grab}` stream(s) -> {SINK} -> {} -> {output}; latency ≈ {:.1}s (Ctrl-C to stop)",
-        grabbed.len(),
+        "stemflow: {route} -> {} -> {output}; latency ≈ {:.1}s (Ctrl-C to stop)",
         ctl.target(),
         (st.as_ref().unwrap().latency() as f32 / SAMPLE_RATE as f32) + slack
     );
-    if grabbed.is_empty() {
-        eprintln!("  (no `{grab}` stream yet; start playback, or move any app to \"stemflow\" in pavucontrol)");
+    if let Some(h) = hint {
+        eprintln!("  {h}");
     }
 
     // capture -> worker -> playback, each on its own thread.
@@ -176,13 +153,8 @@ pub fn live(
     let (tx_out, rx_out) = mpsc::channel::<Stems>();
     let r = running.clone();
     std::thread::spawn(move || {
-        let mut buf = vec![0u8; SAMPLE_RATE as usize / 50 * frame];
         while r.load(Ordering::Relaxed) {
-            if rec.read(&mut buf).is_err() {
-                break;
-            }
-            let mut v = Vec::with_capacity(buf.len() / 4);
-            bytes_to_f32(&buf, &mut v);
+            let Ok(v) = capture.read() else { break };
             if tx_in.send(v).is_err() {
                 break;
             }
@@ -263,8 +235,7 @@ pub fn live(
                 played += block as i64;
                 g = target;
                 pos += block;
-                play.write(&f32_to_bytes(&out))
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                playback.write(&out)?;
                 if running_low(&bass, pos, block) {
                     break; // go fetch the next chunk once we're down to one block
                 }
@@ -332,11 +303,7 @@ pub fn live(
         // Pick up streams the app opens later (Spotify reopens on device changes).
         if last_grab.elapsed().as_secs() >= 2 {
             last_grab = Instant::now();
-            if let Ok(ids) = find_streams(grab) {
-                for id in ids {
-                    let _ = pactl(&["move-sink-input", &id, SINK]);
-                }
-            }
+            regrab();
         }
     }
     Ok(())

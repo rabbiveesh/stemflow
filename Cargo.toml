@@ -12,13 +12,27 @@ clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 libc = "0.2"
 hound = "3"
-libpulse-binding = "2"
-libpulse-simple-binding = "2"
 # ONNX Runtime is loaded at runtime from vendor/ (fetched from Microsoft's GitHub
 # releases by tools/fetch-ort.sh); ort's own CDN download is not used.
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
 realfft = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5"
+libpulse-binding = "2"
+libpulse-simple-binding = "2"
+
+# Core Audio process taps (macOS 14.2+) for capture, an aggregate device for playback.
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic", "coreml"] }
+objc2 = "0.6"
+objc2-core-audio = "0.3"
+objc2-core-audio-types = "0.3"
+objc2-core-foundation = "0.3"
+objc2-foundation = "0.3"
+rtrb = "0.4"
+rubato = "1"
+audioadapter-buffers = "2"
 
 [features]
 default = []

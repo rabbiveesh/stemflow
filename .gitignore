@@ -12,3 +12,4 @@ __pycache__/
 /models/ref_bsrofo/
 /tools/.venv-gpu/
 gnome/*/schemas/gschemas.compiled
+/models/*.coreml/

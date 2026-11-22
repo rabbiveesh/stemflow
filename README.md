@@ -96,6 +96,69 @@ tools/.venv/bin/python -I tools/export_beat_this.py models/beats tools/.venv-gpu
 
 Switch it on from the menu ("Beat click") or `busctl --user set-property org.stemflow.Control /org/stemflow/Control org.stemflow.Control Click b true`. `Meter` (beats per bar, 0 = auto) and `Feel` (0.5 half time, 1, 2 double time) set the bar lines and the beat; `Beats` says what the tracker found. Every 3 s it re-analyses the last 30 s of input (about 0.35 s on the GPU while separating). The input runs ahead of what you hear by the separator's lookahead, so the click comes from audio already analysed. A change of tempo or meter has to show up three times in a row (9 s) before the click follows it. `stemflow file --click in.wav out.wav` renders the same thing to a file.
 
+## macOS (Apple Silicon)
+
+*New, and not yet tried on a real Mac.* Live mode taps the app with a Core Audio
+process tap (macOS 14.2+), which also mutes it on the speakers while stemflow runs,
+and plays the result through a private aggregate device on your output. Both belong
+to the stemflow process, so Ctrl-C or a crash gives the app its sound back.
+
+```bash
+tools/fetch-ort.sh cpu          # osx-arm64 ONNX Runtime, CoreML provider included
+tools/setup-export-env.sh       # then export the models as above
+cargo build --release
+./target/release/stemflow passthrough      # no model: Spotify -> tap -> speakers, levels per second
+./target/release/stemflow live             # CPU
+./target/release/stemflow live --device coreml
+```
+
+- The first run asks for **System Audio Recording** permission for the app you started
+  stemflow from (Terminal, iTerm, ...). Without it the tap hears silence, and stemflow
+  says so once the app is playing. Over ssh there's no prompt: add the terminal (or
+  `/usr/libexec/sshd-keygen-wrapper`) under System Settings > Privacy & Security >
+  Screen & System Audio Recording.
+- `--grab` matches the bundle id or executable name (`spotify` catches Spotify's
+  audio helper). `--output` takes a device name or UID.
+- Audio runs at the output device's rate (often 48 kHz) and is resampled to and from
+  44.1 kHz around the pipeline.
+- `--device coreml` hands what Core ML can run to the GPU / Neural Engine. The first
+  load compiles the model and caches it next to the `.onnx` file. On an M5, htdemucs_ft
+  takes 0.35 s per 7.8 s window this way (1.7 s on the CPU), so on a Mac use
+  `stemflow live --sep demucs --device coreml`. BS-RoFormer takes 2.1 s per 3 s window
+  on the CPU, too slow for live, and is slower still under Core ML (stemflow keeps it
+  on the CPU).
+- On macOS, `live` defaults to `--sep demucs --device coreml`.
+
+### Menu bar app
+
+```bash
+cargo build --release
+macos/install.sh            # builds ~/Applications/Stemflow.app and opens it (--login: start at login)
+```
+
+The same menu as the GNOME extension: start/stop, the balance slider with a boost, or
+separate sliders, snap buttons, beat click with meter and feel, the stem and model
+pickers, and the stats line. It starts `stemflow live` itself (flags from
+`STEMFLOW_ARGS` in `~/.config/stemflow/env`, log in `~/Library/Logs/stemflow.log`), so
+the recording permission is asked for "Stemflow". Scrolling on the icon moves the mix.
+Hotkeys use ⌃⌥ where GNOME uses Super (⌘[ and ⌘] are Back and Forward in Mac apps):
+
+| key | |
+|---|---|
+| `⌃⌥[` / `⌃⌥]` | toward bass solo / toward play-along |
+| `⌃⌥\` | bass solo, or back to where you were |
+| `⌃⌥⇧\` | no bass (play-along), or back |
+| `⌃⌥B` | start / stop |
+
+### Control socket
+
+Every platform also serves the controls on a Unix socket, one request per line and
+the whole state back as JSON (`src/socket.rs` has the list):
+
+```bash
+echo "snap solo" | nc -U ~/Library/Application\ Support/stemflow/control.sock   # Linux: $XDG_RUNTIME_DIR/stemflow.sock
+```
+
 ## GNOME Shell extension (GNOME 42)
 
 ```bash

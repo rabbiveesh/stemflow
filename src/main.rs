@@ -4,6 +4,7 @@ mod control;
 mod looper;
 mod model;
 mod models;
+mod socket;
 mod spec;
 mod stream;
 mod stretch;
@@ -38,6 +39,19 @@ enum Cmd {
         /// Extra playback buffer in seconds to absorb compute jitter.
         #[arg(long, default_value_t = 0.3)]
         slack: f32,
+    },
+    /// Check the live route without a model: capture the app (taking it off the
+    /// speakers) and play it straight back, printing its level every second.
+    Passthrough {
+        /// Capture apps whose name contains this (case-insensitive).
+        #[arg(long, default_value = "spotify")]
+        grab: String,
+        /// Output (default: the current default output).
+        #[arg(long)]
+        output: Option<String>,
+        /// Stop after this many seconds (default: run until Ctrl-C).
+        #[arg(long)]
+        seconds: Option<f32>,
     },
     /// Run the streaming pipeline over a WAV file (44.1 kHz) and write the result.
     File {
@@ -133,8 +147,8 @@ enum Sep {
 
 #[derive(Args, Clone)]
 struct Opts {
-    /// Architecture (default bsrofo). Live, without --sep/--target/--model, the model
-    /// last picked in the menu is used.
+    /// Architecture (default bsrofo; demucs on macOS, where BS-RoFormer can't keep up).
+    /// Live, without --sep/--target/--model, the model last picked in the menu is used.
     #[arg(long, value_enum)]
     sep: Option<Sep>,
     /// Stem to isolate or remove (default bass). Anything but bass needs --sep bsrofo or
@@ -199,7 +213,11 @@ struct Opts {
 
 impl Opts {
     fn sep(&self) -> Sep {
-        self.sep.unwrap_or(Sep::Bsrofo)
+        self.sep.unwrap_or(if cfg!(target_os = "macos") {
+            Sep::Demucs
+        } else {
+            Sep::Bsrofo
+        })
     }
     fn target(&self) -> Target {
         self.target.unwrap_or(Target::Bass)
@@ -217,7 +235,9 @@ impl Opts {
 }
 
 fn default_device() -> Device {
-    if cfg!(feature = "cuda") {
+    if cfg!(target_os = "macos") {
+        Device::Coreml
+    } else if cfg!(feature = "cuda") {
         Device::Cuda
     } else {
         Device::Cpu
@@ -346,6 +366,11 @@ fn main() -> Result<()> {
             };
             let target = m.as_ref().map_or(opts.target().name(), |m| m.target);
             let second = m.as_ref().and_then(|m| m.second);
+            eprintln!(
+                "stemflow: model {} on {:?}",
+                m.as_ref().map_or("ensemble", |m| &m.id),
+                opts.device
+            );
             let ctl = levels(&opts, target, second, true);
             ctl.set_model(m.as_ref().map_or("ensemble", |m| &m.id));
             control::load_beat_options(&ctl);
@@ -375,6 +400,7 @@ fn main() -> Result<()> {
                 st.hop as f64 / SAMPLE_RATE as f64,
             );
             // Off the bus is fine (e.g. no session bus over ssh): CLI flags still work.
+            #[cfg(target_os = "linux")]
             let _bus = control::serve(
                 ctl.clone(),
                 opts.models.clone(),
@@ -384,6 +410,20 @@ fn main() -> Result<()> {
             )
             .map_err(|e| eprintln!("stemflow: no D-Bus control ({e})"))
             .ok();
+            // The same controls on a Unix socket (the macOS menu bar app, scripts).
+            match socket::serve(
+                ctl.clone(),
+                socket::Info {
+                    models: opts.models.clone(),
+                    app: grab.clone(),
+                    latency: lat + slack as f64,
+                    hop,
+                    beats: tracker.is_some(),
+                },
+            ) {
+                Ok(p) => eprintln!("stemflow: control socket {}", p.display()),
+                Err(e) => eprintln!("stemflow: no control socket ({e:#})"),
+            }
             // Switching models from the menu: drop the running one (frees the GPU),
             // then load the new one with the same settings.
             let load =
@@ -394,6 +434,11 @@ fn main() -> Result<()> {
                 };
             audio::live(st, ctl, tracker, &grab, output, slack, load)
         }
+        Cmd::Passthrough {
+            grab,
+            output,
+            seconds,
+        } => audio::passthrough(&grab, output, seconds),
         Cmd::Beats { opts, input, meter } => {
             let r = hound::WavReader::open(&input)?;
             let spec = r.spec();
