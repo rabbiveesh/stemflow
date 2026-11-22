@@ -438,9 +438,11 @@ pub fn coreml_package(onnx: &Path, tag: &str) -> Option<std::path::PathBuf> {
     .find(|p| p.is_dir())
 }
 
-/// Where Demucs runs under Core ML.
+/// Where Demucs runs under Core ML. On an M5 the fp16 package on CPU+GPU takes 0.14 s
+/// per 7.8 s window; with All, Core ML puts part of it on the Neural Engine and the
+/// output goes wrong (spec error ~46), and the Neural Engine alone won't compile it.
 #[cfg(target_os = "macos")]
-const DEMUCS_UNITS: crate::coreml::Units = crate::coreml::Units::All;
+const DEMUCS_UNITS: crate::coreml::Units = crate::coreml::Units::CpuAndGpu;
 
 /// BS-RoFormer SW, bass head, exported by tools/export_bsrofo.py. Its STFT
 /// (n_fft 2048, hop 512, Hann, unnormalized) runs here; the graph's frame axis is
