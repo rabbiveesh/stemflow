@@ -729,7 +729,12 @@ final class Controller: NSObject, NSMenuDelegate, NSPopoverDelegate {
     func loadPanel() {
         guard isOn, loopState != nil else { return loopSec.render(nil) }
         queue.async {
-            let p = requestAny("loop panel") as? [String: Any]
+            var p = requestAny("loop panel") as? [String: Any]
+            // an engine older than the shared panel: say so rather than show nothing
+            if let e = p?["error"] as? String, e.contains("panel") {
+                let note = "This stemflow is too old for the loop panel: cargo build --release, then switch it off and on"
+                p = ["rows": [["id": "note", "items": [["kind": "text", "text": note, "style": "small"]]]]]
+            }
             DispatchQueue.main.async { self.loopSec.render(p) }
         }
     }
