@@ -153,8 +153,10 @@ final class SliderRow: NSView {
     var onChange: (Double) -> Void = { _ in }
     var dragging = false
 
-    init(_ text: String, onChange: @escaping (Double) -> Void) {
+    init(_ text: String, inset: CGFloat = 14, onChange: @escaping (Double) -> Void) {
         super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 26))
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: 26).isActive = true
         self.onChange = onChange
         label.stringValue = text
         for l in [label, value] { l.font = .menuFont(ofSize: 0); l.textColor = .labelColor }
@@ -167,8 +169,8 @@ final class SliderRow: NSView {
         row.translatesAutoresizingMaskIntoConstraints = false
         addSubview(row)
         NSLayoutConstraint.activate([
-            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
-            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -inset),
             row.centerYAnchor.constraint(equalTo: centerYAnchor),
             label.widthAnchor.constraint(equalToConstant: 52),
             value.widthAnchor.constraint(equalToConstant: 58),
@@ -194,6 +196,8 @@ final class SnapRow: NSView {
     var buttons: [String: NSButton] = [:]
     init(onSnap: @escaping (String) -> Void) {
         super.init(frame: NSRect(x: 0, y: 0, width: 300, height: 30))
+        translatesAutoresizingMaskIntoConstraints = false
+        heightAnchor.constraint(equalToConstant: 30).isActive = true
         let stack = NSStackView()
         stack.distribution = .fillEqually
         stack.spacing = 6
@@ -241,6 +245,13 @@ func viewItem(_ v: NSView) -> NSMenuItem {
     let i = NSMenuItem()
     i.view = v
     return i
+}
+
+/// A thin line across the panel, with room around it.
+func separatorRow() -> NSView {
+    let line = NSBox()
+    line.boxType = .separator
+    return inset(line, top: 4, bottom: 4)
 }
 
 func textItem() -> NSMenuItem {
@@ -342,11 +353,18 @@ func registerHotkeys() {
 
 // MARK: - The menu bar item
 
-final class Controller: NSObject, NSMenuDelegate {
+/// Clicking the icon opens a panel (a popover): the mix on top, the loop under it.
+/// It's a window rather than a menu, so it keeps one width, its rows don't move
+/// under the pointer, and it can stay open while you play. The settings (stem,
+/// model, beat click, log, quit) are behind the gear, or a right-click on the icon.
+final class Controller: NSObject, NSMenuDelegate, NSPopoverDelegate {
     static let shared = Controller()
 
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-    let menu = NSMenu()
+    let settings = NSMenu()
+    let popover = NSPopover()
+    let panel = NSStackView()
+    let width: CGFloat = 380
     let hud = HUD()
     let defaults = UserDefaults.standard
 
@@ -362,13 +380,14 @@ final class Controller: NSObject, NSMenuDelegate {
     let queue = DispatchQueue(label: "stemflow.socket")
 
     // rows
-    let switchItem = ClosureItem("Bass isolation") { Controller.shared.setRunning(!Controller.shared.isOnOrStarting) }
-    let desc = textItem()
+    let titleLabel = lineLabel("Bass isolation", font: .boldSystemFont(ofSize: NSFont.systemFontSize), color: .labelColor)
+    let onSwitch = NSSwitch()
+    let desc = lineLabel()
     var one: SliderRow!, boost: SliderRow!, bass: SliderRow!, band: SliderRow!, second: SliderRow!
-    var oneItem: NSMenuItem!, boostItem: NSMenuItem!, bassItem: NSMenuItem!, bandItem: NSMenuItem!, secondItem: NSMenuItem!
-    var snaps: SnapRow!, snapsItem: NSMenuItem!
-    let sep1 = NSMenuItem.separator()
-    let status = textItem()
+    var snaps: SnapRow!
+    let sep1 = separatorRow()
+    let status = lineLabel(font: .systemFont(ofSize: NSFont.smallSystemFontSize - 1), color: .tertiaryLabelColor)
+    let loopSep = separatorRow()
     let clickItem = ClosureItem("Beat click") {
         let c = Controller.shared
         c.send("set click \((c.state?["click"] as? Bool ?? false) ? "off" : "on")")
@@ -383,7 +402,7 @@ final class Controller: NSObject, NSMenuDelegate {
     var modelsKey = ""
     // looping (state["loop"], src/loopdeck.rs; Loop.swift)
     let loopSec = LoopSection { Controller.shared.send($0) }
-    var menuOpen = false
+    var menuOpen = false // the panel shows
     let viewQueue = DispatchQueue(label: "stemflow.loopview")
     var viewBusy = false
     var loopState: [String: Any]? { state?["loop"] as? [String: Any] }
@@ -396,9 +415,11 @@ final class Controller: NSObject, NSMenuDelegate {
         // puts the icon at the far left, where the notch can hide it.
         item.autosaveName = "stemflow"
         item.button?.image = statusIcon(tint: nil)
-        item.menu = menu
-        menu.delegate = self
-        menu.autoenablesItems = false
+        item.button?.target = self
+        item.button?.action = #selector(clicked)
+        item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        settings.delegate = self
+        settings.autoenablesItems = false
 
         one = SliderRow("Solo") { [unowned self] pos in
             var b = 2 * pos - 1
@@ -410,8 +431,6 @@ final class Controller: NSObject, NSMenuDelegate {
         band = SliderRow("Band") { [unowned self] v in send("set band \(v)") }
         second = SliderRow("") { [unowned self] v in send("set second_level \(v)") }
         snaps = SnapRow { [unowned self] name in snap(name) }
-        (oneItem, boostItem, bassItem, bandItem, secondItem, snapsItem) =
-            (viewItem(one), viewItem(boost), viewItem(bass), viewItem(band), viewItem(second), viewItem(snaps))
 
         let meters = NSMenu()
         for m in [0, 2, 3, 4, 5, 6, 7] {
@@ -430,17 +449,13 @@ final class Controller: NSObject, NSMenuDelegate {
         stemsItem.submenu = NSMenu()
         modelsItem.submenu = NSMenu()
 
-        for i in [switchItem, desc, oneItem, boostItem, bassItem, secondItem, bandItem, snapsItem, sep1, status,
-                  clickItem, beatOpts] {
-            menu.addItem(i!)
+        for i in [clickItem, beatOpts, NSMenuItem.separator(), stemsItem, modelsItem, expItem, advItem,
+                  NSMenuItem.separator()] {
+            settings.addItem(i)
         }
-        for i in loopSec.items { menu.addItem(i) }
-        loopSec.menu = menu
-        menu.addItem(.separator())
-        for i in [stemsItem, modelsItem, expItem, advItem] { menu.addItem(i) }
-        menu.addItem(.separator())
-        menu.addItem(ClosureItem("Open log") { NSWorkspace.shared.open(logURL) })
-        menu.addItem(ClosureItem("Quit") { Controller.shared.quit() })
+        settings.addItem(ClosureItem("Open log") { NSWorkspace.shared.open(logURL) })
+        settings.addItem(ClosureItem("Quit stemflow") { Controller.shared.quit() })
+        buildPanel()
 
         // Scrolling on the icon moves the mix.
         NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { ev in
@@ -451,8 +466,8 @@ final class Controller: NSObject, NSMenuDelegate {
         }
 
         let t = Timer(timeInterval: 1, repeats: true) { _ in self.poll() }
-        RunLoop.main.add(t, forMode: .common) // keeps ticking while the menu is open
-        // The loop view moves with the playhead while the menu shows it.
+        RunLoop.main.add(t, forMode: .common) // keeps ticking while the panel is open
+        // The loop view moves with the playhead while the panel shows it.
         let v = Timer(timeInterval: 0.05, repeats: true) { _ in self.pollView() }
         RunLoop.main.add(v, forMode: .common)
         registerHotkeys()
@@ -633,23 +648,97 @@ final class Controller: NSObject, NSMenuDelegate {
         NSApp.terminate(nil)
     }
 
-    // MARK: menu contents
+    // MARK: contents
 
-    func menuWillOpen(_ menu: NSMenu) {
+    // MARK: the panel
+
+    func buildPanel() {
+        onSwitch.controlSize = .small
+        onSwitch.target = self
+        onSwitch.action = #selector(switched)
+        let gear = ClosureButton(title: "") { [unowned self] in showSettings() }
+        gear.bezelStyle = .texturedRounded
+        gear.isBordered = false
+        gear.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Settings")
+        gear.toolTip = "Stem, model, beat click, log, quit"
+        gearButton = gear
+        let head = NSStackView(views: [titleLabel, onSwitch, gear])
+        head.spacing = 8
+        titleLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        panel.orientation = .vertical
+        panel.alignment = .leading
+        panel.spacing = 4
+        panel.edgeInsets = NSEdgeInsets(top: 10, left: 0, bottom: 10, right: 0)
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        for v in [inset(head), inset(desc), one!, boost!, bass!, band!, second!, snaps!, sep1, inset(status), loopSep,
+                  loopSec.box] as [NSView] {
+            panel.addArrangedSubview(v)
+            v.widthAnchor.constraint(equalTo: panel.widthAnchor).isActive = true
+        }
+        panel.widthAnchor.constraint(equalToConstant: width).isActive = true
+        loopSec.onResize = { [unowned self] in fit() }
+
+        let vc = NSViewController()
+        vc.view = panel
+        popover.contentViewController = vc
+        popover.behavior = .transient
+        popover.animates = false
+        popover.delegate = self
+    }
+
+    /// The panel's height to its shown rows (its width never changes).
+    func fit() {
+        panel.layoutSubtreeIfNeeded()
+        let size = NSSize(width: width, height: panel.fittingSize.height)
+        if popover.contentSize != size { popover.contentSize = size }
+    }
+
+    @objc func clicked() {
+        let ev = NSApp.currentEvent
+        if ev?.type == .rightMouseUp || ev?.modifierFlags.contains(.control) == true { return showSettings() }
+        if popover.isShown { return popover.performClose(nil) }
+        guard let b = item.button else { return }
+        sync()
+        fit()
+        NSApp.activate(ignoringOtherApps: true)
+        popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.makeKey()
+    }
+
+    var gearButton: NSButton?
+
+    func showSettings() {
+        if let g = gearButton, popover.isShown {
+            settings.popUp(positioning: nil, at: NSPoint(x: 0, y: g.bounds.height + 4), in: g)
+        } else if let b = item.button {
+            settings.popUp(positioning: nil, at: NSPoint(x: 0, y: b.bounds.height + 5), in: b)
+        }
+    }
+
+    @objc func switched() { setRunning(onSwitch.state == .on) }
+
+    func popoverWillShow(_ notification: Notification) {
         menuOpen = true
         poll()
     }
+
+    func popoverDidClose(_ notification: Notification) { menuOpen = false }
 
     /// The loop panel, as stemflow declares it (`loop panel`).
     func loadPanel() {
         guard isOn, loopState != nil else { return loopSec.render(nil) }
         queue.async {
-            let p = requestAny("loop panel") as? [String: Any]
+            var p = requestAny("loop panel") as? [String: Any]
+            // an engine older than the shared panel: say so rather than show nothing
+            if let e = p?["error"] as? String, e.contains("panel") {
+                let note = "This stemflow is too old for the loop panel: cargo build --release, then switch it off and on"
+                p = ["rows": [["id": "note", "items": [["kind": "text", "text": note, "style": "small"]]]]]
+            }
             DispatchQueue.main.async { self.loopSec.render(p) }
         }
     }
 
-    func menuDidClose(_ menu: NSMenu) { menuOpen = false }
 
     func fillModels(_ models: [[String]], current: String) {
         if !current.isEmpty { lastModelFor[stemOf(current)] = current }
@@ -659,7 +748,9 @@ final class Controller: NSObject, NSMenuDelegate {
         if key == modelsKey { return }
         modelsKey = key
         let stem = stemOf(shown)
-        let tail = loading ? " · loading…" : ""
+        // no "· loading…" in the titles: the panel's status line already says it, and
+        // a title that changes re-lays the open menu
+        let tail = ""
 
         let sm = stemsItem.submenu!
         sm.removeAllItems()
@@ -697,25 +788,28 @@ final class Controller: NSObject, NSMenuDelegate {
         let on = isOn
         let adv = defaults.bool(forKey: "advanced")
         let exp = defaults.bool(forKey: "experiments")
-        switchItem.state = isOnOrStarting ? .on : .off
+        onSwitch.state = isOnOrStarting ? .on : .off
         expItem.state = exp ? .on : .off
         advItem.state = adv ? .on : .off
-        let rows: [NSMenuItem] = [desc, oneItem, boostItem, bassItem, bandItem, secondItem, snapsItem, sep1, status,
-                                  modelsItem, stemsItem, clickItem, beatOpts]
+        defer { fit() }
+        let rows: [NSView] = [one, boost, bass, band, second, snaps, sep1, status.superview!]
         for r in rows { r.isHidden = !on }
+        for i in [modelsItem, stemsItem, clickItem, beatOpts] { i.isHidden = !on }
+        loopSep.isHidden = !on || loopSec.box.isHidden
+        desc.superview?.isHidden = !on && starting == nil && startError.isEmpty
         if !on { loopSec.render(nil) }
 
         let button = item.button
         guard let s = state else {
             button?.image = starting != nil ? statusIcon(tint: clefOn, alpha: 0.5) : statusIcon(tint: nil)
-            switchItem.title = "Bass isolation"
-            desc.isHidden = starting == nil && startError.isEmpty
+            titleLabel.stringValue = "Bass isolation"
             if let st = starting {
                 let secs = Int(Date().timeIntervalSince(st.since))
-                desc.title = "Loading \(st.model.isEmpty ? "the model" : st.model)… \(secs) s"
+                desc.stringValue = "Loading \(st.model.isEmpty ? "the model" : st.model)… \(secs) s"
             } else {
-                desc.title = startError
+                desc.stringValue = startError
             }
+            desc.toolTip = desc.stringValue
             return
         }
         let over = s["overruns"] as? Int ?? 0
@@ -723,21 +817,22 @@ final class Controller: NSObject, NSMenuDelegate {
 
         let secondStem = s["second"] as? String ?? ""
         let three = !secondStem.isEmpty
-        oneItem.isHidden = adv || three
-        boostItem.isHidden = adv || three
-        bassItem.isHidden = !(adv || three)
-        bandItem.isHidden = !(adv || three)
-        secondItem.isHidden = !three
+        one.isHidden = adv || three
+        boost.isHidden = adv || three
+        bass.isHidden = !(adv || three)
+        band.isHidden = !(adv || three)
+        second.isHidden = !three
         snaps.buttons["novocals"]?.isHidden = !three
 
         let t = s["target"] as? String ?? "bass"
         let T = cap(t)
-        switchItem.title = three ? "\(T) + \(secondStem) isolation" : "\(T) isolation\(t == "vocals" ? " (karaoke)" : "")"
+        titleLabel.stringValue = three ? "\(T) + \(secondStem) isolation" : "\(T) isolation\(t == "vocals" ? " (karaoke)" : "")"
         bass.label.stringValue = T
         snaps.buttons["solo"]?.title = "\(T) solo"
         snaps.buttons["nobass"]?.title = "No \(t)"
         let statusText = s["status"] as? String ?? ""
-        desc.title = statusText.isEmpty ? (s["description"] as? String ?? "") : statusText
+        desc.stringValue = statusText.isEmpty ? (s["description"] as? String ?? "") : statusText
+        desc.toolTip = desc.stringValue
 
         let balance = s["balance"] as? Double ?? 0
         let b = s["bass"] as? Double ?? 1
@@ -755,7 +850,7 @@ final class Controller: NSObject, NSMenuDelegate {
 
         let app = s["app"] as? String ?? ""
         let lat = s["latency"] as? Double ?? 0, comp = s["compute"] as? Double ?? 0, hop = s["hop"] as? Double ?? 0
-        status.title = String(format: "%@ · %.1f s behind · model %.2f s of %.1f s", app, lat, comp, hop)
+        status.stringValue = String(format: "%@ · %.1f s behind · model %.2f s of %.1f s", app, lat, comp, hop)
             + (over > 0 ? " · \(over) dropouts" : "")
 
         // No beat tracker model: no click (as the extension hides it for old daemons).
@@ -765,7 +860,10 @@ final class Controller: NSObject, NSMenuDelegate {
         let click = s["click"] as? Bool ?? false
         let beats = s["beats"] as? String ?? ""
         clickItem.state = click ? .on : .off
-        clickItem.title = click && !beats.isEmpty ? "Beat click · \(beats)" : "Beat click"
+        // The settings menu's titles stay put while it's open (a title that changes
+        // width every second re-lays the menu and its open submenu jumps); the
+        // live beat count goes in the panel's status line instead.
+        if click && !beats.isEmpty { status.stringValue += " · \(beats)" }
         let meter = s["meter"] as? Int ?? 0
         let feel = s["feel"] as? Double ?? 1
         for (m, i) in meterItems { i.state = m == meter ? .on : .off }

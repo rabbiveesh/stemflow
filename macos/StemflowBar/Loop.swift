@@ -159,16 +159,17 @@ final class LoopView: NSView {
     }
 }
 
-/// A view with its subviews in a stack, padded like the other menu rows.
-func padded(_ v: NSView, height: CGFloat, width: CGFloat = 360) -> NSView {
-    let box = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+/// A row of the panel: `v` with the panel's side margins, as wide as the panel.
+func inset(_ v: NSView, top: CGFloat = 3, bottom: CGFloat = 3) -> NSView {
+    let box = NSView()
+    box.translatesAutoresizingMaskIntoConstraints = false
     v.translatesAutoresizingMaskIntoConstraints = false
     box.addSubview(v)
     NSLayoutConstraint.activate([
         v.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 14),
         v.trailingAnchor.constraint(equalTo: box.trailingAnchor, constant: -14),
-        v.topAnchor.constraint(equalTo: box.topAnchor, constant: 3),
-        v.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -3),
+        v.topAnchor.constraint(equalTo: box.topAnchor, constant: top),
+        v.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -bottom),
     ])
     return box
 }
@@ -181,7 +182,7 @@ final class ClosureSegments: NSSegmentedControl {
         target = self
         action = #selector(fire)
         controlSize = .small
-        segmentDistribution = .fillEqually
+        segmentDistribution = .fillProportionally
     }
     @objc func fire() { handler(selectedSegment) }
 }
@@ -201,6 +202,19 @@ func smallLabel(_ s: String, size: CGFloat = 10, color: NSColor = .secondaryLabe
     return l
 }
 
+/// A one-line label that truncates rather than grow: a text that changes every
+/// second (the song's time) mustn't move or resize anything.
+func lineLabel(_ s: String = "", font: NSFont = .systemFont(ofSize: NSFont.smallSystemFontSize),
+               color: NSColor = .secondaryLabelColor) -> NSTextField {
+    let l = NSTextField(labelWithString: s)
+    l.font = font
+    l.textColor = color
+    l.lineBreakMode = .byTruncatingTail
+    l.maximumNumberOfLines = 1
+    l.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    return l
+}
+
 // MARK: - The panel
 
 /// The loop panel as stemflow declares it (`loop panel`, src/loopdeck/panel.rs):
@@ -209,9 +223,7 @@ func smallLabel(_ s: String, size: CGFloat = 10, color: NSColor = .secondaryLabe
 /// Rust doesn't build until it's drawn. The rows' texts, states and the lines the
 /// controls send all come from stemflow.
 class Widget {
-    /// A view in the row's stack, or nil for an item that is a menu item itself.
-    var view: NSView? { nil }
-    var menuItem: NSMenuItem? { nil }
+    var view: NSView { NSView() }
     func update(_ j: [String: Any]) {}
 }
 
@@ -231,20 +243,18 @@ func makeWidget(_ kind: PanelKind, _ sec: LoopSection) -> Widget {
     }
 }
 
-/// A line of text: a menu item of its own when alone in its row.
+/// A line of text (truncated, never wrapped: rows keep their height).
 final class TextWidget: Widget {
-    let item = textItem()
-    let label = smallLabel("", size: 11, color: .labelColor)
-    override var view: NSView? { label }
-    override var menuItem: NSMenuItem? { item }
+    let label = lineLabel()
+    override var view: NSView { label }
     override func update(_ j: [String: Any]) {
         let t = str(j, "text")
         let style = str(j, "style")
-        let font: NSFont = style == "title" ? .boldSystemFont(ofSize: NSFont.systemFontSize)
-            : style == "small" ? .systemFont(ofSize: NSFont.smallSystemFontSize) : .menuFont(ofSize: 0)
-        item.attributedTitle = NSAttributedString(string: t, attributes: [.font: font])
+        label.font = style == "title" ? .boldSystemFont(ofSize: NSFont.systemFontSize)
+            : style == "small" ? .systemFont(ofSize: NSFont.smallSystemFontSize) : .systemFont(ofSize: NSFont.systemFontSize)
+        label.textColor = style == "small" ? .secondaryLabelColor : .labelColor
         label.stringValue = t
-        label.font = font
+        label.toolTip = t
     }
 }
 
@@ -258,7 +268,7 @@ final class ButtonWidget: Widget {
             sec.run(lines(j, "send"), ask: j["ask"] as? [String: Any])
         }
     }
-    override var view: NSView? { b }
+    override var view: NSView { b }
     override func update(_ j: [String: Any]) {
         self.j = j
         b.title = str(j, "label")
@@ -270,38 +280,70 @@ final class ButtonWidget: Widget {
     }
 }
 
-/// A menu item with a checkmark.
+/// A checkbox.
 final class SwitchWidget: Widget {
-    let item = ClosureItem("") {}
+    let b = ClosureButton(title: "") {}
     var j: [String: Any] = [:]
     init(_ sec: LoopSection) {
         super.init()
-        item.handler = { [unowned self, unowned sec] in sec.run(lines(j, "send")) }
+        b.setButtonType(.switch)
+        b.handler = { [unowned self, unowned sec] in sec.run(lines(j, "send")) }
     }
-    override var menuItem: NSMenuItem? { item }
+    override var view: NSView { b }
     override func update(_ j: [String: Any]) {
         self.j = j
-        item.title = str(j, "label")
-        item.state = (j["on"] as? Bool ?? false) ? .on : .off
-        item.toolTip = str(j, "tip")
+        b.title = str(j, "label")
+        b.state = (j["on"] as? Bool ?? false) ? .on : .off
+        b.toolTip = str(j, "tip")
     }
 }
 
+/// Side by side when there are few; else a pop-up ("Beats per bar: 4").
 final class ChoiceWidget: Widget {
     var seg: ClosureSegments!
+    let pop = NSPopUpButton(frame: .zero, pullsDown: false)
+    let box = NSStackView()
     var options: [[String: Any]] = []
+    unowned let sec: LoopSection
     init(_ sec: LoopSection) {
+        self.sec = sec
         super.init()
         seg = ClosureSegments([]) { [unowned self, unowned sec] i in
             if i >= 0 && i < options.count { sec.run(lines(options[i], "send")) }
         }
+        pop.controlSize = .small
+        pop.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        pop.target = self
+        pop.action = #selector(picked)
     }
-    override var view: NSView? { seg }
+    @objc func picked() {
+        let i = pop.indexOfSelectedItem
+        if i >= 0 && i < options.count { sec.run(lines(options[i], "send")) }
+    }
+    override var view: NSView { box }
     override func update(_ j: [String: Any]) {
         options = j["options"] as? [[String: Any]] ?? []
-        if seg.segmentCount != options.count { seg.segmentCount = options.count }
-        for (i, o) in options.enumerated() { seg.setLabel(str(o, "label"), forSegment: i) }
-        seg.selectedSegment = j["selected"] as? Int ?? -1
+        let sel = j["selected"] as? Int ?? -1
+        let labels = options.map { str($0, "label") }
+        let menu = options.count > 3
+        let want: NSView = menu ? pop : seg
+        if box.arrangedSubviews.first !== want {
+            box.arrangedSubviews.forEach { $0.removeFromSuperview() }
+            box.addArrangedSubview(want)
+        }
+        if menu {
+            let t = str(j, "title")
+            let titles = labels.map { t.isEmpty ? $0 : "\(t): \($0)" }
+            if pop.itemTitles != titles {
+                pop.removeAllItems()
+                pop.addItems(withTitles: titles)
+            }
+            pop.selectItem(at: sel)
+        } else {
+            if seg.segmentCount != labels.count { seg.segmentCount = labels.count }
+            for (i, l) in labels.enumerated() where seg.label(forSegment: i) != l { seg.setLabel(l, forSegment: i) }
+            seg.selectedSegment = sel
+        }
     }
 }
 
@@ -324,7 +366,7 @@ final class NudgeWidget: Widget {
         col.alignment = .centerX
         buttons.widthAnchor.constraint(equalTo: col.widthAnchor).isActive = true
     }
-    override var view: NSView? { col }
+    override var view: NSView { col }
     override func update(_ j: [String: Any]) {
         self.j = j
         label.stringValue = str(j, "label")
@@ -337,7 +379,7 @@ final class SliderWidget: Widget {
     var j: [String: Any] = [:]
     init(_ sec: LoopSection) {
         super.init()
-        row = SliderRow("") { [unowned self, unowned sec] pos in
+        row = SliderRow("", inset: 0) { [unowned self, unowned sec] pos in
             let d = { (k: String) in self.j[k] as? Double ?? 0 }
             let (lo, hi, step) = (d("min"), d("max"), max(d("step"), 1e-6))
             var v = ((lo + pos * (hi - lo)) / step).rounded() * step
@@ -346,7 +388,7 @@ final class SliderWidget: Widget {
             sec.run([str(j, "send").replacingOccurrences(of: "{v}", with: text)])
         }
     }
-    override var view: NSView? { row }
+    override var view: NSView { row }
     override func update(_ j: [String: Any]) {
         self.j = j
         let d = { (k: String) in j[k] as? Double ?? 0 }
@@ -356,13 +398,15 @@ final class SliderWidget: Widget {
     }
 }
 
-/// The loop drawn (from `loop view`, polled while the menu shows it).
+/// The loop drawn (from `loop view`, polled while the panel shows it).
 final class LoopViewWidget: Widget {
     var j: [String: Any] = [:]
-    let box: NSView
+    let v: LoopView
     init(_ sec: LoopSection) {
-        box = padded(sec.view, height: 102)
+        v = sec.view
         super.init()
+        v.translatesAutoresizingMaskIntoConstraints = false
+        v.heightAnchor.constraint(equalToConstant: 96).isActive = true
         sec.view.onEdges = { [unowned self, unowned sec] a, b in
             sec.run([str(j, "edges").replacingOccurrences(of: "{a}", with: "\(a)")
                 .replacingOccurrences(of: "{b}", with: "\(b)")])
@@ -371,41 +415,45 @@ final class LoopViewWidget: Widget {
             sec.run([str(j, "bar1").replacingOccurrences(of: "{beat}", with: "\(i)")])
         }
     }
-    override var view: NSView? { box }
+    override var view: NSView { v }
     override func update(_ j: [String: Any]) { self.j = j }
 }
 
-/// The saved loops: a submenu with a search field, by recording; each plays,
-/// renames or deletes.
+/// The saved loops: a button that drops a menu with a search field, by
+/// recording; each plays, renames or deletes.
 final class BookmarksWidget: Widget {
-    let item = NSMenuItem(title: "Bookmarks", action: nil, keyEquivalent: "")
+    let menu = NSMenu()
+    var b: NSButton!
     let search = NSSearchField(frame: NSRect(x: 0, y: 0, width: 260, height: 22))
     var j: [String: Any] = [:]
     unowned let sec: LoopSection
     init(_ sec: LoopSection) {
         self.sec = sec
         super.init()
-        item.submenu = NSMenu()
+        b = smallButton("Bookmarks") { [unowned self] in
+            fill()
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: b.bounds.height + 4), in: b)
+        }
         search.sendsSearchStringImmediately = true
         search.target = self
         search.action = #selector(searched)
         let sf = NSView(frame: NSRect(x: 0, y: 0, width: 290, height: 30))
         search.frame = NSRect(x: 14, y: 4, width: 262, height: 22)
         sf.addSubview(search)
-        item.submenu!.addItem(viewItem(sf))
+        menu.addItem(viewItem(sf))
     }
-    override var menuItem: NSMenuItem? { item }
+    override var view: NSView { b }
     @objc func searched() { fill() }
     override func update(_ j: [String: Any]) {
         // only when it changed: keeps the search field's focus while typing
         if NSDictionary(dictionary: j).isEqual(to: self.j) { return }
         self.j = j
+        b.title = str(j, "title") + " ▾"
         fill()
     }
     func fill() {
-        let m = item.submenu!
+        let m = menu
         while m.items.count > 1 { m.removeItem(at: m.items.count - 1) }
-        item.title = str(j, "title")
         search.placeholderString = str(j, "search_hint")
         let q = search.stringValue.lowercased()
         let groups = j["groups"] as? [[String: Any]] ?? []
@@ -438,22 +486,27 @@ final class BookmarksWidget: Widget {
     }
 }
 
+/// The Loop part of the panel: a vertical stack of rows, built once for the
+/// panel's shape (row ids and item kinds) and then only updated, so nothing is
+/// rebuilt under the pointer.
 final class LoopSection: NSObject {
     let send: (String) -> Void
-    let sep = NSMenuItem.separator()
-    let view = LoopView(frame: NSRect(x: 0, y: 0, width: 332, height: 96))
-    weak var menu: NSMenu?
-    /// The rows as built: their menu items and widgets, and the shape they were
-    /// built for (ids and kinds).
-    var rows: [(item: NSMenuItem, widgets: [Widget])] = []
+    let view = LoopView(frame: NSRect(x: 0, y: 0, width: 352, height: 96))
+    /// Where the rows go (Controller puts it in the panel).
+    let box = NSStackView()
+    var rows: [(view: NSView, widgets: [Widget])] = []
     var shape = ""
     var hasLoop = false
-
-    var items: [NSMenuItem] { [sep] }
+    /// After a change in which rows show: the panel fits itself to them.
+    var onResize: () -> Void = {}
 
     init(send: @escaping (String) -> Void) {
         self.send = send
         super.init()
+        box.orientation = .vertical
+        box.alignment = .leading
+        box.spacing = 2
+        box.translatesAutoresizingMaskIntoConstraints = false
     }
 
     /// Send `lines`, asking for a name first (`{name}` in them) if `ask` says so.
@@ -463,7 +516,6 @@ final class LoopSection: NSObject {
             Controller.shared.loadPanel()
             return
         }
-        // after the menu has closed
         DispatchQueue.main.async { [self] in
             guard let name = ask(str(a, "title"), str(a, "text"), value: str(a, "value"), ok: str(a, "ok")) else { return }
             for l in lines { send(l.replacingOccurrences(of: "{name}", with: name)) }
@@ -491,44 +543,40 @@ final class LoopSection: NSObject {
     /// Show the panel (nil: no looping): built once for its shape, then updated.
     func render(_ panel: [String: Any]?) {
         let rowsJ = panel?["rows"] as? [[String: Any]] ?? []
-        sep.isHidden = rowsJ.isEmpty
         let sig = rowsJ.map { r in
             str(r, "id") + ":" + (r["items"] as? [[String: Any]] ?? []).map { str($0, "kind") }.joined(separator: ",")
         }.joined(separator: "|")
-        if sig != shape { build(rowsJ, sig) }
+        var changed = false
+        if sig != shape { build(rowsJ, sig); changed = true }
+        if box.isHidden != rowsJ.isEmpty { box.isHidden = rowsJ.isEmpty; changed = true }
         hasLoop = false
         for (r, j) in zip(rows, rowsJ) {
             let hidden = j["hidden"] as? Bool ?? false
-            r.item.isHidden = hidden
+            if r.view.isHidden != hidden { r.view.isHidden = hidden; changed = true }
             if str(j, "id") == "view" { hasLoop = !hidden }
             for (w, i) in zip(r.widgets, j["items"] as? [[String: Any]] ?? []) { w.update(i) }
         }
         if !hasLoop { view.pic = nil }
+        if changed { onResize() }
     }
 
     private func build(_ rowsJ: [[String: Any]], _ sig: String) {
-        guard let menu = menu ?? sep.menu else { return }
-        for r in rows { menu.removeItem(r.item) }
+        for r in rows { r.view.removeFromSuperview() }
         rows = []
         shape = sig
-        var at = menu.index(of: sep) + 1
         for j in rowsJ {
             let ws: [Widget] = (j["items"] as? [[String: Any]] ?? []).map { i in
                 makeWidget(PanelKind(rawValue: str(i, "kind")) ?? .text, self)
             }
-            let item: NSMenuItem
-            if ws.count == 1, let mi = ws[0].menuItem {
-                item = mi
-            } else {
-                let stack = NSStackView(views: ws.compactMap { $0.view })
-                stack.distribution = .fillEqually
-                stack.spacing = 6
-                let tall = ws.contains { $0 is LoopViewWidget } ? 102.0 : ws.contains { $0 is NudgeWidget } ? 62.0 : 30.0
-                item = viewItem(ws.count == 1 && ws[0] is LoopViewWidget ? ws[0].view! : padded(stack, height: tall))
-            }
-            menu.insertItem(item, at: at)
-            at += 1
-            rows.append((item, ws))
+            let stack = NSStackView(views: ws.map { $0.view })
+            stack.spacing = 6
+            // buttons share the width evenly; a pop-up beside segments takes its
+            // own width and the segments the rest
+            stack.distribution = ws.contains { $0 is ChoiceWidget } ? .fill : .fillEqually
+            let row = inset(stack)
+            box.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: box.widthAnchor).isActive = true
+            rows.append((row, ws))
         }
     }
 }
