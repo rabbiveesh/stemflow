@@ -743,7 +743,9 @@ final class Controller: NSObject, NSMenuDelegate, NSPopoverDelegate {
         if key == modelsKey { return }
         modelsKey = key
         let stem = stemOf(shown)
-        let tail = loading ? " · loading…" : ""
+        // no "· loading…" in the titles: the panel's status line already says it, and
+        // a title that changes re-lays the open menu
+        let tail = ""
 
         let sm = stemsItem.submenu!
         sm.removeAllItems()
