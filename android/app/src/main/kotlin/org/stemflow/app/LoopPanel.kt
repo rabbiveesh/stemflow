@@ -218,6 +218,12 @@ class LoopPanel(
             val opts = options()
             val n = opts.length()
             val sel = if (o.isNull("selected")) -1 else o.optInt("selected", -1)
+            // In a row with another widget: a menu takes its own width and the chips
+            // the rest (half each squeezed "As heard" next to "Beats per bar: 4 ▾").
+            (box.layoutParams as? LayoutParams)?.takeIf { it.weight > 0 }?.let {
+                val w = if (n > 3) 0f else 1f
+                if (it.weight != w) { it.weight = w; it.width = if (w > 0) 0 else LayoutParams.WRAP_CONTENT; box.layoutParams = it }
+            }
             if (n > 3) {
                 val m = menu ?: a.button("", chip = true, weight = 0f) { open() }.also {
                     box.removeAllViews(); chips.clear(); menu = it; box.addView(it)
@@ -230,7 +236,13 @@ class LoopPanel(
             if (chips.size != n) {
                 box.removeAllViews(); chips.clear(); menu = null
                 for (i in 0 until n) {
-                    val b = a.button("", chip = true) { pick(i) }.apply { isSingleLine = true; setPadding(a.dp(4), 0, a.dp(4), 0) }
+                    // wrap_content + weight: each chip its label's width, then an even
+                    // share of what's left (equal widths cut the longest label)
+                    val b = a.button("", chip = true) { pick(i) }.apply {
+                        isSingleLine = true
+                        setPadding(a.dp(10), 0, a.dp(10), 0)
+                        (layoutParams as LayoutParams).width = LayoutParams.WRAP_CONTENT
+                    }
                     if (i > 0) (b.layoutParams as LayoutParams).leftMargin = a.dp(6)
                     chips += b
                     box.addView(b)
