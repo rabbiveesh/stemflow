@@ -56,6 +56,10 @@ pub struct Player {
     pub opens: usize,
     pub pauses: usize,
     pub plays: usize,
+    /// Like Spotify on the Mac once: after an open, the next seek lands in this
+    /// tune instead (it switched track once more).
+    pub drift: Option<usize>,
+    drift_armed: Option<usize>,
 }
 
 impl Player {
@@ -93,6 +97,9 @@ impl Source for FakePlayer {
     }
     fn seek(&self, ms: i64) -> bool {
         let mut p = self.0.lock().unwrap();
+        if let Some(k) = p.drift_armed.take() {
+            p.cur = k;
+        }
         p.ms = ms as f64;
         p.seeks.push(ms);
         true
@@ -106,6 +113,7 @@ impl Source for FakePlayer {
         p.ms = 0.0;
         p.playing = true;
         p.opens += 1;
+        p.drift_armed = p.drift.take();
         true
     }
 }
@@ -194,6 +202,8 @@ impl Sim {
             opens: 0,
             pauses: 0,
             plays: 0,
+            drift: None,
+            drift_armed: None,
         }));
         let core = Core::new(looper.clone(), Arc::new(FakePlayer(p.clone())), io.clone());
         Sim {
@@ -642,6 +652,22 @@ mod tests {
         assert!(st.loop_from > 0, "{st:?}");
     }
 
+    /// A long loop (37 s live on the Mac, 2026-11-23): the next phrase it fetched
+    /// reached past what one minute of buffer holds, so the fetch never finished
+    /// and the player played on unheard until it timed out, minutes later.
+    #[test]
+    fn a_long_loop_pauses_the_player_soon() {
+        let mut s = Sim::new(vec![tune(0, 400, 120.0)]);
+        s.play();
+        s.run(80_000);
+        s.cmd("16");
+        assert_eq!(s.core.state().beats, 64);
+        s.run(30_000);
+        assert!(!s.player().2, "the player still plays, at {}", s.player().1);
+        assert!(!s.core.waiting());
+        assert!(s.core.paused_by_us());
+    }
+
     /// Saved, then another song, then recalled: the player goes back there and the
     /// same loop plays.
     #[test]
@@ -677,6 +703,23 @@ mod tests {
         assert!(h.iter().all(
             |x| x.is_some_and(|x| x.0 == 0 && (b.start_ms - 60..b.end_ms + 60).contains(&x.1))
         ));
+        // Again, with the player switching track once more after it opens the song
+        // (Spotify on the Mac, 2026-11-23): the seek lands in the other song, which
+        // is caught, and the song opened again.
+        s.cmd("live");
+        s.p.lock().unwrap().skip();
+        s.run(10_000);
+        s.p.lock().unwrap().drift = Some(1);
+        s.cmd(&format!("recall {}", b.created));
+        s.run(40_000);
+        let st = s.core.state();
+        assert!(st.playing && st.status.is_empty(), "{st:?}");
+        assert_eq!(s.player().0, 0, "back to the song");
+        assert_eq!(s.p.lock().unwrap().opens, 3, "opened again once");
+        assert!(
+            (st.loop_from - b.start_ms).abs() < 60 && (st.loop_to - b.end_ms).abs() < 60,
+            "{st:?} {b:?}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }
