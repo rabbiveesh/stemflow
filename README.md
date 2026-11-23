@@ -141,11 +141,14 @@ returns the loop for drawing, `loop panel` the panel) and D-Bus (`Loop`, `LoopVi
 
 The loop panel is declared once, in `src/loopdeck/panel.rs`: rows of items (text,
 button, switch, choice, nudge, slider, loop view, bookmarks) that send `loop ...`
-lines, which parse into one `Command` enum. The Mac and GNOME menus only draw what
-the panel says. A test fails if a command has no control, and it regenerates
-`PanelKinds.swift` and `panelKinds.js`, so a new kind of item doesn't build on the
-Mac until `Loop.swift` draws it (its switch is exhaustive), and fails the test until
-`loop.js` does.
+lines, which parse into one `Command` enum. The Mac and GNOME menus and the Android
+app's Loops and Bookmarks tabs only draw what the panel says, and the Android app runs
+the same deck through JNI (`android/core/src/deck.rs`). A test fails if a command has
+no control, and it regenerates `PanelKinds.swift`, `panelKinds.js` and `PanelKinds.kt`,
+so a new kind of item doesn't build on the Mac until `Loop.swift` draws it, nor on
+Android until `LoopPanel.kt` does (Swift's `switch` and Kotlin's `when` are
+exhaustive; CI compiles the Kotlin with `android/tools/kotlin-check.sh`), and fails the
+test until `loop.js` does.
 
 The loop itself is one state machine (`src/loopdeck/core.rs`). `src/loopdeck/sim.rs`
 runs it against a fake player and clock on click tracks, with scripted tests for

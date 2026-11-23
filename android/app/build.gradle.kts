@@ -21,7 +21,7 @@ android {
     kotlinOptions { jvmTarget = "17" }
     // The LiteRT libraries are plain files next to ours; keep them loadable by name.
     packaging { jniLibs { useLegacyPackaging = true } }
-    // SongMap and other pure logic: `gradle testDebugUnitTest` on the laptop
+    // pure logic: `gradle testDebugUnitTest` on the laptop (the loop logic is Rust: cargo test)
     testOptions { unitTests.isReturnDefaultValues = true }
 }
 

@@ -554,7 +554,7 @@ impl Core {
                 }
                 // never seek in another song (the queue may have moved on past it)
                 if !self.on_song(&f.song) {
-                    if !f.open || f.song.id.is_empty() || !self.source.open(&f.song.id) {
+                    if !f.open || f.song.id.is_empty() || !self.source.open(&f.song) {
                         return Some(Err(anyhow!(
                             "The player has moved on from {}",
                             f.song.title

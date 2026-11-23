@@ -4,18 +4,27 @@
 //! code the desktop and the bench run, pulled in by path. Two independent handles:
 //!   - an engine: feed one hop of captured audio, get that hop's bass and band stems;
 //!   - a mixer: turn stems into output at the current levels, with the limiter.
+//!
 //! They are used from different threads (worker and player), so they share nothing.
+//! Looping is the desktop's deck (src/loopdeck; deck.rs here), which owns the looper.
 
 #![allow(dead_code)]
 
 #[path = "../../../src/beats.rs"]
 mod beats;
+#[path = "../../../src/bookmarks.rs"]
+mod bookmarks;
+mod deck;
 #[path = "../../bench/src/litert.rs"]
 mod litert;
+#[path = "../../../src/loopdeck/mod.rs"]
+mod loopdeck;
 #[path = "../../../src/looper.rs"]
 mod looper;
 #[path = "../../../src/model.rs"]
 mod model;
+#[path = "../../../src/songmap.rs"]
+mod songmap;
 #[path = "../../../src/spec.rs"]
 mod spec;
 #[path = "../../../src/stream.rs"]

@@ -1,15 +1,16 @@
 //! The loop panel, declared once: every row of the Loops screen, what each control
 //! shows and what it sends, built from the loop's state. The macOS menu
-//! (macos/StemflowBar/Loop.swift) and the GNOME extension
-//! (gnome/stemflow@veesh/loop.js) only draw it: they render a handful of item kinds
-//! (`Kind`) and send the lines they're given. So a feature added here is on every
-//! desktop at once, and the tests below hold that:
+//! (macos/StemflowBar/Loop.swift), the GNOME extension (gnome/stemflow@veesh/loop.js)
+//! and the Android app (android/app/.../LoopPanel.kt) only draw it: they render a
+//! handful of item kinds (`Kind`) and send the lines they're given. So a feature
+//! added here is on every platform at once, and the tests below hold that:
 //! - every verb of `Command` is sent by some control (no feature without a UI);
 //! - the rows and their items keep their kinds whatever the state (renderers build
 //!   them once and update them in place);
 //! - the platforms' generated lists of kinds are current, and each renderer has a
-//!   case for every kind (Swift's `switch` is exhaustive over the generated enum, so
-//!   a new kind doesn't build until it's drawn; GNOME's JavaScript is checked here).
+//!   case for every kind (Swift's `switch` and Kotlin's `when` are exhaustive over
+//!   the generated enums, so a new kind doesn't build until it's drawn; GNOME's
+//!   JavaScript is checked here).
 
 use super::command::Unit;
 use super::State;
@@ -98,8 +99,10 @@ pub enum Item {
         send: Send,
         tip: String,
     },
-    /// One of several, `selected` (None: none of them).
+    /// One of several, `selected` (None: none of them). `title` names it where
+    /// it's shown as a menu rather than side by side ("" for none).
     Choice {
+        title: String,
         options: Vec<Opt>,
         selected: Option<usize>,
     },
@@ -286,7 +289,7 @@ pub fn build(l: &State, meter: u32, feel: f32, marks: &[Bookmark]) -> Panel {
     let hint = if !l.status.is_empty() && !l.finding {
         l.status.clone()
     } else if playing {
-        s("Drag an end · right-click a beat for bar 1")
+        s("Drag an end · hold a beat (or right-click it) for bar 1")
     } else if l.finding {
         String::new()
     } else {
@@ -325,6 +328,7 @@ pub fn build(l: &State, meter: u32, feel: f32, marks: &[Bookmark]) -> Panel {
         "units",
         !playing,
         vec![Item::Choice {
+            title: s("Step by"),
             options: units
                 .iter()
                 .map(|u| Opt {
@@ -371,6 +375,7 @@ pub fn build(l: &State, meter: u32, feel: f32, marks: &[Bookmark]) -> Panel {
         false,
         vec![
             Item::Choice {
+                title: s("Beats per bar"),
                 options: METERS
                     .iter()
                     .map(|&v| Opt {
@@ -381,6 +386,7 @@ pub fn build(l: &State, meter: u32, feel: f32, marks: &[Bookmark]) -> Panel {
                 selected: METERS.iter().position(|&v| v == meter).or(Some(0)),
             },
             Item::Choice {
+                title: s("Feel"),
                 options: FEELS
                     .iter()
                     .map(|&(v, label)| Opt {
@@ -631,6 +637,26 @@ pub fn js_kinds() -> String {
     )
 }
 
+/// Kotlin for the Android app.
+#[cfg(test)]
+pub fn kotlin_kinds() -> String {
+    use strum::IntoEnumIterator;
+    let kinds: Vec<String> = Kind::iter()
+        .map(|k| format!("    {}(\"{}\")", k.name().to_uppercase(), k.name()))
+        .collect();
+    format!(
+        "// Generated from src/loopdeck/panel.rs by `cargo test`: don't edit.\n\
+         // The kinds of item in the loop panel. LoopPanel.kt draws each one in a `when`\n\
+         // over them with no `else`, so a new kind doesn't build until it's drawn.\n\n\
+         package org.stemflow.app\n\n\
+         enum class PanelKind(val wire: String) {{\n{};\n\n    \
+         companion object {{\n        \
+         fun of(s: String): PanelKind? = entries.firstOrNull {{ it.wire == s }}\n    \
+         }}\n}}\n",
+        kinds.join(",\n")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,6 +727,7 @@ mod tests {
             title: t.into(),
             artist: s("Someone"),
             album: String::new(),
+            ..Default::default()
         };
         let mut v = vec![
             Bookmark::new("Intro", song("Corcovado"), 1_000, 9_000, 1_000, 4, 4, 1.0),
@@ -800,6 +827,10 @@ mod tests {
         for (path, want) in [
             ("macos/StemflowBar/PanelKinds.swift", swift_kinds()),
             ("gnome/stemflow@veesh/panelKinds.js", js_kinds()),
+            (
+                "android/app/src/main/kotlin/org/stemflow/app/PanelKinds.kt",
+                kotlin_kinds(),
+            ),
         ] {
             let f = root.join(path);
             if std::fs::read_to_string(&f).ok().as_deref() != Some(want.as_str()) {
@@ -824,5 +855,16 @@ mod tests {
             !swift.contains("default:"),
             "Loop.swift: no `default:` in the panel's switch"
         );
+        // Android: Kotlin's `when` over an enum, used as a value, must name every
+        // case, unless an `else` hides a new one
+        let kt = std::fs::read_to_string(
+            root.join("android/app/src/main/kotlin/org/stemflow/app/LoopPanel.kt"),
+        )
+        .unwrap();
+        assert!(!kt.contains("else ->"), "LoopPanel.kt: no `else ->`");
+        for k in Kind::iter() {
+            let case = format!("PanelKind.{} ->", k.name().to_uppercase());
+            assert!(kt.contains(&case), "LoopPanel.kt draws no `{}`", k.name());
+        }
     }
 }

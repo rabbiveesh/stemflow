@@ -59,4 +59,29 @@ object Native {
     @JvmStatic external fun looperRefresh(h: Long): Boolean
     @JvmStatic external fun looperLay(h: Long, beats: DoubleArray, a: Int, b: Int, one: Int, meter: Int, bpm: Float, feel: Float)
     @JvmStatic fun looperIsPlaying(h: Long) = looperView(h, 1).let { it.isNotEmpty() && it[0] > 0f }
+
+    // The loop deck (src/loopdeck), shared with the desktop: what a loop does, and the
+    // panel the Loops screen draws. It takes over a looper from looperNew.
+    @JvmStatic external fun deckNew(looper: Long, source: DeckSource, dir: String, meter: Int, feel: Float): Long
+    @JvmStatic external fun deckFree(h: Long)
+    /** The looper's handle, for the looper* calls (valid until deckFree). */
+    @JvmStatic external fun deckLooper(h: Long): Long
+    /** A panel line ("loop 4", "loop move 0 4", ...): null, or why it isn't a command. */
+    @JvmStatic external fun deckCommand(h: Long, line: String): String?
+    /** The loop's state as JSON (src/loopdeck/mod.rs `State`, plus beat_meter, beat_feel). */
+    @JvmStatic external fun deckState(h: Long): String
+    /** The loop panel as JSON (src/loopdeck/panel.rs). */
+    @JvmStatic external fun deckPanel(h: Long): String
+    /** The panel while looping is off: the saved loops and the options. */
+    @JvmStatic external fun panelIdle(
+        dir: String, meter: Int, feel: Float, speed: Float, semis: Float, keepPitch: Boolean, click: Boolean, stemsOnly: Boolean,
+    ): String
+    /** A panel line that needs no deck (rename, delete a bookmark): null, or why not. */
+    @JvmStatic external fun idleCommand(dir: String, line: String): String?
+    /** Buffer frame `frame` is what the player is at now. */
+    @JvmStatic external fun deckInput(h: Long, frame: Long)
+    /** Buffer frame `frame` is what is heard now; the ears trail the reads by `lag`. */
+    @JvmStatic external fun deckHeard(h: Long, frame: Long, lag: Long)
+    /** The buffer broke here (skipped input, a model switch, capture silenced). */
+    @JvmStatic external fun deckCut(h: Long, why: String)
 }

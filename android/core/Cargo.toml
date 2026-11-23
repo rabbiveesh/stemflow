@@ -15,6 +15,11 @@ crate-type = ["cdylib"]
 [dependencies]
 anyhow = "1"
 jni = "0.21"
+libc = "0.2"
+# the loop deck and its panel (src/loopdeck), shared with the desktop
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+strum = { version = "0.26", features = ["derive"] }
 realfft = "3"
 # Only because src/model.rs (shared with the desktop, for the Separator trait and
 # MonoFold) also holds the ONNX Runtime separators. Unused at run time here.

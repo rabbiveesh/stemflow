@@ -38,6 +38,7 @@ pub fn tune(n: usize, len_s: i64, bpm: f64) -> Tune {
             title: format!("Song {n}"),
             artist: "Sim".into(),
             album: String::new(),
+            ..Default::default()
         },
         len_ms: len_s * 1000,
         bpm,
@@ -96,9 +97,9 @@ impl Source for FakePlayer {
         p.seeks.push(ms);
         true
     }
-    fn open(&self, id: &str) -> bool {
+    fn open(&self, song: &Song) -> bool {
         let mut p = self.0.lock().unwrap();
-        let Some(i) = p.tunes.iter().position(|t| t.song.id == id) else {
+        let Some(i) = p.tunes.iter().position(|t| t.song.id == song.id) else {
             return false;
         };
         p.cur = i;
