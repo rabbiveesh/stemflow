@@ -8,6 +8,16 @@
 //! set balance -0.5           (also bass, band, second_level, model, click, meter, feel)
 //! nudge 0.1
 //! snap solo|full|nobass|novocals
+//! loop 4                     loop the last 4 bars (or resize the loop playing)
+//! loop live                  back to the live stream (and the rest of
+//!                            src/loopdeck/command.rs: top, move <da> <db>, unit <u>,
+//!                            edges <a> <b>, bar1 <beat>, meter <n>, feel <x>,
+//!                            click on|off, speed <x>, pitch <semitones>, keep_pitch on|off)
+//! loop view 300              -> the loop for drawing (beats, peaks), not the state
+//! loop panel                 -> the loop panel to show (src/loopdeck/panel.rs)
+//! loop bookmarks             -> the saved loops, not the state (also loop save <name>,
+//!                            recall|delete <created>, rename <created> <name>, repair,
+//!                            playpause, stems_only on|off)
 //! quit                       stop stemflow (as Ctrl-C would), after replying
 //! ```
 //!
@@ -82,6 +92,25 @@ fn handle(conn: UnixStream, ctl: &Control, info: &Info) -> Result<()> {
     let mut out = conn.try_clone()?;
     for line in BufReader::new(conn).lines() {
         let line = line?;
+        // `loop bookmarks`: the saved loops, instead of the state
+        if line.trim() == "loop bookmarks" {
+            out.write_all(crate::bookmarks::list_json().as_bytes())?;
+            out.write_all(b"\n")?;
+            continue;
+        }
+        // `loop panel`: the loop panel, instead of the state
+        if line.trim() == "loop panel" {
+            out.write_all(ctl.loop_panel().as_bytes())?;
+            out.write_all(b"\n")?;
+            continue;
+        }
+        // `loop view <bins>`: the loop for drawing, instead of the state
+        if let Some(n) = line.trim().strip_prefix("loop view") {
+            let bins = n.trim().parse().unwrap_or(200);
+            out.write_all(ctl.loop_view(bins).as_bytes())?;
+            out.write_all(b"\n")?;
+            continue;
+        }
         let reply = match request(line.trim(), ctl, info) {
             Ok(()) => state(ctl, info, None),
             Err(e) => state(ctl, info, Some(&format!("{e:#}"))),
@@ -116,6 +145,11 @@ fn request(line: &str, ctl: &Control, info: &Info) -> Result<()> {
                 unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
             });
             return Ok(());
+        }
+        "loop" => {
+            // the rest of the line: `loop move 1 -1` has three words
+            let rest = line.trim().strip_prefix("loop").unwrap_or("").trim();
+            return ctl.loop_command(rest);
         }
         "set" => match a.context("set what?")? {
             "balance" => ctl.set_balance(num(b)?),
@@ -201,6 +235,7 @@ fn state(ctl: &Control, info: &Info, err: Option<&str>) -> String {
         format!("\"feel\":{}", ctl.feel()),
         format!("\"beats\":{}", js(&ctl.beats())),
         format!("\"models\":[{}]", models.join(",")),
+        format!("\"loop\":{}", ctl.loop_json()),
     ];
     if let Some(e) = err {
         f.push(format!("\"error\":{}", js(e)));
@@ -234,7 +269,7 @@ mod tests {
         let s = state(&ctl, &info, Some("a \"quoted\" error"));
         assert!(s.starts_with("{\"ok\":false,\"balance\":0.25,"), "{s}");
         assert!(
-            s.ends_with(",\"models\":[],\"error\":\"a \\\"quoted\\\" error\"}"),
+            s.ends_with(",\"models\":[],\"loop\":null,\"error\":\"a \\\"quoted\\\" error\"}"),
             "{s}"
         );
     }

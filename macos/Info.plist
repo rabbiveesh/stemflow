@@ -8,5 +8,7 @@
 	<string>stemflow</string>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>stemflow listens to the app you pick (Spotify by default) to separate its stems as it plays.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>stemflow pauses Spotify or Music while a loop plays, so going live again carries on from the loop.</string>
 </dict>
 </plist>

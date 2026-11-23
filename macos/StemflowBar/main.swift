@@ -59,7 +59,10 @@ let logURL = home.appendingPathComponent("Library/Logs/stemflow.log")
 // MARK: - Control socket
 
 /// One request, one JSON line back (the whole state). nil when stemflow isn't there.
-func request(_ line: String) -> [String: Any]? {
+func request(_ line: String) -> [String: Any]? { requestAny(line) as? [String: Any] }
+
+/// One request, its JSON reply as parsed (`loop bookmarks` gives an array).
+func requestAny(_ line: String) -> Any? {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else { return nil }
     defer { close(fd) }
@@ -86,7 +89,7 @@ func request(_ line: String) -> [String: Any]? {
         if n <= 0 { break }
         data.append(buf, count: n)
     }
-    return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    return try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
 }
 
 // MARK: - Stems (as src/models.rs knows them)
@@ -315,6 +318,7 @@ let hotkeys: [(id: UInt32, key: Int, mods: Int, name: String)] = [
     (3, kVK_ANSI_Backslash, controlKey | optionKey, "toggle-solo"),
     (4, kVK_ANSI_Backslash, controlKey | optionKey | shiftKey, "toggle-nobass"),
     (5, kVK_ANSI_B, controlKey | optionKey, "toggle-running"),
+    (6, kVK_ANSI_L, controlKey | optionKey, "toggle-loop"),
 ]
 var hotkeyRefs: [EventHotKeyRef?] = []
 
@@ -377,6 +381,12 @@ final class Controller: NSObject, NSMenuDelegate {
     let expItem = ClosureItem("Experiments") { Controller.shared.flip("experiments") }
     let advItem = ClosureItem("Separate sliders") { Controller.shared.flip("advanced") }
     var modelsKey = ""
+    // looping (state["loop"], src/loopdeck.rs; Loop.swift)
+    let loopSec = LoopSection { Controller.shared.send($0) }
+    var menuOpen = false
+    let viewQueue = DispatchQueue(label: "stemflow.loopview")
+    var viewBusy = false
+    var loopState: [String: Any]? { state?["loop"] as? [String: Any] }
 
     var isOn: Bool { state != nil }
     var isOnOrStarting: Bool { state != nil || starting != nil }
@@ -416,13 +426,18 @@ final class Controller: NSObject, NSMenuDelegate {
             feelItems.append((f, i))
         }
         beatOpts.submenu = meters
+
         stemsItem.submenu = NSMenu()
         modelsItem.submenu = NSMenu()
 
         for i in [switchItem, desc, oneItem, boostItem, bassItem, secondItem, bandItem, snapsItem, sep1, status,
-                  clickItem, beatOpts, stemsItem, modelsItem, expItem, advItem] {
+                  clickItem, beatOpts] {
             menu.addItem(i!)
         }
+        for i in loopSec.items { menu.addItem(i) }
+        loopSec.menu = menu
+        menu.addItem(.separator())
+        for i in [stemsItem, modelsItem, expItem, advItem] { menu.addItem(i) }
         menu.addItem(.separator())
         menu.addItem(ClosureItem("Open log") { NSWorkspace.shared.open(logURL) })
         menu.addItem(ClosureItem("Quit") { Controller.shared.quit() })
@@ -437,6 +452,9 @@ final class Controller: NSObject, NSMenuDelegate {
 
         let t = Timer(timeInterval: 1, repeats: true) { _ in self.poll() }
         RunLoop.main.add(t, forMode: .common) // keeps ticking while the menu is open
+        // The loop view moves with the playhead while the menu shows it.
+        let v = Timer(timeInterval: 0.05, repeats: true) { _ in self.pollView() }
+        RunLoop.main.add(v, forMode: .common)
         registerHotkeys()
         poll()
     }
@@ -452,6 +470,19 @@ final class Controller: NSObject, NSMenuDelegate {
         queue.async {
             let s = request("state")
             DispatchQueue.main.async { self.got(s) }
+        }
+    }
+
+    func pollView() {
+        guard menuOpen, loopSec.hasLoop, !viewBusy else { return }
+        viewBusy = true
+        let bins = Int(loopSec.view.bounds.width / 2)
+        viewQueue.async {
+            let j = request("loop view \(bins)")
+            DispatchQueue.main.async {
+                self.viewBusy = false
+                self.loopSec.view.pic = LoopPic(j)
+            }
         }
     }
 
@@ -472,6 +503,20 @@ final class Controller: NSObject, NSMenuDelegate {
         if s != nil && starting != nil { stopStarting("") }
         if s == nil && was { modelsKey = "" }
         sync()
+    }
+
+    func loop(_ cmd: String) { send("loop \(cmd)") }
+
+    /// ⌃⌥L: loop the last 4 bars, or back to live if a loop plays (or is being found).
+    func toggleLoop() {
+        guard let l = loopState else { return hud.show(isOn ? "No looping: no beat model" : "stemflow is off", level: nil) }
+        if l["playing"] as? Bool ?? false || l["finding"] as? Bool ?? false {
+            loop("live")
+            hud.show("Live", level: nil)
+        } else {
+            loop("4")
+            hud.show("Looping the last 4 bars", level: nil)
+        }
     }
 
     func snap(_ name: String) { send("snap \(name)") { self.osd() } }
@@ -499,6 +544,7 @@ final class Controller: NSObject, NSMenuDelegate {
         case "toggle-solo": toggle("solo", at: -1)
         case "toggle-nobass": toggle("nobass", at: 1)
         case "toggle-running": setRunning(!isOnOrStarting)
+        case "toggle-loop": toggleLoop()
         default: break
         }
     }
@@ -589,7 +635,21 @@ final class Controller: NSObject, NSMenuDelegate {
 
     // MARK: menu contents
 
-    func menuWillOpen(_ menu: NSMenu) { poll() }
+    func menuWillOpen(_ menu: NSMenu) {
+        menuOpen = true
+        poll()
+    }
+
+    /// The loop panel, as stemflow declares it (`loop panel`).
+    func loadPanel() {
+        guard isOn, loopState != nil else { return loopSec.render(nil) }
+        queue.async {
+            let p = requestAny("loop panel") as? [String: Any]
+            DispatchQueue.main.async { self.loopSec.render(p) }
+        }
+    }
+
+    func menuDidClose(_ menu: NSMenu) { menuOpen = false }
 
     func fillModels(_ models: [[String]], current: String) {
         if !current.isEmpty { lastModelFor[stemOf(current)] = current }
@@ -643,6 +703,7 @@ final class Controller: NSObject, NSMenuDelegate {
         let rows: [NSMenuItem] = [desc, oneItem, boostItem, bassItem, bandItem, secondItem, snapsItem, sep1, status,
                                   modelsItem, stemsItem, clickItem, beatOpts]
         for r in rows { r.isHidden = !on }
+        if !on { loopSec.render(nil) }
 
         let button = item.button
         guard let s = state else {
@@ -711,6 +772,8 @@ final class Controller: NSObject, NSMenuDelegate {
         for (f, i) in feelItems { i.state = f == feel ? .on : .off }
         beatOpts.title = "Meter and feel: \(meter > 0 ? "\(meter)/bar" : "auto meter")"
             + (feel == 0.5 ? " · half time" : feel == 2 ? " · double time" : "")
+
+        loadPanel()
 
         let loading = statusText.hasPrefix("Loading")
         if wasLoading && !loading { pending = nil }

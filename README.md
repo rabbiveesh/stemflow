@@ -96,6 +96,62 @@ tools/.venv/bin/python -I tools/export_beat_this.py models/beats tools/.venv-gpu
 
 Switch it on from the menu ("Beat click") or `busctl --user set-property org.stemflow.Control /org/stemflow/Control org.stemflow.Control Click b true`. `Meter` (beats per bar, 0 = auto) and `Feel` (0.5 half time, 1, 2 double time) set the bar lines and the beat; `Beats` says what the tracker found. Every 3 s it re-analyses the last 30 s of input (about 0.35 s on the GPU while separating). The input runs ahead of what you hear by the separator's lookahead, so the click comes from audio already analysed. A change of tempo or meter has to show up three times in a row (9 s) before the click follows it. `stemflow file --click in.wav out.wav` renders the same thing to a file.
 
+### Looping
+
+With the beat model in place, `stemflow live` can loop what you just heard, snapped to
+the bars, from the Loop section of the menu (Mac and GNOME, as on Android):
+
+- **1 bar · 2 · 4 · 8 bars** loop the last bars heard (`⌃⌥L` / `Super+Alt+L`: 4, or
+  back to live); while a loop plays they resize it. **Live** goes back.
+- The **loop view**: the waveform with a bar either side, a tick on every beat,
+  numbered bar lines and the playhead. Drag an end to move it (it snaps to the
+  beats); right-click a beat (or long-press it on GNOME, ⌃-click on the Mac) to make
+  it bar 1.
+- **Beat · Bar · Phrase** sets what the edits step by; **Start**, **Move** (the whole
+  loop, same length) and **End** move earlier ◀ or later ▶ by that much.
+- **Meter** and **feel** re-find the bars; **Speed** (40–120%), **Pitch** (±12
+  semitones), **Keep pitch**, **Click**, and **From the top**.
+- With the player's song position (MPRIS on Linux; Spotify or Music over AppleScript
+  on macOS), stemflow maps the buffer to song time, as the Android app does:
+  - the song plays on, unheard, until the next phrase is buffered, then pauses, so
+    moving the loop into it is instant;
+  - moving or extending the loop past what was buffered seeks the player there and
+    plays it through (the old loop keeps playing meanwhile);
+  - **Repair** plays the loop's part of the song again and lays the loop on that;
+  - **Save…** keeps the loop as a bookmark (`~/.local/state/stemflow/bookmarks.json`,
+    the Android app's format), and **Bookmarks** lists them by song, with search:
+    pick one to go back there (the player seeks a few seconds before it and the loop
+    comes back with its bars), or rename or delete it.
+- **Stems only when looping** plays the plain mix while live and separates only
+  what you loop, to save power.
+
+While a loop plays stemflow pauses the app it captures (MPRIS on Linux; Spotify or
+Music over AppleScript on macOS, which asks once whether stemflow may control it), so
+"Live" carries on from the loop, through what was buffered after it, and the app
+plays again. If the app can't be paused, "Live" jumps straight back to the live
+stream.
+
+The same commands go over the socket (`loop 4`, `loop live`, `loop top`,
+`loop move <start beats> <end beats>`, `loop unit beat|bar|phrase`, `loop edges <a> <b>`,
+`loop bar1 <beat>`, `loop meter 3`, `loop feel 0.5`, `loop speed 0.75`, `loop pitch -2`,
+`loop keep_pitch off`, `loop click on`, `loop repair`, `loop save <name>`,
+`loop recall <created>`, `loop playpause`, `loop stems_only on`; `loop view <bins>`
+returns the loop for drawing, `loop panel` the panel) and D-Bus (`Loop`, `LoopView`,
+`LoopPanel`, with the state as JSON in `LoopState`).
+
+The loop panel is declared once, in `src/loopdeck/panel.rs`: rows of items (text,
+button, switch, choice, nudge, slider, loop view, bookmarks) that send `loop ...`
+lines, which parse into one `Command` enum. The Mac and GNOME menus only draw what
+the panel says. A test fails if a command has no control, and it regenerates
+`PanelKinds.swift` and `panelKinds.js`, so a new kind of item doesn't build on the
+Mac until `Loop.swift` draws it (its switch is exhaustive), and fails the test until
+`loop.js` does.
+
+The loop itself is one state machine (`src/loopdeck/core.rs`). `src/loopdeck/sim.rs`
+runs it against a fake player and clock on click tracks, with scripted tests for
+bugs heard live and random sessions checked against invariants (`SIM_CASES=500
+cargo test random_sessions` for a longer run, `SIM_TRACE=1` to print what happens).
+
 ## macOS (Apple Silicon)
 
 Tested on an M5 MacBook Pro (macOS 26). Live mode taps the app with a Core Audio
@@ -170,6 +226,7 @@ Hotkeys use ⌃⌥ where GNOME uses Super (⌘[ and ⌘] are Back and Forward in
 | `⌃⌥\` | bass solo, or back to where you were |
 | `⌃⌥⇧\` | no bass (play-along), or back |
 | `⌃⌥B` | start / stop |
+| `⌃⌥L` | loop the last 4 bars, or back to live |
 
 ### Control socket
 
@@ -194,6 +251,7 @@ A top-bar menu to start/stop stemflow and move the mix, plus hotkeys:
 | `Super+\` | bass solo, or back to where you were |
 | `Super+Shift+\` | no bass (play-along), or back |
 | `Super+Alt+B` | start / stop |
+| `Super+Alt+L` | loop the last 4 bars, or back to live |
 
 Scrolling on the icon moves the mix too. "Separate sliders" in the menu gives the
 bass and the band a slider each. stemflow also serves `org.stemflow.Control` on the

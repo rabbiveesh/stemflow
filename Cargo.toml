@@ -16,6 +16,9 @@ hound = "3"
 # releases by tools/fetch-ort.sh); ort's own CDN download is not used.
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
 realfft = "3"
+serde_json = "1"
+strum = { version = "0.26", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5"
@@ -45,3 +48,10 @@ debug = 1
 [build-dependencies]
 # Compiles the vendored Signalsmith Stretch (third_party/signalsmith) for src/stretch.rs.
 cc = "1"
+
+[dev-dependencies]
+proptest = "1"
+
+# The simulator's sessions (src/loopdeck/sim.rs) analyse minutes of audio.
+[profile.test]
+opt-level = 1

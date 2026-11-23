@@ -1,12 +1,16 @@
 mod audio;
 mod beats;
+mod bookmarks;
 mod control;
 #[cfg(target_os = "macos")]
 mod coreml;
+mod loopdeck;
 mod looper;
 mod model;
 mod models;
 mod socket;
+mod songmap;
+mod source;
 mod spec;
 mod stream;
 mod stretch;
@@ -406,6 +410,40 @@ fn main() -> Result<()> {
                 eprintln!("stemflow: no beat click ({} not found)", bpath.display());
                 None
             };
+            // Looping (src/loopdeck.rs) needs a beat model of its own: the click's
+            // tracker analyses on its own schedule.
+            let deck = if bpath.exists() {
+                match model::runtime(opts.device).and_then(|env| {
+                    beats::BeatNet::load(
+                        env,
+                        &bpath,
+                        opts.beat_threads,
+                        opts.device == Device::Cuda,
+                    )
+                }) {
+                    Ok(net) => {
+                        let c = ctl.clone();
+                        let d = loopdeck::Deck::new(
+                            looper::Looper::new(Box::new(net)),
+                            source::for_app(&grab),
+                            Box::new(move || c.touch()),
+                        );
+                        let _ = ctl.deck.set(d.clone());
+                        // the player's song position, for the song map (osascript is
+                        // slower to ask than D-Bus)
+                        d.watch(std::time::Duration::from_millis(
+                            if cfg!(target_os = "macos") { 1000 } else { 500 },
+                        ));
+                        Some(d)
+                    }
+                    Err(e) => {
+                        eprintln!("stemflow: no looping ({e:#})");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let (lat, hop) = (
                 st.latency() as f64 / SAMPLE_RATE as f64,
                 st.hop as f64 / SAMPLE_RATE as f64,
@@ -443,7 +481,7 @@ fn main() -> Result<()> {
                         .with_context(|| format!("no model `{id}`"))?;
                     Ok((wrap(&opts, load_model(&opts, &m)?)?, m.target, m.second))
                 };
-            audio::live(st, ctl, tracker, &grab, output, slack, load)
+            audio::live(st, ctl, tracker, deck, &grab, output, slack, load)
         }
         Cmd::Passthrough {
             grab,

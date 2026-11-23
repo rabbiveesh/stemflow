@@ -11,6 +11,7 @@ const PopupMenu = imports.ui.popupMenu;
 const Slider = imports.ui.slider;
 const ExtensionUtils = imports.misc.extensionUtils;
 const Me = ExtensionUtils.getCurrentExtension();
+const Loop = Me.imports.loop;
 
 const BUS_NAME = 'org.stemflow.Control';
 const MAX_BASS = 2; // the daemon's limit: twice as loud as the original
@@ -50,6 +51,11 @@ const IFACE = `
     <property name="Meter" type="u" access="readwrite"/>
     <property name="Feel" type="d" access="readwrite"/>
     <property name="Beats" type="s" access="read"/>
+    <property name="LoopState" type="s" access="read"/>
+    <method name="Loop"><arg type="s" direction="in"/></method>
+    <method name="LoopView"><arg type="u" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="LoopBookmarks"><arg type="s" direction="out"/></method>
+    <method name="LoopPanel"><arg type="s" direction="out"/></method>
     <method name="Nudge"><arg type="d" direction="in"/><arg type="d" direction="out"/></method>
     <method name="Snap"><arg type="s" direction="in"/><arg type="d" direction="out"/></method>
   </interface>
@@ -254,6 +260,32 @@ class StemflowIndicator extends PanelMenu.Button {
             this._feelItems.set(f, item);
         }
 
+        // Looping (loop.js): loop the last bars heard, and edit the loop.
+        this._loopSec = new Loop.LoopSection(this.menu, cmd => this.loop(cmd),
+            (bins, cb) => {
+                if (!this._proxy)
+                    return cb(null);
+                this._proxy.LoopViewRemote(bins, (res, err) => {
+                    let pic = null;
+                    try {
+                        pic = err ? null : JSON.parse(res[0]);
+                    } catch (e) {}
+                    cb(pic);
+                });
+            },
+            cb => {
+                if (!this._proxy || !this._loopState())
+                    return cb(null);
+                this._proxy.LoopPanelRemote((res, err) => {
+                    let panel = null;
+                    try {
+                        panel = err ? null : JSON.parse(res[0]);
+                    } catch (e) {}
+                    cb(panel);
+                });
+            });
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+
         // Stem: which part of the music the controls act on (vocals = karaoke,
         // other = the horns in a jazz combo). Picking one switches to the model last
         // used for it (or the first one); only stems with a model are listed.
@@ -279,7 +311,7 @@ class StemflowIndicator extends PanelMenu.Button {
         this.menu.connect('open-state-changed', (_m, open) => {
             if (open) {
                 this._refreshStats();
-                this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, () => {
+                this._timer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
                     this._refreshStats();
                     return GLib.SOURCE_CONTINUE;
                 });
@@ -378,6 +410,46 @@ class StemflowIndicator extends PanelMenu.Button {
         }
     }
 
+    /* The loop's state (JSON from the daemon), or null: off, no beat model, or an
+     * older daemon. */
+    _loopState() {
+        const j = this._proxy?.LoopState;
+        if (!j)
+            return null;
+        try {
+            return JSON.parse(j);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    loop(cmd) {
+        if (!this._proxy)
+            return this._osdOff();
+        this._proxy.LoopRemote(cmd, (_r, err) => {
+            if (err)
+                Main.notify('stemflow', err.message.replace(/^.*InvalidArgs: /, ''));
+        });
+    }
+
+    /* Super+Alt+L: loop the last 4 bars, or back to live if a loop plays (or is
+     * being found). */
+    toggleLoop() {
+        const l = this._loopState();
+        if (!l)
+            return this._proxy ? Main.notify('stemflow', 'No looping: no beat model') : this._osdOff();
+        const live = l.playing || l.finding;
+        this.loop(live ? 'live' : '4');
+        Main.osdWindowManager.show(-1, icon(), live ? 'Live' : 'Looping the last 4 bars', null);
+    }
+
+    _syncLoop(on) {
+        if (on && this._loopState())
+            this._loopSec.load();
+        else
+            this._loopSec.render(null);
+    }
+
     _onScroll(ev) {
         const dir = ev.get_scroll_direction();
         if (dir === Clutter.ScrollDirection.UP || dir === Clutter.ScrollDirection.RIGHT)
@@ -416,6 +488,9 @@ class StemflowIndicator extends PanelMenu.Button {
                     const over = v('Overruns');
                     if (props.Models)
                         this._fillModels(v('Models'), v('Model'));
+                    // the song position isn't announced: read it while showing it
+                    if (props.LoopState && v('LoopState') !== 'null')
+                        this._loopSec.load();
                     this._status.label.text =
                         `${v('App')} · ${v('Latency').toFixed(1)} s behind · ` +
                         `GPU ${v('Compute').toFixed(2)} s of ${v('Hop').toFixed(1)} s` +
@@ -524,6 +599,7 @@ class StemflowIndicator extends PanelMenu.Button {
         // An older daemon has no Model property: no pickers.
         this._stems.visible = on && !!this._proxy.Model;
         this._models.visible = on && this._settings.get_boolean('experiments') && !!this._proxy.Model;
+        this._syncLoop(on);
         if (!on) {
             this._status.label.text = '';
             // Starting, or why it didn't: one line under the switch.
@@ -578,6 +654,7 @@ class StemflowIndicator extends PanelMenu.Button {
     }
 
     destroy() {
+        this._loopSec.destroy();
         if (this._timer)
             GLib.source_remove(this._timer);
         if (this._startTimer)
@@ -592,7 +669,7 @@ class StemflowIndicator extends PanelMenu.Button {
 
 let indicator = null;
 let settings = null;
-const KEYS = ['slide-left', 'slide-right', 'toggle-solo', 'toggle-nobass', 'toggle-running'];
+const KEYS = ['slide-left', 'slide-right', 'toggle-solo', 'toggle-nobass', 'toggle-running', 'toggle-loop'];
 
 function init() {
 }
@@ -607,6 +684,7 @@ function enable() {
         'toggle-solo': () => indicator.toggle('solo', -1),
         'toggle-nobass': () => indicator.toggle('nobass', 1),
         'toggle-running': () => indicator.setRunning(!indicator._proxy && !indicator._starting),
+        'toggle-loop': () => indicator.toggleLoop(),
     };
     for (const k of KEYS)
         Main.wm.addKeybinding(k, settings, Meta.KeyBindingFlags.NONE,
