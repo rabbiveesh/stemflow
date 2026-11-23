@@ -431,6 +431,14 @@ impl Core {
             }
         }
         let playing = n.as_ref().is_some_and(|n| n.playing);
+        // another song while paused: no audio to map, but the person skipped all the same
+        if ext.is_none() && !playing && !self.expected(Expected::Song) {
+            if let (Some(o), Some(n)) = (self.now.as_ref(), n.as_ref()) {
+                if !o.song.same(&n.song) {
+                    ext = Some(External::NextSong { natural: false });
+                }
+            }
+        }
         if !playing && was {
             // it played up to where its sound stopped: one stretch to there
             self.songs.extend_to(self.looper.sound_end() as i64);
@@ -477,10 +485,16 @@ impl Core {
                 }
             }
             // The loop is what's heard: the player only plays unheard, for us. Played
-            // from its own controls, it's wanted again.
+            // from its own controls, or skipped to another song, it's wanted again.
+            // (A song that ends while we buffer the next phrase isn't a skip.)
             Mode::Looping { .. } => {
-                if e == External::Played {
-                    eprintln!("loop: the player was played; back to live");
+                let back = match e {
+                    External::Played => Some("played"),
+                    External::NextSong { natural: false } => Some("skipped"),
+                    _ => None,
+                };
+                if let Some(why) = back {
+                    eprintln!("loop: the player was {why}; back to live");
                     self.paused = false;
                     self.looper.stop();
                     self.mode = Mode::Live;
@@ -554,7 +568,7 @@ impl Core {
                 }
                 // never seek in another song (the queue may have moved on past it)
                 if !self.on_song(&f.song) {
-                    if !f.open || f.song.id.is_empty() || !self.source.open(&f.song.id) {
+                    if !f.open || f.song.id.is_empty() || !self.source.open(&f.song) {
                         return Some(Err(anyhow!(
                             "The player has moved on from {}",
                             f.song.title
@@ -1146,7 +1160,13 @@ impl Core {
 
     fn play_pause(&mut self) {
         if self.player_playing() {
-            self.expect(Expected::State, OURS_MS);
+            // this pause is all we're waiting on now: what we asked before (opening
+            // a song, a seek) is called off, so the person playing it again counts
+            self.expect = Expect {
+                jump: 0,
+                song: 0,
+                state: self.t + OURS_MS,
+            };
             self.source.pause();
             match &self.mode {
                 // the buffered music after a loop stops with it
@@ -1154,6 +1174,7 @@ impl Core {
                 Mode::Looping { .. } => {
                     self.paused = true;
                     self.set_work(|_, _| Work::Idle);
+                    self.say("");
                 }
                 Mode::Recalling { .. } => {
                     self.mode = Mode::Live;
@@ -1293,8 +1314,11 @@ impl Core {
             s.song_playing = n.playing;
         }
         if s.playing {
-            if let Some((_, from, to)) = self.loop_in_song() {
+            if let Some((a, from, to)) = self.loop_in_song() {
                 (s.loop_from, s.loop_to) = (from, to);
+                // the loop's song, not whatever the player has moved on to
+                s.title = a.song.title;
+                s.artist = a.song.artist;
             }
         }
         if let Some(v) = self.looper.view(1) {

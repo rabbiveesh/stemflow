@@ -42,23 +42,28 @@ import kotlin.math.roundToInt
 /**
  * Three tabs over a now-playing strip:
  *  - Stems: on/off, which stem, the mix (as the GNOME menu), model and source;
- *  - Loops: loop the last 2/4/8 bars, the loop view and its edits, meter and feel;
+ *  - Loops: loop the last bars, the loop view and its edits, meter and feel;
  *  - Bookmarks: saved loops grouped by recording; tap to go back there.
  * The strip says what is playing and whether it's live or a loop, with Save and Live
  * (or a quick "Loop 4") always at hand.
+ *
+ * Everything about looping (the Loops and Bookmarks tabs, the strip's Pause and Save,
+ * the stems-only switch) is the loop panel shared with the desktop
+ * (src/loopdeck/panel.rs), drawn by LoopPanel.kt; this screen only says where each of
+ * its rows goes.
  */
 class MainActivity : Activity() {
     // palette: the logo's water blue (lightened to read on dark) on navy ink; its leaf
     // green marks the bar lines in the loop view
-    private val bg = Color.rgb(0x0e, 0x18, 0x20)
-    private val surface = Color.rgb(0x16, 0x25, 0x2f)
-    private val raised = Color.rgb(0x21, 0x36, 0x45)
-    private val line = Color.rgb(0x2d, 0x47, 0x57)
-    private val ink = Color.rgb(0xea, 0xf2, 0xf7)
-    private val muted = Color.rgb(0x9f, 0xb6, 0xc6)
-    private val accent = Color.rgb(0x6c, 0xb4, 0xe8)
-    private val onAccent = Color.rgb(0x06, 0x12, 0x1b)
-    private val bar = Color.rgb(0x0b, 0x14, 0x1b)
+    internal val bg = Color.rgb(0x0e, 0x18, 0x20)
+    internal val surface = Color.rgb(0x16, 0x25, 0x2f)
+    internal val raised = Color.rgb(0x21, 0x36, 0x45)
+    internal val line = Color.rgb(0x2d, 0x47, 0x57)
+    internal val ink = Color.rgb(0xea, 0xf2, 0xf7)
+    internal val muted = Color.rgb(0x9f, 0xb6, 0xc6)
+    internal val accent = Color.rgb(0x6c, 0xb4, 0xe8)
+    internal val onAccent = Color.rgb(0x06, 0x12, 0x1b)
+    internal val bar = Color.rgb(0x0b, 0x14, 0x1b)
 
     private val ui = Handler(Looper.getMainLooper())
     private var dragging = false
@@ -90,7 +95,6 @@ class MainActivity : Activity() {
     private lateinit var vocalsValue: TextView
     private lateinit var bandValue: TextView
     private lateinit var modelPicker: Picker
-    private lateinit var loopActions: View
     private lateinit var monoIn: Button
     private lateinit var monoOut: Button
     private var modelIds = listOf<String>()
@@ -98,63 +102,38 @@ class MainActivity : Activity() {
     private var sourcePkgs = listOf<String?>()
     private lateinit var health: TextView
 
-    // Loops
+    // Loops: the loop panel's rows go in these
     private lateinit var loopDesc: TextView
-    private val grabButtons = mutableMapOf<Int, Button>()
-    private lateinit var loopInfo: TextView
-    private lateinit var loopHint: TextView
-    private lateinit var loopView: LoopView
-    private lateinit var loopEdit: LinearLayout
-    private lateinit var clickChip: Button
-    private lateinit var meterPicker: Picker
-    private lateinit var feelPicker: Picker
-    private lateinit var speedBar: SeekBar
-    private lateinit var speedValue: TextView
-    private lateinit var pitchBar: SeekBar
-    private lateinit var pitchValue: TextView
-    private lateinit var keepChip: Button
-    private var loopBars = 4
-    /** What the loop edits step by: 0 a beat, 1 a bar, 2 a phrase (the loop's length). */
-    private var editUnit = 1
-    private val unitButtons = mutableListOf<Button>()
-
-    // Bookmarks
-    private lateinit var bookmarkCount: TextView
-    private lateinit var bookmarkList: LinearLayout
-    private lateinit var search: EditText
-    private var shownBookmarks = ""
+    private lateinit var loopsBox: LinearLayout
+    private lateinit var bookmarksBox: LinearLayout
+    private lateinit var stemsLoopBox: LinearLayout
+    private lateinit var nowBox: LinearLayout
+    private lateinit var stripBox: LinearLayout
+    private lateinit var panel: LoopPanel
 
     // now playing
-    private lateinit var npTitle: TextView
-    private lateinit var npLine: TextView
-    private lateinit var npSave: Button
+    private lateinit var npOff: TextView
     private lateinit var npLive: Button
-    private lateinit var npPause: Button
     private lateinit var npLoop: Button
-    private var songCheck = 0L
-    private var song: NowPlaying.Song? = null
-    /** The player's session says it's playing; null when we can't read it. */
-    private var sourcePlaying: Boolean? = null
-    private var songMs: Long? = null
 
     private val tick = object : Runnable {
         override fun run() { refresh(); ui.postDelayed(this, 300) }
     }
     private val loopTick = object : Runnable {
-        override fun run() { refreshLoop(); ui.postDelayed(this, 40) }
+        override fun run() { panel.tick(); ui.postDelayed(this, 40) }
     }
 
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    internal fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     // ---------------------------------------------------------------- building blocks
 
-    private fun rounded(color: Int, radius: Int, stroke: Int = 0) = GradientDrawable().apply {
+    internal fun rounded(color: Int, radius: Int, stroke: Int = 0) = GradientDrawable().apply {
         setColor(color)
         cornerRadius = dp(radius).toFloat()
         if (stroke != 0) setStroke(dp(1), stroke)
     }
 
-    private fun label(s: String, size: Float = 15f, color: Int = ink, bold: Boolean = false) = TextView(this).apply {
+    internal fun label(s: String, size: Float = 15f, color: Int = ink, bold: Boolean = false) = TextView(this).apply {
         text = s
         textSize = size
         setTextColor(color)
@@ -191,7 +170,7 @@ class MainActivity : Activity() {
     }
 
     /** A filled button (`primary`: the accent) or an outlined chip. */
-    private fun button(s: String, primary: Boolean = false, chip: Boolean = false, weight: Float = 1f, onClick: () -> Unit) =
+    internal fun button(s: String, primary: Boolean = false, chip: Boolean = false, weight: Float = 1f, onClick: () -> Unit) =
         Button(this).apply {
             text = s
             isAllCaps = false
@@ -202,10 +181,10 @@ class MainActivity : Activity() {
             setPadding(dp(14), 0, dp(14), 0)
             layoutParams = lp(if (weight > 0) 0 else LayoutParams.WRAP_CONTENT, dp(if (chip) 38 else 46), weight)
             style(this, primary, chip)
-            setOnClickListener { onClick(); refresh(); refreshLoop() }
+            setOnClickListener { onClick(); refresh() }
         }
 
-    private fun style(b: Button, on: Boolean, chip: Boolean) {
+    internal fun style(b: Button, on: Boolean, chip: Boolean) {
         b.background = when {
             on -> rounded(accent, if (chip) 19 else 12)
             chip -> rounded(Color.TRANSPARENT, 19, line)
@@ -214,7 +193,7 @@ class MainActivity : Activity() {
         b.setTextColor(if (on) onAccent else ink)
     }
 
-    private fun slider(max: Int, onUser: (Int) -> Unit) = SeekBar(this).apply {
+    internal fun slider(max: Int, onUser: (Int) -> Unit) = SeekBar(this).apply {
         this.max = max
         layoutParams = lp(0, LayoutParams.WRAP_CONTENT, 1f)
         progressTintList = ColorStateList.valueOf(accent)
@@ -261,7 +240,7 @@ class MainActivity : Activity() {
             AlertDialog.Builder(this@MainActivity)
                 .setTitle(title)
                 .setSingleChoiceItems(list.toTypedArray(), selected()) { d, w ->
-                    d.dismiss(); onPick(w); refresh(); refreshLoop()
+                    d.dismiss(); onPick(w); refresh()
                 }
                 .show()
         }
@@ -308,7 +287,35 @@ class MainActivity : Activity() {
             addView(nowPlaying())
             addView(tabBar())
         })
+        panel = LoopPanel(this, ::placeRow, ::sendLoop, { bins ->
+            val h = CaptureService.looper
+            if (h == 0L || !CaptureService.running) null
+            else Native.looperView(h, bins).takeIf { it.size >= 14 }?.let { it to CaptureService.unheardFrames() * Control.speed }
+        }, compact = setOf("now", "strip"))
         showTab(tab)
+    }
+
+    /** Where the loop panel's rows go: the strip, the Stems tab, Bookmarks, Loops. */
+    private fun placeRow(id: String): LinearLayout = when (id) {
+        "now" -> nowBox
+        "strip" -> stripBox
+        "bookmarks" -> bookmarksBox
+        "stems_only" -> stemsLoopBox
+        else -> loopsBox
+    }
+
+    /** The loop panel's lines, to the deck. */
+    private fun sendLoop(lines: List<String>) {
+        for (l in lines) {
+            val w = l.removePrefix("loop ").trim()
+            if (w.startsWith("save") && !NowPlaying.granted(this)) { askAccess(); return }
+            val off = w.startsWith("recall") && !CaptureService.running
+            val err = Loops.send(this, l)
+            if (err != null) { Toast.makeText(this, err, Toast.LENGTH_LONG).show(); return }
+            if (off) start() // switch on; the bookmark is recalled once the audio flows
+            if (w.startsWith("recall") || w.firstOrNull()?.isDigit() == true) showTab(1)
+        }
+        refresh()
     }
 
     private fun stemsPage(): View {
@@ -395,19 +402,8 @@ class MainActivity : Activity() {
             divider(),
             row(label("From", 14f, muted).apply { minWidth = dp(64) }, sourcePicker.view).apply { setPadding(dp(16), dp(4), dp(12), dp(4)) },
         ).apply { background = rounded(surface, 18) }
-        val onLoop = Switch(this).apply {
-            thumbTintList = ColorStateList.valueOf(accent)
-            isChecked = Control.stemsOnLoop
-            setOnCheckedChangeListener { _, on -> Control.stemsOnLoop = on; Control.saveBeats(this@MainActivity) }
-        }
-        val onLoopRow = row(
-            column(
-                label("Stems only when looping", 15f),
-                label("Hear the plain mix and save battery; a loop is separated when you make it", 12f, muted),
-            ).apply { layoutParams = lp(0, LayoutParams.WRAP_CONTENT, 1f) },
-            onLoop,
-            gap = 12,
-        ).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(12), dp(12), dp(12)); background = rounded(surface, 18) }
+        // the loop panel's "stems only when looping" switch goes here
+        stemsLoopBox = column()
         health = label("", 12f, muted).apply { setPadding(dp(20), dp(12), dp(20), 0) }
         val extras = row(
             button("Add quick tile", chip = true, weight = 0f) { addTile() },
@@ -421,7 +417,7 @@ class MainActivity : Activity() {
             chipsScroll,
             pad(mix),
             pad(pickers),
-            pad(onLoopRow),
+            margins(stemsLoopBox, t = 4),
             health,
             extras,
         )
@@ -429,149 +425,27 @@ class MainActivity : Activity() {
 
     private fun loopsPage(): View {
         loopDesc = label("", 13f, muted)
-        val grabs = row()
-        for (n in listOf(2, 4, 8)) {
-            val b = button("$n bars") { loopBars = n; CaptureService.loopLast(this, n) }
-            grabButtons[n] = b
-            grabs.addView(b)
-            if (grabs.childCount > 1) (b.layoutParams as LayoutParams).leftMargin = dp(8)
-        }
-        grabs.setPadding(dp(16), 0, dp(16), 0)
-
-        val edit = { op: Int, a: Int, b: Int, f: Float ->
-            CaptureService.looper.takeIf { it != 0L }?.let { Native.looperEdit(it, op, a, b, f) }; Unit
-        }
-        loopInfo = label("", 15f, bold = true)
-        loopHint = label("", 12f, muted)
-        loopView = LoopView(this).apply {
-            layoutParams = lp(LayoutParams.MATCH_PARENT, dp(118))
-            onEdges = { a, b -> edit(3, a, b, 0f); refreshLoop() }
-            onBarOne = { i -> edit(5, i, 0, 0f); refreshLoop() }
-        }
-        // Edit by a beat, a bar or a phrase (the loop's own length): the start, the
-        // whole loop, or the end, earlier or later.
-        val units = row(*listOf("Beat", "Bar", "Phrase").mapIndexed { i, s ->
-            button(s, chip = true) { editUnit = i }.also { it.setPadding(dp(4), 0, dp(4), 0); it.isSingleLine = true; unitButtons += it }
-        }.toTypedArray(), gap = 6)
-        val step = {
-            val h = CaptureService.looper
-            val v = if (h != 0L) Native.looperView(h, 1) else FloatArray(0)
-            if (v.size < 14) 0 else when (editUnit) {
-                0 -> 1
-                1 -> v[3].toInt().coerceAtLeast(1)
-                else -> (v[11] - v[10]).toInt()
-            }
-        }
-        val adj = { da: Int, db: Int -> CaptureService.adjust(this, da, db) }
-        fun pair(name: String, note: String, l: () -> Unit, r: () -> Unit) = column(
-            label(name.uppercase(), 11f, muted, bold = true).apply { gravity = Gravity.CENTER; layoutParams = lp(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT) },
-            margins(row(button("◀") { l() }, button("▶") { r() }, gap = 6), t = 6),
-            margins(label(note, 11f, muted).apply { gravity = Gravity.CENTER; layoutParams = lp(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT) }, t = 4),
-        ).apply { layoutParams = lp(0, LayoutParams.WRAP_CONTENT, 1f) }
-        val pairs = row(
-            pair("Start", "◀ longer · shorter ▶", { val u = step(); adj(-u, 0) }, { val u = step(); adj(u, 0) }),
-            pair("Move", "same length", { val u = step(); adj(-u, -u) }, { val u = step(); adj(u, u) }),
-            pair("End", "◀ shorter · longer ▶", { val u = step(); adj(0, -u) }, { val u = step(); adj(0, u) }),
-            gap = 8,
-        )
-        loopEdit = column(margins(loopView, t = 12), margins(units, t = 12), margins(pairs, t = 10))
-        val loopCard = card(loopInfo, loopHint, loopEdit)
-
-        val meters = listOf(0, 2, 3, 4, 5, 6, 7)
-        meterPicker = Picker("Beats per bar", { meters.map { if (it == 0) "Auto meter" else "$it/4" } },
-            { meters.indexOf(Control.meter).coerceAtLeast(0) }) { pos ->
-            if (Control.meter != meters[pos]) {
-                Control.meter = meters[pos]; Control.saveBeats(this)
-                edit(7, Control.meter, 0, Control.feel)
-            }
-        }
-        val feels = listOf(1f, 0.5f, 2f)
-        feelPicker = Picker("Feel", { listOf("As heard", "Half time", "Double time") },
-            { feels.indexOf(Control.feel).coerceAtLeast(0) }) { pos ->
-            if (Control.feel != feels[pos]) {
-                Control.feel = feels[pos]; Control.saveBeats(this)
-                edit(7, Control.meter, 0, Control.feel)
-            }
-        }
-        clickChip = button("Click", chip = true, weight = 0f) {
-            Control.click = !Control.click; Control.saveBeats(this)
-            edit(6, if (Control.click) 1 else 0, 0, 0f)
-        }
-        val feel = row(meterPicker.view, feelPicker.view, clickChip).apply { setPadding(dp(16), dp(14), dp(16), 0) }
-        // pills as in the mockup: sized to their text, not stretched across the row
-
-        // Practice speed (40-120%) and transposition (±12 semitones), for the loop.
-        speedBar = slider(80) { p -> Control.speed = (40 + p) / 100f; applySpeed() }
-        speedValue = label("100%", 13f, muted).apply { minWidth = dp(58); gravity = Gravity.END }
-        pitchBar = slider(24) { p -> Control.semis = (p - 12).toFloat(); applySpeed() }
-        pitchValue = label("0 st", 13f, muted).apply { minWidth = dp(58); gravity = Gravity.END }
-        keepChip = button("Keep pitch", chip = true, weight = 0f) { Control.keepPitch = !Control.keepPitch; applySpeed() }
-        val speedRows = column(
-            row(label("Speed", 13f, muted).apply { minWidth = dp(50) }, speedBar, speedValue, gap = 4),
-            margins(row(label("Pitch", 13f, muted).apply { minWidth = dp(50) }, pitchBar, pitchValue, gap = 4), t = 6),
-            margins(row(
-                button("75%", chip = true, weight = 0f) { Control.speed = 0.75f; applySpeed() },
-                button("50%", chip = true, weight = 0f) { Control.speed = 0.5f; applySpeed() },
-                keepChip,
-                button("Reset", chip = true, weight = 0f) { Control.speed = 1f; Control.semis = 0f; applySpeed() },
-            ), t = 10),
-        ).apply { setPadding(dp(20), dp(14), dp(16), 0) }
-
-        val top = button("From the top", weight = 0f) { edit(1, 0, 0, 0f) }.apply { layoutParams = lp(LayoutParams.MATCH_PARENT, dp(46)) }
-        val repair = button("Repair", weight = 0f) { CaptureService.repair(this) }.apply { layoutParams = lp(LayoutParams.MATCH_PARENT, dp(46)) }
-        val actions = column(top, margins(repair, t = 8)).apply { setPadding(dp(16), dp(14), dp(16), 0) }
-        loopActions = actions
-
-        return page(
-            header("Loops", loopDesc),
-            label("Loop the last", 13f, muted).apply { setPadding(dp(20), dp(6), dp(20), dp(8)) },
-            grabs,
-            pad(loopCard),
-            feel,
-            speedRows,
-            actions,
-        )
+        loopsBox = column()
+        return page(header("Loops", loopDesc), loopsBox)
     }
 
     private fun bookmarksPage(): View {
-        bookmarkCount = label("", 13f, muted)
-        search = EditText(this).apply {
-            hint = "Search songs and loops"
-            setHintTextColor(muted)
-            setTextColor(ink)
-            textSize = 15f
-            isSingleLine = true
-            background = rounded(surface, 12)
-            setPadding(dp(14), 0, dp(14), 0)
-            layoutParams = lp(LayoutParams.MATCH_PARENT, dp(46))
-            addTextChangedListener(object : TextWatcher {
-                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-                override fun afterTextChanged(s: Editable?) { refreshBookmarks(force = true) }
-            })
-        }
-        bookmarkList = column()
+        bookmarksBox = column().apply { setPadding(dp(4), dp(18), dp(4), 0) }
         val foot = label(
             "Tap a loop to go back there: the player seeks a few seconds before it, you hear the run-up, " +
                 "and the loop comes back with its bars. Long-press to rename or delete.",
             12f, muted,
         ).apply { setPadding(dp(20), dp(14), dp(20), 0) }
-        return page(header("Bookmarks", bookmarkCount), pad(search), bookmarkList, foot)
+        return page(bookmarksBox, foot)
     }
 
     private fun nowPlaying(): View {
-        npTitle = label("", 14f, bold = true).apply { isSingleLine = true; ellipsize = android.text.TextUtils.TruncateAt.END }
-        npLine = label("", 12f, muted).apply { isSingleLine = true; ellipsize = android.text.TextUtils.TruncateAt.END }
-        npSave = button("Save", chip = true, weight = 0f) { saveLoop() }
-        npLive = button("Live", primary = true, chip = true, weight = 0f) { CaptureService.goLive(this) }
-        npPause = button("Pause", chip = true, weight = 0f) {
-            // the player takes a moment to say; flip the button now, re-check in a second
-            CaptureService.playPause(this)
-            sourcePlaying = !(sourcePlaying ?: !CaptureService.sourceSilent)
-            songCheck = System.currentTimeMillis()
-        }
-        npLoop = button("Loop 4", primary = true, chip = true, weight = 0f) { loopBars = 4; CaptureService.loopLast(this, 4); showTab(1) }
-        val texts = column(npTitle, npLine).apply { layoutParams = lp(0, LayoutParams.WRAP_CONTENT, 1f) }
+        npOff = label("", 14f, bold = true).apply { isSingleLine = true; ellipsize = android.text.TextUtils.TruncateAt.END }
+        nowBox = column()
+        stripBox = column()
+        npLive = button("Live", primary = true, chip = true, weight = 0f) { sendLoop(listOf("loop live")) }
+        npLoop = button("Loop 4", primary = true, chip = true, weight = 0f) { sendLoop(listOf("loop 4")) }
+        val texts = column(npOff, nowBox).apply { layoutParams = lp(0, LayoutParams.WRAP_CONTENT, 1f) }
         val icon = android.widget.ImageView(this).apply {
             setImageResource(R.drawable.ic_now_playing)
             imageTintList = ColorStateList.valueOf(accent)
@@ -579,7 +453,7 @@ class MainActivity : Activity() {
             setPadding(dp(8), dp(8), dp(8), dp(8))
             layoutParams = lp(dp(36), dp(36))
         }
-        return row(icon, texts, npPause, npSave, npLive, npLoop, gap = 10).apply {
+        return row(icon, texts, stripBox, npLive, npLoop, gap = 6).apply {
             background = rounded(surface, 14)
             setPadding(dp(14), dp(8), dp(10), dp(8))
             layoutParams = lp().apply { setMargins(dp(12), dp(6), dp(12), dp(8)) }
@@ -618,10 +492,9 @@ class MainActivity : Activity() {
             t.compoundDrawableTintList = ColorStateList.valueOf(if (k == i) accent else muted)
             t.typeface = if (k == i) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
         }
-        if (i == 2) refreshBookmarks(force = true)
     }
 
-    override fun onResume() { super.onResume(); loadSources(); refreshBookmarks(force = true); ui.post(tick); ui.post(loopTick) }
+    override fun onResume() { super.onResume(); loadSources(); ui.post(tick); ui.post(loopTick) }
     override fun onPause() { super.onPause(); ui.removeCallbacks(tick); ui.removeCallbacks(loopTick) }
 
     private var sourceLabels = listOf<String>()
@@ -631,15 +504,6 @@ class MainActivity : Activity() {
         sourcePkgs = listOf<String?>(null) + apps.map { it.pkg }
         sourceLabels = apps.map { it.label }
         sourcePicker.update()
-    }
-
-    /** Speed and pitch to the looper (and the screen), saved for next time. */
-    private fun applySpeed() {
-        Control.saveBeats(this)
-        CaptureService.looper.takeIf { it != 0L }?.let {
-            Native.looperEdit(it, 9, (Control.semis * 100).roundToInt(), if (Control.keepPitch) 1 else 0, Control.speed)
-        }
-        refresh()
     }
 
     // ---------------------------------------------------------------- refreshing
@@ -702,213 +566,39 @@ class MainActivity : Activity() {
         }
         for (i in 0 until stemChips.childCount) (stemChips.getChildAt(i) as? Button)?.let { style(it, it.tag == t, true) }
         modelPicker.update() // the source picker updates on resume and when picked
-        meterPicker.update()
-        feelPicker.update()
-        style(clickChip, Control.click, true)
-        if (!dragging) {
-            speedBar.progress = (Control.speed * 100).roundToInt() - 40
-            pitchBar.progress = Control.semis.roundToInt() + 12
-        }
-        speedValue.text = "${(Control.speed * 100).roundToInt()}%"
-        pitchValue.text = "%+d st".format(Control.semis.roundToInt()).replace("+0", "0")
-        style(keepChip, Control.keepPitch, true)
+        panel.render(Loops.panel(this))
         refreshNowPlaying()
     }
 
-    /** The strip: the song and where it is, or the loop; Save + Live, or Loop 4. */
+    /** The strip: the panel's song line, Pause and Save, and Live or a quick Loop 4. */
     private fun refreshNowPlaying() {
-        val now = System.currentTimeMillis()
-        if (now - songCheck > 1000) {
-            songCheck = now
-            val ctl = NowPlaying.controller(this)
-            song = ctl?.let { NowPlaying.song(it) } ?: CaptureService.anchor?.song
-            songMs = ctl?.let { NowPlaying.positionMs(it) }
-            sourcePlaying = ctl?.let { NowPlaying.playing(it) }
-        }
-        val h = CaptureService.looper
-        val v = if (h != 0L && CaptureService.running) Native.looperView(h, 1) else FloatArray(0)
-        val looping = v.size >= 14 && v[0] > 0f
-        val range = CaptureService.loopSongRange()
-        npTitle.text = song?.title ?: if (CaptureService.running) "stemflow" else "Off"
-        npLine.text = when {
+        val st = Loops.state()
+        val on = st != null
+        npOff.visibility = if (on) View.GONE else View.VISIBLE
+        nowBox.visibility = if (on) View.VISIBLE else View.GONE
+        stripBox.visibility = if (on) View.VISIBLE else View.GONE
+        npOff.text = when {
+            !CaptureService.running -> "Off · switch on under Stems"
             CaptureService.loopStatus.isNotEmpty() -> CaptureService.loopStatus
-            v.size >= 2 && v[1] > 0f -> "Finding the bars…"
-            looping && range != null -> "Looping %s–%s · paused".format(Bookmarks.time(range[0]), Bookmarks.time(range[1]))
-            looping -> "Looping · %d bars".format(v[4].toInt())
-            CaptureService.running -> listOfNotNull("Live", song?.artist?.ifEmpty { null }, songMs?.let { Bookmarks.time(it) }).joinToString(" · ")
-            else -> "Switch on under Stems"
+            else -> "Loading the bar finder…"
         }
-        npSave.visibility = if (v.size >= 14) View.VISIBLE else View.GONE
-        val recalling = CaptureService.recalling
-        npLive.visibility = if (looping || recalling) View.VISIBLE else View.GONE
-        npLoop.visibility = if (CaptureService.running && !looping && !recalling && h != 0L) View.VISIBLE else View.GONE
-        val live = CaptureService.running && !looping && !recalling
-        npPause.visibility = if (live) View.VISIBLE else View.GONE
-        if (live) npPause.text = if (sourcePlaying ?: !CaptureService.sourceSilent) "Pause" else "Play"
-    }
-
-    /** The loop card: what was found, or why not. */
-    private fun refreshLoop() {
-        val h = CaptureService.looper
-        val bins = (loopView.width / (3 * resources.displayMetrics.density)).toInt().coerceIn(40, 600)
-        val v = if (h != 0L && CaptureService.running) Native.looperView(h, bins) else FloatArray(0)
-        val has = v.size >= 14
-        loopEdit.visibility = if (has) View.VISIBLE else View.GONE
-        loopActions.visibility = if (has) View.VISIBLE else View.GONE
-        if (has) {
-            loopView.update(v, CaptureService.unheardFrames() * Control.speed)
-            loopBars = v[4].toInt().coerceAtLeast(1)
-        }
-        for ((n, b) in grabButtons) style(b, has && v[0] > 0f && n == loopBars, false)
-        unitButtons.forEachIndexed { i, b -> style(b, i == editUnit, true) }
-        if (has && unitButtons.size == 3) {
-            val bars = ((v[11] - v[10]) / v[3].coerceAtLeast(1f)).let { Math.round(it) }
-            unitButtons[2].text = if (bars == 1) "1-bar phrase" else "$bars-bar phrase"
-        }
-        val finding = v.size >= 2 && v[1] > 0f
-        loopInfo.text = when {
-            has -> {
-                val m = v[3].toInt().coerceAtLeast(1)
-                val n = (v[11] - v[10]).toInt()
-                val (bars, extra) = n / m to n % m
-                "%s · %d bar%s%s of %d/4".format(if (v[0] > 0f) "Looping" else "Kept", bars, if (bars == 1) "" else "s",
-                    if (extra > 0) " + $extra beat" + (if (extra == 1) "" else "s") else "", m)
-            }
-            finding -> "Finding the bars…"
-            CaptureService.running -> if (h == 0L) "Loading the bar finder…" else "No loop yet"
-            else -> "Switch isolation on under Stems"
-        }
-        loopHint.text = when {
-            CaptureService.loopStatus.isNotEmpty() -> CaptureService.loopStatus
-            has -> "%.0f bpm · drag an end · long-press a beat for bar 1".format(v[2])
-            CaptureService.running && h != 0L -> "Press a length to loop what you just heard"
-            else -> ""
-        }
-    }
-
-    /** Loops grouped by recording; tap to go back, long-press to rename or delete. */
-    private fun refreshBookmarks(force: Boolean = false) {
-        val q = search.text.toString().trim().lowercase()
-        val all = Bookmarks.all(this)
-        val list = all.filter {
-            q.isEmpty() || listOf(it.name, it.title, it.artist, it.album).any { s -> s.lowercase().contains(q) }
-        }
-        val key = q + "|" + list.joinToString(",") { "${it.created}:${it.name}" }
-        if (!force && key == shownBookmarks) return
-        shownBookmarks = key
-        val songs = all.groupBy { "${it.title}|${it.artist}|${it.album}" }.size
-        bookmarkCount.text = "%d loop%s · %d song%s".format(all.size, if (all.size == 1) "" else "s", songs, if (songs == 1) "" else "s")
-        bookmarkList.removeAllViews()
-        if (all.isEmpty()) {
-            bookmarkList.addView(label("Save a loop (Save, in the strip below) to come back to it later.", 14f, muted)
-                .apply { setPadding(dp(20), dp(16), dp(20), 0) })
-            return
-        }
-        val groups = list.groupBy { "${it.title}|${it.artist}|${it.album}" }
-            .values.sortedByDescending { g -> g.maxOf { it.created } }
-        for (g in groups) {
-            val first = g.first()
-            val initials = first.title.split(" ").filter { it.isNotEmpty() }.take(2).joinToString("") { it.take(1).uppercase() }
-            val badge = label(initials, 16f, accent, bold = true).apply {
-                gravity = Gravity.CENTER
-                background = rounded(Color.rgb(0x1f, 0x3d, 0x55), 10)
-                layoutParams = lp(dp(44), dp(44))
-            }
-            val names = column(
-                label(first.title, 16f, bold = true).apply { isSingleLine = true; ellipsize = android.text.TextUtils.TruncateAt.END },
-                label(listOf(first.artist, first.album).filter { it.isNotEmpty() }.joinToString(" · "), 13f, muted)
-                    .apply { isSingleLine = true; ellipsize = android.text.TextUtils.TruncateAt.END },
-            ).apply { layoutParams = lp(0, LayoutParams.WRAP_CONTENT, 1f) }
-            val card = column(row(badge, names, gap = 12).apply { setPadding(dp(14), dp(14), dp(14), dp(10)) }).apply {
-                background = rounded(surface, 18)
-            }
-            for (b in g.sortedBy { it.startMs }) card.addView(bookmarkRow(b))
-            bookmarkList.addView(pad(card))
-        }
-    }
-
-    private fun bookmarkRow(b: Bookmarks.Bookmark): View {
-        val at = label(Bookmarks.time(b.startMs), 13f, accent, bold = true).apply { minWidth = dp(52) }
-        val texts = column(
-            label(b.name, 15f).apply { isSingleLine = true; ellipsize = android.text.TextUtils.TruncateAt.END },
-            label("%d bars · %d/4 · %s–%s".format(b.bars, b.meter, Bookmarks.time(b.startMs), Bookmarks.time(b.endMs)), 12f, muted),
-        ).apply { layoutParams = lp(0, LayoutParams.WRAP_CONTENT, 1f) }
-        val play = label("▶", 16f, accent)
-        return row(at, texts, play, gap = 10).apply {
-            setPadding(dp(14), dp(10), dp(14), dp(10))
-            minimumHeight = dp(56)
-            isClickable = true
-            setBackgroundResource(android.R.drawable.list_selector_background)
-            setOnClickListener {
-                val off = !CaptureService.running
-                CaptureService.recall(this@MainActivity, b)
-                if (off) start() // switch on; the bookmark is recalled once the audio flows
-                showTab(1)
-            }
-            setOnLongClickListener { bookmarkMenu(b); true }
-        }
-    }
-
-    private fun bookmarkMenu(b: Bookmarks.Bookmark) {
-        AlertDialog.Builder(this)
-            .setTitle(b.name)
-            .setItems(arrayOf("Rename", "Delete")) { _, which ->
-                if (which == 0) {
-                    val input = EditText(this).apply { setText(b.name); selectAll() }
-                    AlertDialog.Builder(this)
-                        .setTitle("Rename")
-                        .setView(input)
-                        .setPositiveButton("Rename") { _, _ ->
-                            Bookmarks.rename(this, b, input.text.toString().ifBlank { b.name }); refreshBookmarks(true)
-                        }
-                        .setNegativeButton("Cancel", null)
-                        .show()
-                } else {
-                    AlertDialog.Builder(this)
-                        .setTitle("Delete \"${b.name}\"?")
-                        .setPositiveButton("Delete") { _, _ -> Bookmarks.remove(this, b); refreshBookmarks(true) }
-                        .setNegativeButton("Cancel", null)
-                        .show()
-                }
-            }
-            .show()
+        val looping = st?.optBoolean("playing") == true
+        val busy = st?.optBoolean("recalling") == true || st?.optBoolean("finding") == true || st?.optBoolean("tail") == true
+        npLive.visibility = if (looping || busy) View.VISIBLE else View.GONE
+        npLoop.visibility = if (on && !looping && !busy) View.VISIBLE else View.GONE
     }
 
     // ---------------------------------------------------------------- actions
 
-    /** Name the loop and save it; first ask for notification access if it's missing. */
-    private fun saveLoop() {
-        if (!NowPlaying.granted(this)) {
-            AlertDialog.Builder(this)
-                .setTitle("Allow notification access")
-                .setMessage("Bookmarks need to know which song is playing and where, and to seek it later. " +
-                    "Android only lets an app read the player for that with notification access " +
-                    "(stemflow doesn't read your notifications).\n\nTurn on \"stemflow bookmarks\", then make the loop again.")
-                .setPositiveButton("Open settings") { _, _ ->
-                    startActivity(Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-                }
-                .setNegativeButton("Cancel", null)
-                .show()
-            return
-        }
-        val range = CaptureService.loopSongRange()
-        val input = EditText(this).apply {
-            setText(listOfNotNull(song?.title, range?.let { Bookmarks.time(it[0]) }).joinToString(" · "))
-            selectAll()
-        }
+    /** Saving needs to know the song: ask for notification access first. */
+    private fun askAccess() {
         AlertDialog.Builder(this)
-            .setTitle("Save this loop")
-            .setView(input)
-            .setPositiveButton("Save") { _, _ ->
-                val name = input.text.toString().ifBlank { "Loop" }
-                val err = try {
-                    CaptureService.saveBookmark(this, name)
-                } catch (e: Exception) {
-                    Log.e("stemflow", "bookmark save failed", e)
-                    "Not saved: ${e.message}"
-                }
-                Toast.makeText(this, err ?: "Saved \u201c$name\u201d", Toast.LENGTH_LONG).show()
-                refreshBookmarks(force = true)
+            .setTitle("Allow notification access")
+            .setMessage("Bookmarks need to know which song is playing and where, and to seek it later. " +
+                "Android only lets an app read the player for that with notification access " +
+                "(stemflow doesn't read your notifications).\n\nTurn on \"stemflow bookmarks\", then make the loop again.")
+            .setPositiveButton("Open settings") { _, _ ->
+                startActivity(Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -921,7 +611,7 @@ class MainActivity : Activity() {
     }
 
     private fun start() {
-        if (!notificationsOk()) { CaptureService.pendingRecall = null; return }
+        if (!notificationsOk()) return
         val go = {
             CaptureService.status = "Starting…"
             startForegroundService(Intent(this, CaptureService::class.java)); Unit

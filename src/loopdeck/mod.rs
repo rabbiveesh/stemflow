@@ -61,8 +61,8 @@ pub trait Source: Send + Sync {
     fn seek(&self, _ms: i64) -> bool {
         false
     }
-    /// Play the recording with this id (a bookmark's).
-    fn open(&self, _id: &str) -> bool {
+    /// Play this recording (a bookmark's): by its id, in its app.
+    fn open(&self, _song: &Song) -> bool {
         false
     }
 }
@@ -185,6 +185,12 @@ impl Deck {
         std::thread::Builder::new()
             .name("loop-jobs".into())
             .spawn(move || {
+                // The phone's separator must never wait for the bar finder: this
+                // thread (and the beat network's, made at load) run in the background.
+                #[cfg(target_os = "android")]
+                unsafe {
+                    libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                }
                 for (id, job) in rx {
                     let starts = job.starts();
                     let r = job.run(&looper);
@@ -340,12 +346,7 @@ impl State {
 }
 
 fn stems_only_file() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
-        })?;
-    Some(base.join("stemflow/stems-only"))
+    Some(crate::bookmarks::state_dir()?.join("stems-only"))
 }
 
 fn load_stems_only() -> bool {

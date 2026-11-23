@@ -21,6 +21,8 @@ pub struct Song {
     pub title: String,
     pub artist: String,
     pub album: String,
+    /// The app that plays it (an Android package), or "": a bookmark opens it there.
+    pub app: String,
 }
 
 impl Song {

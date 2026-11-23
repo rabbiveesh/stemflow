@@ -29,6 +29,29 @@ jobs:
       - run: cargo clippy --all-targets --features cuda -- -D warnings
       - run: cargo test --release
 
+  android:
+    # The app's Rust core and Kotlin, without the NDK or the SDK: the core is checked
+    # for the host, the Kotlin compiled against Robolectric's framework classes (see
+    # android/tools/kotlin-check.sh). The loop panel's `when` over its kinds must be
+    # exhaustive there, as Swift's switch must be on the Mac.
+    name: Android core and Kotlin compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: android/core
+      - run: cargo clippy --manifest-path android/core/Cargo.toml -- -D warnings
+      # (the runner's own Java runs kotlinc)
+      - uses: actions/cache@v6
+        with:
+          path: ~/.cache/stemflow-kotlin-check
+          key: kotlin-check-${{ hashFiles('android/tools/kotlin-check.sh') }}
+      - run: android/tools/kotlin-check.sh
+
   numerics:
     # End to end against PyTorch: export htdemucs_ft's bass model to ONNX, then check
     # that the Rust STFT + ONNX Runtime + iSTFT pipeline reproduces demucs' forward.

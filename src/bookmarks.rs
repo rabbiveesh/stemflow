@@ -99,6 +99,7 @@ impl Bookmark {
                 title: s("title"),
                 artist: s("artist"),
                 album: s("album"),
+                app: s("pkg"),
             },
             start_ms: start,
             end_ms: i("endMs")?,
@@ -128,10 +129,7 @@ impl Bookmark {
         };
         put("v", json!(if self.has_grid() { v.max(VERSION) } else { v }));
         put("name", json!(self.name));
-        put(
-            "pkg",
-            json!(self.raw.get("pkg").cloned().unwrap_or(json!(""))),
-        );
+        put("pkg", json!(self.song.app));
         put("title", json!(self.song.title));
         put("artist", json!(self.song.artist));
         put("album", json!(self.song.album));
@@ -168,11 +166,29 @@ impl Bookmark {
     }
 }
 
-fn file() -> Option<PathBuf> {
+static STATE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Keep stemflow's state (bookmarks, the loop options) in `dir` rather than
+/// `$XDG_STATE_HOME/stemflow`: the Android app's files folder, where its bookmarks
+/// have always been.
+#[allow(dead_code)] // the Android app's
+pub fn set_state_dir(dir: PathBuf) {
+    let _ = STATE_DIR.set(dir);
+}
+
+/// Where stemflow keeps its state.
+pub fn state_dir() -> Option<PathBuf> {
+    if let Some(d) = STATE_DIR.get() {
+        return Some(d.clone());
+    }
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    Some(base.join("stemflow/bookmarks.json"))
+    Some(base.join("stemflow"))
+}
+
+fn file() -> Option<PathBuf> {
+    Some(state_dir()?.join("bookmarks.json"))
 }
 
 /// Every entry as stored, with the bookmark it holds (None if it doesn't parse).

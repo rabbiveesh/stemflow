@@ -213,7 +213,7 @@ adb shell "cd /data/local/tmp/stemflow && LD_LIBRARY_PATH=. ./stemflow-bench bea
 - **Sources:** the shell-uid helper (default; takes whatever app is playing, Spotify included, see below), or Android's screen-capture consent ("Use screen capture instead"; only for apps that allow capture, and the original keeps playing).
 - **Threads:** reader (source → 2 s hops) → worker (separator) → player (20 ms blocks, levels applied at playback so the controls act at once). When the worker falls behind it skips to the newest hop.
 
-Setup (once): Android SDK at `~/Android/sdk` (cmdline-tools, `platforms;android-35`, `build-tools;35.0.0`), Gradle 8.11.1 at `~/Android/gradle-8.11.1`, `app/local.properties` with `sdk.dir=`, and LiteRT 2's `libLiteRt.so` and `libLiteRtClGlAccelerator.so` (from `~/Android/litert-2`) copied into `app/src/main/jniLibs/arm64-v8a/`.
+Setup (once): Android SDK at `~/Android/sdk` (cmdline-tools, `platforms;android-35`, `build-tools;35.0.0`), Gradle 8.11.1 at `~/Android/gradle-8.11.1` and `app/local.properties` with `sdk.dir=`. The app's LiteRT 2 libraries (`libLiteRt.so`, `libLiteRtClGlAccelerator.so`) come out of the `litert` and `litert-gpu` AARs on Google's Maven at build time (`unpackLiteRt` in `app/build.gradle.kts`); nothing to copy. The build stops if `libstemflow_core.so` hasn't been built.
 
 ```bash
 cd android/core && ANDROID_NDK_HOME=~/Android/android-ndk-r29 LITERT_LIB_DIRS=~/Android/litert-2/litert/jni/arm64-v8a cargo ndk -t arm64-v8a -P 26 -o ../app/src/main/jniLibs build --release --features litert2

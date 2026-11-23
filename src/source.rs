@@ -135,6 +135,7 @@ mod mpris {
                         title,
                         artist: get("xesam:artist"),
                         album: get("xesam:album"),
+                        ..Default::default()
                     },
                     ms: us / 1000,
                     len_ms: len / 1000,
@@ -181,7 +182,8 @@ impl Source for Player {
         };
         self.set_position(&trackid, ms)
     }
-    fn open(&self, id: &str) -> bool {
+    fn open(&self, song: &Song) -> bool {
+        let id = song.id.as_str();
         // Spotify gives its tracks as https://open.spotify.com/track/<id>
         let uri = match id.strip_prefix("https://open.spotify.com/track/") {
             Some(t) => format!("spotify:track:{}", t.split('?').next().unwrap_or(t)),
@@ -274,6 +276,7 @@ impl Source for Player {
                 title: f[1].into(),
                 artist: f[2].into(),
                 album: f[3].into(),
+                ..Default::default()
             },
             ms: f[4].trim().parse().ok()?,
             playing: f[5].trim() == "playing",
@@ -288,7 +291,8 @@ impl Source for Player {
         ))
         .is_some()
     }
-    fn open(&self, id: &str) -> bool {
+    fn open(&self, song: &Song) -> bool {
+        let id = song.id.as_str();
         // Spotify plays its track URIs; Music has no such thing to script
         self.app() == Some("Spotify")
             && id.starts_with("spotify:")

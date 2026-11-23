@@ -38,6 +38,7 @@ pub fn tune(n: usize, len_s: i64, bpm: f64) -> Tune {
             title: format!("Song {n}"),
             artist: "Sim".into(),
             album: String::new(),
+            ..Default::default()
         },
         len_ms: len_s * 1000,
         bpm,
@@ -96,9 +97,9 @@ impl Source for FakePlayer {
         p.seeks.push(ms);
         true
     }
-    fn open(&self, id: &str) -> bool {
+    fn open(&self, song: &Song) -> bool {
         let mut p = self.0.lock().unwrap();
-        let Some(i) = p.tunes.iter().position(|t| t.song.id == id) else {
+        let Some(i) = p.tunes.iter().position(|t| t.song.id == song.id) else {
             return false;
         };
         p.cur = i;
@@ -412,6 +413,24 @@ mod tests {
         assert!(h.iter().all(|x| x.is_some_and(|x| x.0 == 1)), "{h:?}");
     }
 
+    /// Skipping in the player while a loop plays (live on the phone, 2026-11-23):
+    /// the person has moved on, so the loop stops and the new song is heard.
+    #[test]
+    fn a_skip_during_a_loop_goes_live() {
+        let mut s = two_songs();
+        s.play();
+        s.run(40_000);
+        s.cmd("4");
+        s.run(2_000);
+        assert_eq!(s.core.mode_name(), "looping");
+        s.p.lock().unwrap().skip();
+        s.p.lock().unwrap().playing = true;
+        s.run(2_500);
+        assert_eq!(s.core.mode_name(), "live");
+        let h = heard_since(&s, 300);
+        assert!(h.iter().all(|x| x.is_some_and(|x| x.0 == 1)), "{h:?}");
+    }
+
     /// ...but a song that plays to its end carries on from the buffer, every bit of
     /// it heard.
     #[test]
@@ -642,6 +661,8 @@ mod random {
     }
 
     struct Rules {
+        /// The person skipped to another song while a loop played: the loop stops.
+        skipped_loop: Option<i64>,
         /// The person did something in the player at this time, while live: from a
         /// moment later, what's heard is the player.
         synced_after: Option<i64>,
@@ -679,6 +700,17 @@ mod random {
                 );
             } else {
                 self.idle_playing_since = None;
+            }
+            if let Some(t0) = self.skipped_loop {
+                if mode != "looping" {
+                    self.skipped_loop = None;
+                } else {
+                    prop_assert!(
+                        s.t <= t0 + s.poll_ms + 600,
+                        "still looping at {} after a skip at {t0}",
+                        s.t
+                    );
+                }
             }
             if mode != "live" {
                 self.synced_after = None;
@@ -720,6 +752,7 @@ mod random {
         s.play();
         s.run(30_000);
         let mut rules = Rules {
+            skipped_loop: None,
             synced_after: None,
             idle_playing_since: None,
         };
@@ -764,8 +797,12 @@ mod random {
             if user && s.core.mode_name() == "live" {
                 rules.synced_after = Some(s.t);
             }
+            if matches!(a, Act::Skip) && s.core.mode_name() == "looping" {
+                rules.skipped_loop = Some(s.t);
+            }
             if matches!(a, Act::Live | Act::Top | Act::Loop(_)) {
                 rules.synced_after = None; // our own doing: the buffer may play on
+                rules.skipped_loop = None; // a loop asked for after the skip
             }
             rules.check(&s, false)?;
             let wait = if let Act::Wait(ms) = a { ms } else { 1_500 };
