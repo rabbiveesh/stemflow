@@ -582,6 +582,66 @@ mod tests {
         );
     }
 
+    /// A loop left playing a while, then extended (on the Mac, 2026-11-23): the
+    /// paused player's silence had pushed the loop out of the newest minute of the
+    /// buffer, so finding the beats there again laid the loop on silence, out of
+    /// the song map ("Can't tell where in the song this loop is", and Save failed).
+    /// The loop must play on unchanged while the player fetches the new part.
+    #[test]
+    fn extending_after_a_long_loop_keeps_it_playing() {
+        let mut s = two_songs();
+        s.p.lock().unwrap().ms = 60_000.0;
+        s.play();
+        s.run(12_000);
+        s.cmd("1");
+        s.run(60_000);
+        // a little longer: the player fetches the next phrase, far along the buffer
+        s.cmd("move 0 2");
+        s.run(15_000);
+        let was = s.core.state();
+        assert!(was.loop_from > 0, "{was:?}");
+        // back past where the buffer began: the player plays it again
+        s.cmd("move -16 0");
+        assert!(s.status().starts_with("Listening to"), "{}", s.status());
+        let from = s.heard.len();
+        s.run(30_000);
+        let st = s.core.state();
+        assert_eq!(st.status, "", "{st:?}");
+        assert_eq!(st.beats, 22, "{st:?}");
+        assert!(
+            (st.loop_from - (was.loop_from - 8_000)).abs() < 60
+                && (st.loop_to - was.loop_to).abs() < 60,
+            "{was:?} {st:?}"
+        );
+        // only the loop, old or new, never silence
+        let h: Vec<i64> = s.heard[from..]
+            .iter()
+            .filter_map(|h| h.1.map(|x| x.1))
+            .collect();
+        assert_eq!(h.len(), s.heard.len() - from, "silence heard");
+        assert!(h
+            .iter()
+            .all(|&ms| (st.loop_from - 100..st.loop_to + 100).contains(&ms)));
+    }
+
+    /// Minutes of loop: the paused player's silence fills the whole buffer, and a
+    /// copy of its newest minute must not crash (it underflowed past 150 s).
+    #[test]
+    fn a_loop_left_playing_for_minutes_can_still_be_extended() {
+        let mut s = Sim::new(vec![tune(0, 400, 120.0)]);
+        s.p.lock().unwrap().ms = 60_000.0;
+        s.play();
+        s.run(12_000);
+        s.cmd("4");
+        s.run(200_000);
+        s.cmd("move -16 0");
+        s.run(30_000);
+        let st = s.core.state();
+        assert_eq!(st.status, "", "{st:?}");
+        assert_eq!(st.beats, 32, "{st:?}");
+        assert!(st.loop_from > 0, "{st:?}");
+    }
+
     /// Saved, then another song, then recalled: the player goes back there and the
     /// same loop plays.
     #[test]
@@ -653,6 +713,8 @@ mod random {
             1 => Just(Act::Repair),
             1 => Just(Act::PlayPause),
             4 => (200i64..12_000).prop_map(Act::Wait),
+            // a loop left playing a while: the paused player's silence fills the buffer
+            1 => (60_000i64..200_000).prop_map(Act::Wait),
             1 => Just(Act::Skip),
             1 => (0i64..100_000).prop_map(Act::Seek),
             1 => Just(Act::Pause),
@@ -668,6 +730,8 @@ mod random {
         synced_after: Option<i64>,
         /// Since when a loop has left the player playing with nothing to wait for.
         idle_playing_since: Option<i64>,
+        /// The loop playing now has had its place in the song.
+        mapped: bool,
     }
 
     impl Rules {
@@ -686,6 +750,15 @@ mod random {
                 if st.loop_from >= 0 {
                     prop_assert!(st.loop_from >= -300, "a loop before the song: {:?}", st);
                 }
+            }
+            // a loop the song map placed stays placed while it plays (after a long
+            // loop, extending it laid it on silence: Mac, 2026-11-23)
+            if mode != "looping" {
+                self.mapped = false;
+            } else if st.loop_from != -1 {
+                self.mapped = true;
+            } else if self.mapped && !s.core.waiting() {
+                prop_assert!(false, "the loop left the song map at {}: {:?}", s.t, st);
             }
             let (cur, ms, playing) = s.player();
             // a loop never leaves the player playing unheard with nothing to wait for
@@ -755,6 +828,7 @@ mod random {
             skipped_loop: None,
             synced_after: None,
             idle_playing_since: None,
+            mapped: false,
         };
         let trace = std::env::var("SIM_TRACE").is_ok();
         for a in acts {
@@ -803,6 +877,9 @@ mod random {
             if matches!(a, Act::Live | Act::Top | Act::Loop(_)) {
                 rules.synced_after = None; // our own doing: the buffer may play on
                 rules.skipped_loop = None; // a loop asked for after the skip
+            }
+            if matches!(a, Act::Loop(_)) {
+                rules.mapped = false; // another loop
             }
             rules.check(&s, false)?;
             let wait = if let Act::Wait(ms) = a { ms } else { 1_500 };

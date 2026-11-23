@@ -21,7 +21,7 @@ use crate::beats::{
 use crate::model::Separator;
 use crate::stream::Streamer;
 use crate::stretch::Stretch;
-use anyhow::{ensure, Result};
+use anyhow::{bail, ensure, Result};
 use std::sync::Mutex;
 
 const RATE: usize = 44_100;
@@ -132,6 +132,11 @@ struct Clip {
 impl Clip {
     fn frames(&self) -> usize {
         self.data.len() / CH
+    }
+
+    /// Whether it has the music of frames [from, to].
+    fn holds(&self, from: f64, to: f64) -> bool {
+        from >= self.from as f64 && to <= self.music_end() as f64
     }
 
     /// The frame after the last one with any sound: a paused source leaves exact
@@ -408,8 +413,8 @@ impl Looper {
     fn find_inner(&self, press: u64, bars: usize, s: Settings) -> Result<()> {
         let clip = self.snapshot();
         let an = self.analyse(&clip)?;
-        let mut st = self.with_fresh_clip();
-        // a find that fails leaves the loop (if any) as it was
+        let (mut st, old_clip) = self.with_fresh_clip();
+        // a find that fails leaves the loop (if any) as it was, playing from its copy
         let before = (st.settings, st.analysis.take(), st.grid.clone());
         st.settings = s;
         st.analysis = Some(an);
@@ -417,6 +422,9 @@ impl Looper {
         let r = Self::place(&mut st, press, bars);
         if r.is_err() {
             (st.settings, st.analysis, st.grid) = before;
+            if st.grid.is_some() {
+                st.clip = old_clip;
+            }
         }
         r
     }
@@ -456,15 +464,16 @@ impl Looper {
 
     /// The state, with a copy of the buffer newer than any separated audio written
     /// so far. A copy taken before an analysis can't be used after it: what was
-    /// separated meanwhile wouldn't be in it, though it's marked as done.
-    fn with_fresh_clip(&self) -> std::sync::MutexGuard<'_, State> {
+    /// separated meanwhile wouldn't be in it, though it's marked as done. With the
+    /// copy it replaced: the loop plays from that, so a change that fails puts it back.
+    fn with_fresh_clip(&self) -> (std::sync::MutexGuard<'_, State>, Option<Clip>) {
         loop {
             let gen = self.state.lock().unwrap().stem_gen;
             let clip = self.snapshot();
             let mut st = self.state.lock().unwrap();
             if st.stem_gen == gen {
-                st.clip = Some(clip);
-                return st;
+                let old = st.clip.replace(clip);
+                return (st, old);
             }
         }
     }
@@ -476,9 +485,11 @@ impl Looper {
         let ring = self.ring.lock().unwrap();
         // a second of the silence too, for a loop that ends as the music does
         let to = (ring.sound_end + RATE as u64).min(ring.total);
+        // (none of it, once the silence of a long pause has filled the whole ring)
         let from = to
             .saturating_sub((ANALYSE_S * RATE) as u64)
-            .max(ring.oldest());
+            .max(ring.oldest())
+            .min(to);
         let mut data = Vec::with_capacity(CH * (to - from) as usize);
         for f in from..to {
             let k = CH * (f as usize % ring.cap);
@@ -576,7 +587,7 @@ impl Looper {
         let bar = (0..beats.len())
             .map(|k| (k + meter - one % meter).is_multiple_of(meter))
             .collect();
-        let mut st = self.with_fresh_clip();
+        let (mut st, _) = self.with_fresh_clip();
         st.settings.meter = meter;
         st.settings.feel = feel;
         st.analysis = None;
@@ -600,21 +611,35 @@ impl Looper {
     /// edits into what was buffered since need no analysis. Near the loop's tempo.
     /// False without a loop, or if the copy reaches no further.
     pub fn refresh(&self) -> Result<bool> {
-        let (start, len, one, bpm, heard0) = {
+        let (start, end, len, one, bpm, heard0) = {
             let st = self.state.lock().unwrap();
             let (Some(g), Some(c)) = (st.grid.as_ref(), st.clip.as_ref()) else {
                 return Ok(false);
             };
             let one = (st.a..st.b).find(|&i| g.bar[i]).unwrap_or(st.a);
             let raw = st.loop_bpm() / st.settings.feel.max(0.25);
-            (g.beats[st.a], st.b - st.a, g.beats[one], raw, c.music_end())
+            let b = st.b.min(g.beats.len() - 1);
+            (
+                g.beats[st.a],
+                g.beats[b],
+                st.b - st.a,
+                g.beats[one],
+                raw,
+                c.music_end(),
+            )
         };
         let clip = self.snapshot();
         if clip.music_end() <= heard0 + RATE as u64 {
             return Ok(false);
         }
+        // After a long loop the newest minute may not reach back to it any more (the
+        // paused player's silence, then what it played for us since): nothing there
+        // to move the loop to, and laying it there would play silence.
+        if !clip.holds(start.min(one) - XFADE as f64, end) {
+            return Ok(false);
+        }
         let an = self.analyse(&clip)?;
-        let mut st = self.with_fresh_clip();
+        let (mut st, old_clip) = self.with_fresh_clip();
         if st.grid.is_none() {
             return Ok(false); // the loop went meanwhile
         }
@@ -626,9 +651,11 @@ impl Looper {
         self.decode(&mut st);
         st.settings.min_bpm = old.min_bpm;
         st.settings.max_bpm = old.max_bpm;
-        // the loop as it was, if the new beats would put it across a gap
+        // the loop as it was (and the copy it plays from), if the new beats would
+        // put it across a gap or out of the copy
         if !self.relay(&mut st, start, len, one) {
             (st.analysis, st.grid) = before;
+            st.clip = old_clip;
             return Ok(false);
         }
         Ok(true)
@@ -651,7 +678,11 @@ impl Looper {
         }
         // keep the playhead on the same music
         let shift = g.beats[a] - start;
-        if b <= a || !self.spans_music(st, a, b) {
+        let held = st
+            .clip
+            .as_ref()
+            .is_some_and(|c| c.holds(g.beats[a] - XFADE as f64, g.beats[b]));
+        if b <= a || !held || !self.spans_music(st, a, b) {
             return false;
         }
         st.a = a;
@@ -679,14 +710,22 @@ impl Looper {
         };
         let clip = self.snapshot();
         let heard = clip.music_end() as f64;
-        if end + span + 0.3 * RATE as f64 > heard {
+        if !clip.holds(end - XFADE as f64, end + span + 0.3 * RATE as f64) {
             return Ok(false);
         }
         self.state.lock().unwrap().finding = true;
         let an = self.analyse(&clip);
-        let mut st = self.with_fresh_clip();
+        let (mut st, old_clip) = self.with_fresh_clip();
         st.finding = false;
-        let an = an?;
+        let an = match an {
+            Ok(an) => an,
+            Err(e) => {
+                st.clip = old_clip;
+                return Err(e);
+            }
+        };
+        // the loop as it was, if the next phrase can't be laid
+        let before = (st.settings.meter, st.analysis.take(), st.grid.clone());
         st.settings.meter = meter;
         st.analysis = Some(an);
         self.decode(&mut st);
@@ -699,10 +738,11 @@ impl Looper {
             })
             .unwrap_or(0);
         let b = a + len;
-        ensure!(
-            b < g.beats.len() && g.beats[b] <= heard,
-            "the next phrase isn't in the buffer"
-        );
+        if b >= g.beats.len() || g.beats[b] > heard {
+            (st.settings.meter, st.analysis, st.grid) = before;
+            st.clip = old_clip;
+            bail!("the next phrase isn't in the buffer");
+        }
         let m = g.meter;
         for (k, f) in g.bar.iter_mut().enumerate() {
             *f = (k + m - a % m).is_multiple_of(m);
@@ -1624,7 +1664,7 @@ mod tests {
         let stale = l.snapshot();
         l.replace(100, &vec![0.25; 200], &vec![0.25; 200], &[]);
         assert_eq!(stale.at(150)[0], 0.0, "the old copy doesn't have it");
-        let st = l.with_fresh_clip();
+        let (st, _) = l.with_fresh_clip();
         let v = st.clip.as_ref().unwrap().at(150);
         assert!((v[0] - 0.25).abs() < 1e-3 && (v[2] - 0.25).abs() < 1e-3);
     }
