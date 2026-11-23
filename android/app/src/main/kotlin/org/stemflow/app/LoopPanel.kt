@@ -240,6 +240,10 @@ class LoopPanel(
                     // share of what's left (equal widths cut the longest label)
                     val b = a.button("", chip = true) { pick(i) }.apply {
                         isSingleLine = true
+                        // a Button's theme minimum (88dp) made three chips wider than
+                        // their half of the row, and LinearLayout cut them all evenly
+                        minWidth = 0
+                        minimumWidth = 0
                         setPadding(a.dp(10), 0, a.dp(10), 0)
                         (layoutParams as LayoutParams).width = LayoutParams.WRAP_CONTENT
                     }
