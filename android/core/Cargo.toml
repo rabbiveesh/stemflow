@@ -15,7 +15,6 @@ crate-type = ["cdylib"]
 [dependencies]
 anyhow = "1"
 jni = "0.21"
-libc = "0.2"
 # the loop deck and its panel (src/loopdeck), shared with the desktop
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,6 +24,10 @@ realfft = "3"
 # MonoFold) also holds the ONNX Runtime separators. Unused at run time here.
 clap = { version = "4", features = ["derive"] }
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "load-dynamic"] }
+
+# the loop deck's job thread runs in the background (src/loopdeck/mod.rs)
+[target.'cfg(target_os = "android")'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
 cc = "1"

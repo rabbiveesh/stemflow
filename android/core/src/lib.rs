@@ -157,10 +157,10 @@ impl Mixer {
             }
         }
         if MONO_OUT.load(Ordering::Relaxed) {
-            for f in out.chunks_exact_mut(2) {
-                let m = 0.5 * (f[0] + f[1]);
-                f[0] = m;
-                f[1] = m;
+            for i in (0..out.len()).step_by(2) {
+                let m = 0.5 * (out[i] + out[i + 1]);
+                out[i] = m;
+                out[i + 1] = m;
             }
         }
         let next_peak = (2 * block..bass.len()).fold(0f32, |m, k| {
