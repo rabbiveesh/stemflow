@@ -49,6 +49,17 @@ struct Args {
     /// Stop after this many model runs (0 = the whole file).
     #[arg(long, default_value_t = 0)]
     runs: usize,
+    /// Run over the input this many times (long timing runs; the output is not kept).
+    #[arg(long, default_value_t = 1)]
+    repeat: usize,
+    /// Start one run per hop, as live, sleeping in between (the GPU's clock and the
+    /// phone's temperature then behave as in real use). Late runs start at once.
+    #[arg(long)]
+    pace: bool,
+    /// Convert the whole window back to audio in every run, as the desktop does, not
+    /// just the samples the stream keeps.
+    #[arg(long)]
+    whole_window: bool,
     /// Write the isolated stem here.
     #[arg(long)]
     out: Option<PathBuf>,
@@ -61,7 +72,9 @@ struct Args {
 
 fn read_f32(p: &Path) -> Result<Vec<f32>> {
     let b = std::fs::read(p).with_context(|| format!("reading {}", p.display()))?;
-    Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    Ok(b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
 }
 
 /// Times Beat This! as the app would run it: one run every `hop` seconds, idle between.
@@ -70,11 +83,26 @@ fn beat_bench(a: &Args, accel: litert::Accel) -> Result<()> {
     let mut net = litert::LiteRtBeatNet::load(&a.model, accel, a.threads)?;
     let n = net.frames() * 128;
     let (spect, want) = match &a.beat_ref {
-        Some(d) => (read_f32(&d.join("spect.f32"))?, Some((read_f32(&d.join("beat.f32"))?, read_f32(&d.join("downbeat.f32"))?))),
-        None => ((0..n).map(|i| (i * 2654435761 % 1000) as f32 / 250.0).collect(), None),
+        Some(d) => (
+            read_f32(&d.join("spect.f32"))?,
+            Some((
+                read_f32(&d.join("beat.f32"))?,
+                read_f32(&d.join("downbeat.f32"))?,
+            )),
+        ),
+        None => (
+            (0..n)
+                .map(|i| (i * 2654435761 % 1000) as f32 / 250.0)
+                .collect(),
+            None,
+        ),
     };
     net.run(&spect)?;
-    eprintln!("loaded {} + first run in {:.2}s", a.model.display(), t.elapsed().as_secs_f32());
+    eprintln!(
+        "loaded {} + first run in {:.2}s",
+        a.model.display(),
+        t.elapsed().as_secs_f32()
+    );
     let mut times = Vec::new();
     let mut err = [0f32; 2];
     for i in 0..a.runs.max(1) {
@@ -85,7 +113,10 @@ fn beat_bench(a: &Args, accel: litert::Accel) -> Result<()> {
         times.push(dt);
         if let Some((b, d)) = &want {
             for (e, (got, want)) in err.iter_mut().zip([(&beat, b), (&down, d)]) {
-                *e = got.iter().zip(want.iter()).fold(*e, |m, (x, y)| m.max((x - y).abs()));
+                *e = got
+                    .iter()
+                    .zip(want.iter())
+                    .fold(*e, |m, (x, y)| m.max((x - y).abs()));
             }
         }
         if i + 1 < a.runs {
@@ -115,7 +146,11 @@ fn read_wav(p: &Path) -> Result<Vec<f32>> {
     let mut r = hound::WavReader::open(p).with_context(|| format!("opening {}", p.display()))?;
     let spec = r.spec();
     if spec.sample_rate != SAMPLE_RATE {
-        bail!("{} is {} Hz; resample to 44100", p.display(), spec.sample_rate);
+        bail!(
+            "{} is {} Hz; resample to 44100",
+            p.display(),
+            spec.sample_rate
+        );
     }
     let raw: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Float => r.samples::<f32>().collect::<Result<_, _>>()?,
@@ -142,7 +177,10 @@ fn peak_rss_mb() -> Option<f32> {
 
 fn main() -> Result<()> {
     let a = Args::parse();
-    if a.model.file_name().is_some_and(|n| n.to_string_lossy().starts_with("beat_this")) {
+    if a.model
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().starts_with("beat_this"))
+    {
         let accel = match a.gpu.as_deref() {
             None => litert::Accel::Cpu,
             Some("fp32") => litert::Accel::Gpu,
@@ -177,10 +215,26 @@ fn main() -> Result<()> {
             Some(o) => bail!("--gpu {o}: expected fp32 or fp16"),
         };
         // Told apart by file name, as written by the two export scripts.
-        if a.model.file_name().is_some_and(|n| n.to_string_lossy().starts_with("bsrofo")) {
-            Box::new(litert::LiteRtRoformer::load(&a.model, accel, a.threads)?)
+        // What Streamer::process reads of each window: its slice and the crossfade tail.
+        let needed = |seg: usize| {
+            let start = seg.saturating_sub(secs(a.lookahead) + secs(a.hop));
+            if a.whole_window {
+                0..seg
+            } else {
+                start..(start + secs(a.hop) + secs(a.xfade)).min(seg)
+            }
+        };
+        if a.model
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("bsrofo"))
+        {
+            let mut m = litert::LiteRtRoformer::load(&a.model, accel, a.threads)?;
+            m.set_needed(needed(m.window_len()));
+            Box::new(m)
         } else {
-            Box::new(litert::LiteRtDemucs::load(&a.model, accel, a.threads)?)
+            let mut m = litert::LiteRtDemucs::load(&a.model, accel, a.threads)?;
+            m.set_needed(needed(m.window_len()));
+            Box::new(m)
         }
     } else {
         Box::new(HtDemucs::load(&a.model, Device::Cpu, a.threads)?)
@@ -201,14 +255,24 @@ fn main() -> Result<()> {
 
     let mut out = Vec::with_capacity(padded.len());
     let mut times = Vec::new();
-    for chunk in padded.chunks(2 * hop) {
-        let t = Instant::now();
-        out.extend(s.process(chunk)?.bass);
-        let dt = t.elapsed().as_secs_f32();
-        times.push(dt);
-        eprintln!("run {:3}: {:.3}s", times.len(), dt);
-        if a.runs > 0 && times.len() >= a.runs {
-            break;
+    let start = Instant::now();
+    'all: for pass in 0..a.repeat.max(1) {
+        for chunk in padded.chunks(2 * hop) {
+            if a.pace {
+                let due = std::time::Duration::from_secs_f32(times.len() as f32 * a.hop);
+                std::thread::sleep(due.saturating_sub(start.elapsed()));
+            }
+            let t = Instant::now();
+            let stems = s.process(chunk)?;
+            if pass == 0 {
+                out.extend(stems.bass);
+            }
+            let dt = t.elapsed().as_secs_f32();
+            times.push(dt);
+            eprintln!("run {:3}: {:.3}s", times.len(), dt);
+            if a.runs > 0 && times.len() >= a.runs {
+                break 'all;
+            }
         }
     }
 
