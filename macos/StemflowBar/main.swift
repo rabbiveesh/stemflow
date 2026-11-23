@@ -55,6 +55,64 @@ func extraArgs() -> [String] {
 }
 
 let logURL = home.appendingPathComponent("Library/Logs/stemflow.log")
+/// Runs kept before this one: stemflow.1.log (the last) to stemflow.5.log.
+let keptLogs = 5
+
+/// The log of run `n` back (0: this one).
+func logFile(_ n: Int) -> URL {
+    n == 0 ? logURL : home.appendingPathComponent("Library/Logs/stemflow.\(n).log")
+}
+
+/// Keep the last runs' logs: a bug is often noticed after stemflow restarted.
+func rotateLogs() {
+    let fm = FileManager.default
+    try? fm.removeItem(at: logFile(keptLogs))
+    for n in stride(from: keptLogs - 1, through: 0, by: -1) {
+        try? fm.moveItem(at: logFile(n), to: logFile(n + 1))
+    }
+}
+
+/// stemflow's output to the log, each line stamped with the time it came.
+final class LogWriter {
+    let file: FileHandle
+    let pipe = Pipe()
+    var partial = Data()
+    let stamp: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+        return f
+    }()
+
+    init?(_ url: URL) {
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        guard let f = try? FileHandle(forWritingTo: url) else { return nil }
+        file = f
+        line("stemflow started")
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let d = h.availableData
+            if d.isEmpty {
+                h.readabilityHandler = nil // stemflow exited
+                if let s = self, !s.partial.isEmpty { s.write(s.partial) }
+                return
+            }
+            self?.take(d)
+        }
+    }
+
+    func take(_ d: Data) {
+        partial.append(d)
+        while let nl = partial.firstIndex(of: UInt8(ascii: "\n")) {
+            write(partial[partial.startIndex..<nl])
+            partial.removeSubrange(partial.startIndex...nl)
+        }
+    }
+
+    func line(_ s: String) { write(Data(s.utf8)) }
+
+    func write(_ d: Data) {
+        file.write(Data("\(stamp.string(from: Date())) ".utf8) + d + Data("\n".utf8))
+    }
+}
 
 // MARK: - Control socket
 
@@ -370,6 +428,7 @@ final class Controller: NSObject, NSMenuDelegate, NSPopoverDelegate {
 
     var state: [String: Any]? // nil: stemflow isn't running
     var child: Process?
+    var logWriter: LogWriter?
     var starting: (since: Date, model: String)?
     var startError = ""
     var wantRunning = false
@@ -454,6 +513,9 @@ final class Controller: NSObject, NSMenuDelegate, NSPopoverDelegate {
             settings.addItem(i)
         }
         settings.addItem(ClosureItem("Open log") { NSWorkspace.shared.open(logURL) })
+        settings.addItem(ClosureItem("Earlier logs") {
+            NSWorkspace.shared.activateFileViewerSelecting([logFile(1)])
+        })
         settings.addItem(ClosureItem("Quit stemflow") { Controller.shared.quit() })
         buildPanel()
 
@@ -595,10 +657,11 @@ final class Controller: NSObject, NSMenuDelegate, NSPopoverDelegate {
         p.executableURL = exe
         p.currentDirectoryURL = root
         p.arguments = ["live", "--models", root.appendingPathComponent("models").path] + extraArgs()
-        FileManager.default.createFile(atPath: logURL.path, contents: nil)
-        if let log = try? FileHandle(forWritingTo: logURL) {
-            p.standardOutput = log
-            p.standardError = log
+        rotateLogs()
+        logWriter = LogWriter(logURL)
+        if let log = logWriter {
+            p.standardOutput = log.pipe
+            p.standardError = log.pipe
         }
         p.terminationHandler = { proc in
             DispatchQueue.main.async { self.exited(proc) }
@@ -631,7 +694,10 @@ final class Controller: NSObject, NSMenuDelegate, NSPopoverDelegate {
 
     func lastLogLine() -> String {
         let text = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
-        return text.split(separator: "\n").last.map(String.init) ?? "see the log"
+        // without the time stamp
+        return text.split(separator: "\n").last.map {
+            String($0.split(separator: " ", maxSplits: 2).dropFirst(2).first ?? $0)
+        } ?? "see the log"
     }
 
     func stopStarting(_ err: String) {
