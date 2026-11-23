@@ -36,6 +36,9 @@ class LoopView(c: Context) : View(c) {
     /** Which end is being dragged (0 none, 1 start, 2 end) and the beat it is on. */
     private var drag = 0
     private var dragBeat = -1
+    /** Where the finger went down: an end moves only once it has really moved. */
+    private var downX = 0f
+    private val slop = android.view.ViewConfiguration.get(c).scaledTouchSlop
 
     /** Loop frames between where the loop is read and what is heard (see `update`). */
     private var lag = 0f
@@ -65,8 +68,11 @@ class LoopView(c: Context) : View(c) {
 
     private val gestures = GestureDetector(c, object : GestureDetector.SimpleOnGestureListener() {
         override fun onDown(e: MotionEvent) = true
+        // held still, even near an end (the ends grab a wide strip): bar 1 there
         override fun onLongPress(e: MotionEvent) {
-            if (drag == 0) nearest(e.x)?.let { onBarOne(it.second) }
+            if (dragBeat >= 0) return
+            drag = 0
+            nearest(e.x)?.let { onBarOne(it.second) }
         }
     })
 
@@ -83,9 +89,10 @@ class LoopView(c: Context) : View(c) {
                     else -> 0
                 }
                 dragBeat = -1
+                downX = e.x
                 if (drag != 0) parent.requestDisallowInterceptTouchEvent(true)
             }
-            MotionEvent.ACTION_MOVE -> if (drag != 0) {
+            MotionEvent.ACTION_MOVE -> if (drag != 0 && (dragBeat >= 0 || abs(e.x - downX) > slop)) {
                 dragBeat = nearest(e.x)?.second ?: -1
                 invalidate()
             }
