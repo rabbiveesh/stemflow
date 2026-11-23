@@ -680,9 +680,16 @@ impl Core {
             self.say("The loop can't get shorter than that");
             return w;
         }
-        // What was buffered after (or before) the loop may hold it: find the beats
-        // there (keeping the loop as it is) and try again. Only if that isn't enough
-        // is the song played again.
+        // Only the end moving right can gain from the beats of what was buffered
+        // since (a prefetched phrase): the newest minute only ever moves later, so
+        // it never holds more before the loop than the loop's own copy. The start
+        // moving left goes straight to the song (which takes it from the buffer
+        // when it's there, without playing it again).
+        if db <= 0 {
+            return self.stream_to(da, db, false);
+        }
+        // Find the beats there (keeping the loop as it is) and try again. Only if
+        // that isn't enough is the song played again.
         let id = self.job(Job::Refresh);
         Work::Job(id, Then::Refreshed { da, db })
     }
