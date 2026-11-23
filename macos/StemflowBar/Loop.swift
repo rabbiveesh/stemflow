@@ -24,7 +24,7 @@ struct LoopPic {
 
 /// The waveform of the loop with a bar either side: a tick on every beat, numbered
 /// bar lines, the ends and the playhead. Drag an end to move it (it snaps to the
-/// beats); right-click (or ⌃/⌥-click) a beat to make it bar 1.
+/// beats); hold, right-click (or ⌃/⌥-click) a beat to make it bar 1.
 final class LoopView: NSView {
     var pic: LoopPic? { didSet { needsDisplay = true } }
     var onEdges: (Int, Int) -> Void = { _, _ in }
@@ -54,19 +54,34 @@ final class LoopView: NSView {
         let grab: CGFloat = 18
         drag = abs(px - s) < grab && abs(px - s) <= abs(px - en) ? 1 : abs(px - en) < grab ? 2 : 0
         dragBeat = -1
+        // held still on a beat (as on the phone): that beat is bar 1
+        hold?.invalidate()
+        if drag == 0 {
+            hold = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
+                guard let self else { return }
+                self.hold = nil
+                if let i = self.nearest(px) { self.onBarOne(i) }
+            }
+        }
     }
+
+    private var hold: Timer?
 
     override func rightMouseDown(with e: NSEvent) {
         if let i = nearest(convert(e.locationInWindow, from: nil).x) { onBarOne(i) }
     }
 
     override func mouseDragged(with e: NSEvent) {
+        hold?.invalidate()
+        hold = nil
         guard drag != 0 else { return }
         dragBeat = nearest(convert(e.locationInWindow, from: nil).x) ?? -1
         needsDisplay = true
     }
 
     override func mouseUp(with e: NSEvent) {
+        hold?.invalidate()
+        hold = nil
         if drag != 0, dragBeat >= 0, let p = pic {
             if drag == 1 && dragBeat < p.b && dragBeat != p.a { onEdges(dragBeat, p.b) }
             if drag == 2 && dragBeat > p.a && dragBeat != p.b { onEdges(p.a, dragBeat) }

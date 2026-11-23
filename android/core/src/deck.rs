@@ -16,6 +16,43 @@ use jni::{JNIEnv, JavaVM};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+/// The deck says what it does on stderr (`eprintln!`, one line per event), which an
+/// app sends nowhere: send it to logcat, under the app's tag.
+#[cfg(target_os = "android")]
+fn stderr_to_logcat() {
+    use std::io::BufRead;
+    use std::os::fd::FromRawFd;
+    #[link(name = "log")]
+    extern "C" {
+        fn __android_log_write(prio: i32, tag: *const u8, text: *const u8) -> i32;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut fds = [0; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0
+            || unsafe { libc::dup2(fds[1], libc::STDERR_FILENO) } < 0
+        {
+            return;
+        }
+        unsafe { libc::close(fds[1]) };
+        let r = std::io::BufReader::new(unsafe { std::fs::File::from_raw_fd(fds[0]) });
+        let _ = std::thread::Builder::new()
+            .name("stemflow-stderr".into())
+            .spawn(move || {
+                for line in r.split(b'\n').map_while(Result::ok) {
+                    let mut t = line;
+                    t.retain(|&b| b != 0);
+                    t.push(0);
+                    // 4: ANDROID_LOG_INFO
+                    unsafe { __android_log_write(4, c"stemflow".as_ptr().cast(), t.as_ptr()) };
+                }
+            });
+    });
+}
+
+#[cfg(not(target_os = "android"))]
+fn stderr_to_logcat() {}
+
 /// The player, as the app's `DeckSource` reaches it (its media session).
 struct JavaSource {
     vm: JavaVM,
@@ -157,6 +194,7 @@ pub extern "system" fn Java_org_stemflow_app_Native_deckNew<'l>(
 ) -> jlong {
     let r = (|| -> anyhow::Result<jlong> {
         anyhow::ensure!(looper != 0, "no looper");
+        stderr_to_logcat();
         let dir: String = env.get_string(&dir)?.into();
         bookmarks::set_state_dir(dir.into());
         let src = JavaSource {

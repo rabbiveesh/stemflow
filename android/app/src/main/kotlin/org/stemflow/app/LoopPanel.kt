@@ -92,6 +92,9 @@ class LoopPanel(
                 val lp = if (small || ws.size > 4) LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT)
                     else if (!many) LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT)
                     else LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f)
+                // a widget with a height of its own (the loop view) keeps it; a plain
+                // View told wrap_content would take the whole page
+                (w.view.layoutParams?.height ?: 0).takeIf { it > 0 }?.let { lp.height = it }
                 if (k > 0) lp.leftMargin = a.dp(if (small) 6 else 8)
                 line.addView(w.view, lp)
             }

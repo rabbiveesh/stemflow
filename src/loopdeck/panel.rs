@@ -289,7 +289,7 @@ pub fn build(l: &State, meter: u32, feel: f32, marks: &[Bookmark]) -> Panel {
     let hint = if !l.status.is_empty() && !l.finding {
         l.status.clone()
     } else if playing {
-        s("Drag an end · hold a beat (or right-click it) for bar 1")
+        s("Drag an end · hold a beat for bar 1")
     } else if l.finding {
         String::new()
     } else {
