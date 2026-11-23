@@ -28,6 +28,11 @@ const RATE: f64 = 44_100.0;
 pub(super) const OURS_MS: i64 = 1_500;
 /// ...after asking it to open another recording.
 const OPEN_MS: i64 = 6_000;
+/// How long the player must stay on a song we opened before we seek in it.
+const SETTLE_MS: i64 = 1_500;
+/// The most song time one fetch can ask for at once (ms): what's wanted must lie
+/// within the newest minute of music (see `covering`), with room to spare.
+const REACH_MS: i64 = 50_000;
 
 pub enum Event {
     /// The clock moved on (waits and time-outs).
@@ -188,12 +193,20 @@ struct Fetch {
     open: bool,
     fresh: bool,
     stage: Stage,
+    /// Opened the song again after the player drifted to another.
+    reopened: bool,
 }
 
 enum Stage {
     Start,
-    Opening { until: i64 },
-    Waiting { until: i64 },
+    /// `on_since`: since when the player has said it's on the song.
+    Opening {
+        until: i64,
+        on_since: Option<i64>,
+    },
+    Waiting {
+        until: i64,
+    },
 }
 
 impl Fetch {
@@ -205,6 +218,7 @@ impl Fetch {
             open,
             fresh,
             stage: Stage::Start,
+            reopened: false,
         }
     }
 }
@@ -578,14 +592,21 @@ impl Core {
                     self.expect(Expected::State, OPEN_MS);
                     f.stage = Stage::Opening {
                         until: self.t + 30_000,
+                        on_since: None,
                     };
                     return None;
                 }
                 self.fetch_go(f);
                 None
             }
-            Stage::Opening { until } => {
-                if self.on_song(&f.song) {
+            Stage::Opening { until, on_since } => {
+                // Spotify can show the song a moment, then switch once more (Mac,
+                // 2026-11-23: our seek landed in the next track): seek once it has
+                // stayed on the song a while
+                let on = self.on_song(&f.song);
+                let on_since = if on { on_since.or(Some(self.t)) } else { None };
+                f.stage = Stage::Opening { until, on_since };
+                if on_since.is_some_and(|t0| self.t - t0 >= SETTLE_MS) {
                     self.fetch_go(f);
                 } else if self.t > until {
                     return Some(Err(anyhow!("The player didn't open {}", f.song.title)));
@@ -605,6 +626,16 @@ impl Core {
                 }
                 if let Some(x) = self.songs.latest() {
                     if self.since.is_some_and(|t| x.at >= t) && !x.song.same(&f.song) {
+                        // went to another song after we opened this one: once more
+                        if f.open && !f.reopened {
+                            eprintln!(
+                                "loop: the player went to {} instead; opening {} again",
+                                x.song.title, f.song.title
+                            );
+                            f.reopened = true;
+                            f.stage = Stage::Start;
+                            return None;
+                        }
                         return Some(Err(anyhow!("The song ended before that part")));
                     }
                 }
@@ -639,20 +670,31 @@ impl Core {
             self.pause_source();
             return Work::Idle;
         };
-        let (r0, r1) = (e, e + (e - s));
+        // Only what fits in the minute the beats are found in, with the loop and its
+        // run-up: a long loop gets less of the next phrase (a fetch reaching further
+        // could never be in the buffer at once, and left the player playing on
+        // unheard until it timed out: Mac, 2026-11-23).
+        let from = s - 6_000;
+        let reach = from + REACH_MS;
+        let r0 = e;
+        let r1 = (e + (e - s) + 1_000).min(reach);
+        if r1 < e + 1_000 {
+            self.pause_source(); // the loop alone fills the minute
+            return Work::Idle;
+        }
         // Half the next phrase still buffered, in one stretch with the loop (after an
         // extend into it, say): enough. Otherwise the player plays it (unheard) from
         // a run-up before the loop's start, so the loop and what follows are one
         // stretch, and moving into it needs nothing played again.
         if self
-            .covering(&a0.song, s - 6_000, e + (e - s) / 2)
+            .covering(&a0.song, from, (e + (e - s) / 2).min(reach))
             .is_some()
         {
             self.pause_source();
             return Work::Idle;
         }
         Work::Fetch(
-            Fetch::new(a0.song, s - 6_000, r1 + 1_000, false, false),
+            Fetch::new(a0.song, from, r1, false, false),
             Then::Prefetched { r0 },
         )
     }
