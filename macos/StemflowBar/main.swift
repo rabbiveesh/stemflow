@@ -853,7 +853,10 @@ final class Controller: NSObject, NSMenuDelegate, NSPopoverDelegate {
         let click = s["click"] as? Bool ?? false
         let beats = s["beats"] as? String ?? ""
         clickItem.state = click ? .on : .off
-        clickItem.title = click && !beats.isEmpty ? "Beat click · \(beats)" : "Beat click"
+        // The settings menu's titles stay put while it's open (a title that changes
+        // width every second re-lays the menu and its open submenu jumps); the
+        // live beat count goes in the panel's status line instead.
+        if click && !beats.isEmpty { status.stringValue += " · \(beats)" }
         let meter = s["meter"] as? Int ?? 0
         let feel = s["feel"] as? Double ?? 1
         for (m, i) in meterItems { i.state = m == meter ? .on : .off }
