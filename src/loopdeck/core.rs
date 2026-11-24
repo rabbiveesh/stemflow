@@ -273,6 +273,8 @@ pub struct Core {
     /// jump in the song (a seek), another song (an open), playing or pausing.
     /// Only that kind of change is taken as ours meanwhile.
     expect: Expect,
+    /// The song we last asked the player to open: only that one is ours meanwhile.
+    opening: Option<Song>,
     click: bool,
     unit: Unit,
     /// speed, transposition (semitones), keep pitch when slowed
@@ -302,6 +304,7 @@ impl Core {
             since: None,
             from_ms: 0,
             expect: Expect::default(),
+            opening: None,
             click: false,
             unit: Unit::Beat,
             speed: (1.0, 0.0, true),
@@ -370,6 +373,11 @@ impl Core {
             }
     }
 
+    /// The player going to `song` now is what we asked of it.
+    fn ours_song(&self, song: &Song) -> bool {
+        self.expected(Expected::Song) && self.opening.as_ref().is_none_or(|w| w.same(song))
+    }
+
     fn on_song(&self, song: &Song) -> bool {
         self.now.as_ref().is_some_and(|n| n.song.same(song))
     }
@@ -427,7 +435,7 @@ impl Core {
                 if s.gap_to > s.gap_from {
                     self.looper.mark_gap(s.gap_from, s.gap_to);
                 }
-                if !self.expected(Expected::Song) && s.why.starts_with("next song") {
+                if !self.ours_song(&n.song) && s.why.starts_with("next song") {
                     // played to its end, or skipped?
                     let len = self
                         .now
@@ -446,9 +454,9 @@ impl Core {
         }
         let playing = n.as_ref().is_some_and(|n| n.playing);
         // another song while paused: no audio to map, but the person skipped all the same
-        if ext.is_none() && !playing && !self.expected(Expected::Song) {
+        if ext.is_none() && !playing {
             if let (Some(o), Some(n)) = (self.now.as_ref(), n.as_ref()) {
-                if !o.song.same(&n.song) {
+                if !o.song.same(&n.song) && !self.ours_song(&n.song) {
                     ext = Some(External::NextSong { natural: false });
                 }
             }
@@ -479,6 +487,13 @@ impl Core {
 
     /// The one place for what the player does that we didn't ask for.
     fn external(&mut self, e: External) {
+        // Another song while we open one: Spotify may have drifted to the next
+        // track by itself, which the fetch undoes once (a skip then needs doing
+        // twice: the two can't be told apart).
+        if e == (External::NextSong { natural: false }) && self.may_reopen() {
+            eprintln!("loop: the player: another song while we open one; left to the fetch");
+            return;
+        }
         if e != External::Paused || !matches!(self.mode, Mode::Live) || self.looper.tail_playing() {
             eprintln!("loop: the player: {e:?}");
         }
@@ -590,6 +605,7 @@ impl Core {
                     }
                     self.expect(Expected::Song, OPEN_MS);
                     self.expect(Expected::State, OPEN_MS);
+                    self.opening = Some(f.song.clone());
                     f.stage = Stage::Opening {
                         until: self.t + 30_000,
                         on_since: None,
@@ -604,6 +620,10 @@ impl Core {
                 // 2026-11-23: our seek landed in the next track): seek once it has
                 // stayed on the song a while
                 let on = self.on_song(&f.song);
+                if !on && on_since.is_some() {
+                    // it was on the song, and now isn't
+                    return self.reopen(f);
+                }
                 let on_since = if on { on_since.or(Some(self.t)) } else { None };
                 f.stage = Stage::Opening { until, on_since };
                 if on_since.is_some_and(|t0| self.t - t0 >= SETTLE_MS) {
@@ -626,15 +646,8 @@ impl Core {
                 }
                 if let Some(x) = self.songs.latest() {
                     if self.since.is_some_and(|t| x.at >= t) && !x.song.same(&f.song) {
-                        // went to another song after we opened this one: once more
                         if f.open && !f.reopened {
-                            eprintln!(
-                                "loop: the player went to {} instead; opening {} again",
-                                x.song.title, f.song.title
-                            );
-                            f.reopened = true;
-                            f.stage = Stage::Start;
-                            return None;
+                            return self.reopen(f);
                         }
                         return Some(Err(anyhow!("The song ended before that part")));
                     }
@@ -642,6 +655,29 @@ impl Core {
                 None
             }
         }
+    }
+
+    /// The player went to another song after we opened this one: open it once more
+    /// (Spotify can drift to the next track by itself); the second time, it's taken
+    /// as the person's doing.
+    fn reopen(&mut self, f: &mut Fetch) -> Option<Result<Anchor>> {
+        let other = self
+            .now
+            .as_ref()
+            .map_or("another song", |n| n.song.title.as_str());
+        if !f.open || f.reopened {
+            return Some(Err(anyhow!(
+                "The player has moved on from {}",
+                f.song.title
+            )));
+        }
+        eprintln!(
+            "loop: the player went to {other} instead; opening {} again",
+            f.song.title
+        );
+        f.reopened = true;
+        f.stage = Stage::Start;
+        None
     }
 
     /// The loop in song ms (start, end) and the anchor that maps it, if one stretch
@@ -1194,6 +1230,11 @@ impl Core {
     /// not, it went on unheard, so jump straight to it.
     fn live(&mut self) {
         self.cant_pause = false;
+        // What a wait called off here asked of the player (opening a song, a seek)
+        // isn't ours any more: from now on, the player doing that is the person's
+        // doing (a pause just after Live left the buffer playing on, 2026-11-23).
+        self.expect = Expect::default();
+        self.opening = None;
         let ours = self.paused || self.player_playing();
         let looping = matches!(self.mode, Mode::Looping { .. }) && self.looper.playing();
         if looping && ours {
@@ -1398,6 +1439,21 @@ impl Core {
     #[cfg(test)]
     pub fn paused_by_us(&self) -> bool {
         self.paused
+    }
+
+    /// A fetch that may yet open its song again (see `Fetch::reopened`) is under
+    /// way: the player going to another song now may be taken for its drifting.
+    pub fn may_reopen(&self) -> bool {
+        match &self.mode {
+            Mode::Looping {
+                work: Work::Fetch(f, _),
+            }
+            | Mode::Recalling {
+                work: Work::Fetch(f, _),
+                ..
+            } => f.open && !f.reopened,
+            _ => false,
+        }
     }
 
     /// A loop (or recall) waits for the player or a job.
