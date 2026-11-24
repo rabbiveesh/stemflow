@@ -668,6 +668,32 @@ mod tests {
         assert!(s.core.paused_by_us());
     }
 
+    /// Live while a loop waits for the player to open its song (a repair after a
+    /// skip and a pause), then a pause in the player: the open was called off with
+    /// Live, so the pause is the person's, and the buffer behind the player stops
+    /// with it. (It was still taken as ours for the open's 6 s: the buffer played on.)
+    #[test]
+    fn a_pause_right_after_live_is_heard_at_once() {
+        let mut s = two_songs();
+        s.play();
+        s.run(30_000);
+        s.p.lock().unwrap().skip();
+        s.run(1_500);
+        s.p.lock().unwrap().playing = false;
+        s.run(1_500);
+        s.cmd("1");
+        s.run(1_500);
+        s.cmd("repair");
+        s.run(1_500);
+        s.cmd("live");
+        s.run(1_500);
+        assert!(s.core.state().tail, "the buffer plays on behind the player");
+        s.p.lock().unwrap().playing = false;
+        s.run(1_700);
+        let h = heard_since(&s, 300);
+        assert!(h.iter().all(|x| x.is_none()), "{h:?}");
+    }
+
     /// Saved, then another song, then recalled: the player goes back there and the
     /// same loop plays.
     #[test]
@@ -716,6 +742,24 @@ mod tests {
         assert!(st.playing && st.status.is_empty(), "{st:?}");
         assert_eq!(s.player().0, 0, "back to the song");
         assert_eq!(s.p.lock().unwrap().opens, 3, "opened again once");
+        assert!(
+            (st.loop_from - b.start_ms).abs() < 60 && (st.loop_to - b.end_ms).abs() < 60,
+            "{st:?} {b:?}"
+        );
+        // And with it going to the next track before we seek (or the person
+        // skipping then: the same to us): opened again too.
+        s.cmd("live");
+        s.p.lock().unwrap().skip();
+        s.run(10_000);
+        s.cmd(&format!("recall {}", b.created));
+        s.run(1_100);
+        assert_eq!(s.player().0, 0, "opened");
+        s.p.lock().unwrap().skip();
+        s.run(40_000);
+        let st = s.core.state();
+        assert!(st.playing && st.status.is_empty(), "{st:?}");
+        assert_eq!(s.player().0, 0, "back to the song");
+        assert_eq!(s.p.lock().unwrap().opens, 5, "opened again once");
         assert!(
             (st.loop_from - b.start_ms).abs() < 60 && (st.loop_to - b.end_ms).abs() < 60,
             "{st:?} {b:?}"
@@ -837,6 +881,9 @@ mod random {
                         None => {
                             prop_assert!(!playing, "silence while the player plays, at {}", s.t)
                         }
+                        // (the block in which the next track began is heard as the
+                        // last of the one before)
+                        Some((i, _)) if i != cur && ms < 100 => {}
                         Some((i, h)) => {
                             prop_assert!(
                                 playing,
@@ -893,7 +940,10 @@ mod random {
             // what the person does in the player (that changes anything)
             let was_playing = s.player().2;
             let user = match a {
-                Act::Skip | Act::Seek(_) => true,
+                Act::Skip => true,
+                // a seek by less than the song map's tolerance can't be told from
+                // playing on (nor heard): not the person's doing as far as the rules go
+                Act::Seek(ms) => (ms - s.player().1).abs() > 1_000,
                 Act::Pause => was_playing,
                 Act::Play => !was_playing,
                 _ => false,
@@ -914,7 +964,9 @@ mod random {
             if user && s.core.mode_name() == "live" {
                 rules.synced_after = Some(s.t);
             }
-            if matches!(a, Act::Skip) && s.core.mode_name() == "looping" {
+            // (a skip while the deck opens a song can't be told from the player
+            // drifting to the next track, which the deck undoes once)
+            if matches!(a, Act::Skip) && s.core.mode_name() == "looping" && !s.core.may_reopen() {
                 rules.skipped_loop = Some(s.t);
             }
             if matches!(a, Act::Live | Act::Top | Act::Loop(_)) {
